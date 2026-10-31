@@ -131,3 +131,9 @@ def require_recent_totp(minutes: int = 10) -> SessionDep:
         return session
 
     return dependency
+
+
+def ensure_step_up(session: UserSession, user: User, now: datetime) -> None:
+    """For handlers that only learn mid-way that the request is sensitive."""
+    if not has_recent_totp(session, user, now):
+        raise ApiError("auth.step_up_required", 403)

@@ -1,13 +1,21 @@
 import base64
 import os
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import datetime, timedelta
 from typing import Any
+from urllib.parse import parse_qs, urlparse
+from uuid import UUID
 
 import httpx
+import pyotp
 import pytest
 from fastapi import FastAPI
 from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from sijil_core.db.base import utcnow
+from sijil_core.db.models import JobKind
+from sijil_cp import deps
 from sijil_cp.main import create_app
 from sijil_cp.settings import CpSettings
 
@@ -103,3 +111,100 @@ async def client(
     """App on the migrated test DB and test Redis; unsafe requests carry a CSRF token."""
     async with csrf_client_for(make_db_app()) as c:
         yield c
+
+
+class RecordingEnqueuer:
+    """Stands in for Celery: remembers what would have been sent."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[JobKind, UUID, UUID]] = []
+
+    def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None:
+        self.calls.append((kind, job_id, workspace_id))
+
+
+@pytest.fixture
+def enqueuer() -> RecordingEnqueuer:
+    return RecordingEnqueuer()
+
+
+class Clock:
+    """A frozen request clock that tests move by hand."""
+
+    def __init__(self) -> None:
+        now = utcnow()
+        # Five seconds into a TOTP step, so ±1 step is unambiguous.
+        self.now = datetime.fromtimestamp((int(now.timestamp()) // 30) * 30 + 5, tz=now.tzinfo)
+
+    def advance(self, delta: timedelta) -> datetime:
+        self.now += delta
+        return self.now
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+PASSWORD = "correct horse battery"
+
+
+class Actor:
+    """A signed-in user with their own cookie jar."""
+
+    def __init__(self, client: CsrfClient, email: str, user_id: UUID, clock: Clock) -> None:
+        self.client = client
+        self.email = email
+        self.user_id = user_id
+        self.clock = clock
+        self.secret: str | None = None
+
+    async def enable_totp(self) -> None:
+        r = await self.client.post("/v1/auth/totp/enrol")
+        assert r.status_code == 200
+        self.secret = parse_qs(urlparse(str(r.json()["otpauth_uri"])).query)["secret"][0]
+        code = pyotp.TOTP(self.secret).at(self.clock.now)
+        assert (await self.client.post("/v1/auth/totp/confirm", json={"code": code})).is_success
+        self.clock.advance(timedelta(seconds=30))
+
+    async def step_up(self) -> None:
+        """Log in again and verify a fresh TOTP code (needs enable_totp first)."""
+        assert self.secret is not None
+        r = await self.client.post(
+            "/v1/auth/login", json={"email": self.email, "password": PASSWORD}
+        )
+        assert r.status_code == 200
+        code = pyotp.TOTP(self.secret).at(self.clock.now)
+        assert (await self.client.post("/v1/auth/totp/verify", json={"code": code})).is_success
+        self.clock.advance(timedelta(seconds=30))
+
+
+@pytest.fixture
+def cp_app(
+    make_db_app: Callable[..., FastAPI], enqueuer: RecordingEnqueuer, clock: Clock
+) -> FastAPI:
+    app = make_db_app()
+    app.state.enqueuer = enqueuer
+    app.dependency_overrides[deps.get_now] = lambda: clock.now
+    return app
+
+
+@pytest.fixture
+async def make_actor(
+    cp_app: FastAPI, csrf_client_for: Callable[..., CsrfClient], clock: Clock, db: AsyncSession
+) -> AsyncIterator[Callable[[str], Awaitable[Actor]]]:
+    clients: list[CsrfClient] = []
+
+    async def _make(email: str) -> Actor:
+        c = csrf_client_for(cp_app)
+        clients.append(c)
+        r = await c.post(
+            "/v1/auth/signup",
+            json={"email": email, "password": PASSWORD, "name": email, "locale": "fr"},
+        )
+        assert r.status_code == 201
+        return Actor(c, email, UUID(r.json()["user"]["id"]), clock)
+
+    yield _make
+    for c in clients:
+        await c.aclose()

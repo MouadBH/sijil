@@ -56,7 +56,7 @@ def _probe_router() -> APIRouter:
     """Test-only routes that exercise the TOTP dependencies directly."""
     router = APIRouter(prefix="/v1")
 
-    @router.get("/orgs/_probe")
+    @router.get("/_probe/compliance")
     async def compliance_probe(
         user: Annotated[User, Depends(deps.require_totp_compliance)],
     ) -> dict[str, str]:
@@ -449,9 +449,9 @@ async def test_owner_enforcement_blocks_users_without_totp(
     c: httpx.AsyncClient, clock: Clock, db: AsyncSession
 ) -> None:
     await signup(c)
-    assert (await c.get("/v1/orgs/_probe")).status_code == 200
+    assert (await c.get("/v1/_probe/compliance")).status_code == 200
     await _require_totp_org(db)
-    r = await c.get("/v1/orgs/_probe")
+    r = await c.get("/v1/_probe/compliance")
     assert r.status_code == 403
     assert error(r) == "auth.totp_enrolment_required"
     # Enrolling is still possible, and once enabled the user gets through.
@@ -459,7 +459,7 @@ async def test_owner_enforcement_blocks_users_without_totp(
     assert (
         await c.post("/v1/auth/totp/confirm", json={"code": code_at(secret, clock.now)})
     ).status_code == 200
-    assert (await c.get("/v1/orgs/_probe")).status_code == 200
+    assert (await c.get("/v1/_probe/compliance")).status_code == 200
 
 
 async def test_enforcement_applies_through_workspace_membership(
@@ -467,7 +467,7 @@ async def test_enforcement_applies_through_workspace_membership(
 ) -> None:
     await signup(c)
     await _require_totp_org(db, via_workspace=True)
-    r = await c.get("/v1/orgs/_probe")
+    r = await c.get("/v1/_probe/compliance")
     assert r.status_code == 403
     assert error(r) == "auth.totp_enrolment_required"
 
