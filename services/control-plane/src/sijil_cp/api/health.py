@@ -41,7 +41,7 @@ async def _database_up(engine: AsyncEngine) -> bool:
 
 
 async def _redis_up(url: str) -> bool:
-    client = aioredis.from_url(url, socket_connect_timeout=2, socket_timeout=2)
+    client = aioredis.Redis.from_url(url, socket_connect_timeout=2, socket_timeout=2)
     try:
         return bool(await client.ping())
     except Exception:
