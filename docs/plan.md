@@ -10,7 +10,7 @@
 - The control plane owns the ledger, the hash-chained audit log, retention and export. Document content stays in per-workspace stores.
 
 **Tech Stack:**
-- Python 3.13 (uv workspace): FastAPI, SQLAlchemy 2, Alembic, Pydantic v2, Celery, Redis, PostgreSQL 17 + pgvector, MinIO (object lock), Ollama.
+- Python 3.13 (uv workspace): FastAPI, SQLAlchemy 2, Alembic, Pydantic v2, Celery, Redis, PostgreSQL 17 + pgvector, RustFS (S3 with object lock), Ollama.
 - TypeScript (pnpm workspace): Next.js 15 App Router, next-intl.
 - Tests and checks: pytest, Vitest, Playwright, ruff, mypy, eslint.
 - CI and infra: GitHub Actions, docker-compose.
@@ -47,7 +47,7 @@
   - Digits: the user preference is `latn` or `arab`.
 - Uploads: up to 100 MB per file. Accepted types: PDF, JPG, PNG, TIFF, HEIC, DOCX, XLSX, XML.
 - Sample data lives only in `fixtures/`, every file carries the `SAMPLE` mark, and ICE numbers are fictitious.
-- Python 3.13, Node 22 LTS in CI (newer locally is fine), pnpm 10+, uv 0.10+.
+- Python 3.13, Node 24 LTS in CI (newer locally is fine), pnpm 12, uv 0.10+, TypeScript 5.9, ESLint 9.
 - Commits are small and in the Conventional Commits style, on the milestone branch. Never push to `main` without asking.
 
 ## Review Focus
@@ -248,16 +248,16 @@ def test_assert_region_refuses_other_region():
 | postgres | `pgvector/pgvector:pg17` | core, tenants | healthcheck `pg_isready` |
 | redis | `redis:7.4-alpine` | core | |
 | paperless-redis | `redis:7.4-alpine` | tenants | Paperless broker, separate from ours |
-| minio | `minio/minio` (pinned release) | core | bucket `sijil-originals` created with `--with-lock` by `minio-init` |
+| objectstore | `rustfs/rustfs:1.0.4` | core | S3 API with object lock; the locked bucket is created by `ObjectStore` in M2 |
 | ollama | `ollama/ollama` (pinned) | core, tenants | volume `ollama`, no model pull at boot (`make models` pulls) |
 | tika | `apache/tika` (pinned) | tenants | for DOCX/XLSX |
 | gotenberg | `gotenberg/gotenberg:8` | tenants | for DOCX/XLSX |
 | paperless-t1, paperless-t2 | `ghcr.io/paperless-ngx/paperless-ngx:3.4.1` | tenants only | `env_file: paperless/tenant.env` + per-tenant `PAPERLESS_DBNAME`, `PAPERLESS_SECRET_KEY`, `PAPERLESS_ADMIN_USER/PASSWORD`; `PAPERLESS_OCR_LANGUAGES=ara fra`, `PAPERLESS_OCR_LANGUAGE=ara+fra+eng`, `PAPERLESS_TIKA_ENABLED=1`; volumes `t1_data`, `t1_media`; **no `ports:`** |
 | control-plane | build | core, tenants | port `8000` |
-| worker | build | core, tenants | `/var/run/docker.sock` mounted **dev profile only**, for `DockerRuntime` in M1 |
+| worker | build | core, tenants | the Docker socket mount for `DockerRuntime` arrives with M1 |
 
 - Networks: `tenants` is `internal: true`, so tenants have no route out and no published ports. `core` is a normal bridge network, because the control-plane port is published on it.
-- `minio-init` is a one-shot `minio/mc` service that creates the locked bucket.
+- Arabic OCR: `tessdata/ara.traineddata` (tessdata_fast 4.1.0, checksummed) is mounted read-only into each tenant.
 
 - [ ] **Step 1:** Write `smoke.sh`. It waits up to 300 s, then asserts:
   - `curl localhost:8000/v1/health/ready` → 200;
@@ -356,7 +356,7 @@ Branch `m2-capture`. Covers **CAP-1, CAP-2, CAP-4, ARC-4**.
 
 | Task | Deliverable | Acceptance tests |
 | --- | --- | --- |
-| 2.1 Object store | `sijil_core.storage.ObjectStore` protocol + `MinioObjectStore`; `put_original(sha256, bytes, retain_until)` in COMPLIANCE mode; `extend_retention`; `governance_remove` (used only by the pre-seal removal flow, M4) | `test_locked_object_cannot_be_deleted`; `test_retention_can_only_extend` |
+| 2.1 Object store | `sijil_core.storage.ObjectStore` protocol + `S3ObjectStore` (boto3; RustFS locally); `put_original(sha256, bytes, retain_until)` in COMPLIANCE mode; `extend_retention`; `governance_remove` (used only by the pre-seal removal flow, M4) | `test_locked_object_cannot_be_deleted`; `test_retention_can_only_extend` |
 | 2.2 Ledger model | `DocumentLedger` (design §5.5): states, `sha256`, `object_key`, `fields_sha256`, `retention_until` (provisional), unique `(workspace_id, sha256)`; DB trigger rejecting UPDATE of `sha256`/`object_key` and DELETE of any row whose state ≠ `removed` tombstone flow | `test_ledger_sha_immutable`; `test_ledger_row_delete_rejected_by_db` |
 | 2.3 Upload API | `POST /v1/workspaces/{id}/uploads` (multipart, ≤ 100 MB, MIME sniffing on the allow-list) → hash while streaming → object store → ledger `received` → enqueue `ingest` → `202 {task_id}` in < 2 s; worker pushes the file to Paperless and polls the task; `paperless_doc_id` stored | `test_upload_rejects_101mb`; `test_upload_rejects_exe`; `test_each_cap2_format_ingests` (integration, per format; failures recorded and handled per design §5.7); `test_concurrent_identical_uploads_create_one_row`; `test_upload_accepted_when_tenant_unreachable`; `test_upload_p95_under_2s` |
 | 2.4 Duplicates | Content-hash duplicate → `409 document.duplicate` with the existing id; invoice-number + supplier + amount duplicate → flagged `possible_duplicate` (needs M3 fields; the hook and test are added in 2.4 and activated in 3.4) | `test_same_hash_rejected`; `test_duplicate_logged_in_audit` |

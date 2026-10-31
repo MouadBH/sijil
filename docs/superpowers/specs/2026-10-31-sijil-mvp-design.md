@@ -83,7 +83,7 @@ The product promise comes down to three things that must hold under test:
 
 ### 5.2a Original files and official field values (decided)
 
-- **Paperless-ngx is a working copy, not the record.** Every original file is also written to **our own write-once, in-region object storage with object lock**, in compliance mode until `retention_until`. Locally this is MinIO with object lock, behind an `ObjectStore` interface.
+- **Paperless-ngx is a working copy, not the record.** Every original file is also written to **our own write-once, in-region object storage with object lock**, in compliance mode until `retention_until`. Locally this is RustFS (S3 API with object lock; MinIO stopped publishing images in 2025), behind an `ObjectStore` interface.
   - The object key is the SHA-256 hash.
   - The lock is extended when sealing sets the final retention date.
 - **Official field values** are the ledger's sealed fields (see §5.5 for where they are stored). Paperless-ngx custom fields are only a mirror for search.
