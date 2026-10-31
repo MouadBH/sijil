@@ -23,12 +23,18 @@ async def test_org_region_cannot_change(db: AsyncSession, owner_conn: AsyncConne
         await owner_conn.execute(text("UPDATE organisation SET region = 'eu-fra'"))
 
 
-async def test_email_unique_case_insensitive(db: AsyncSession) -> None:
+async def test_email_unique_case_insensitive(db: AsyncSession, owner_conn: AsyncConnection) -> None:
     db.add(User(email="mouad@example.com", name="M", password_hash="x"))
     await db.commit()
-    db.add(User(email="MOUAD@example.com", name="M2", password_hash="x"))
+    # Raw SQL bypasses the ORM lower-casing hook, so only the citext column can reject this.
     with pytest.raises(IntegrityError):
-        await db.commit()
+        await owner_conn.execute(
+            text(
+                "INSERT INTO user_account (id, created_at, email, name, password_hash, locale,"
+                " digits) VALUES (gen_random_uuid(), now(), 'MOUAD@example.com', 'M2', 'x',"
+                " 'fr', 'latn')"
+            )
+        )
 
 
 async def test_email_is_normalised(db: AsyncSession) -> None:
