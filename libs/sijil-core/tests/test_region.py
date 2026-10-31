@@ -1,4 +1,5 @@
 import pytest
+
 from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.settings import CoreSettings
 

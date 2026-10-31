@@ -134,8 +134,10 @@ def test_settings_require_region(monkeypatch):
     with pytest.raises(ValidationError):
         CoreSettings()
 
+
 def test_assert_region_passes_same_region():
     assert_region("ma-cas", CoreSettings(region="ma-cas", environment="test"))
+
 
 def test_assert_region_refuses_other_region():
     with pytest.raises(RegionMismatch) as e:

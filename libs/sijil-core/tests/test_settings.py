@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+
 from sijil_core.settings import CoreSettings
 
 
