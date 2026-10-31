@@ -1,0 +1,16 @@
+{
+  "shell": {
+    "title": "Sijil",
+    "subtitle": "Your accounting documents, captured, sealed and kept in Morocco."
+  },
+  "site": {
+    "meta": {
+      "title": "Sijil — the compliance archive for Moroccan SMEs",
+      "description": "Capture invoices and receipts, keep them tamper-evident in Morocco, and hand over an audit-ready file on request."
+    },
+    "hero": {
+      "title": "The archive that stands up to a tax audit.",
+      "subtitle": "Every document captured, checked, sealed and kept for ten years in Morocco."
+    }
+  }
+}

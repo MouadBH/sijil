@@ -1,0 +1,14 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Security: Next 15 pins postcss 8.4 (GHSA-6g55-p6wh-862q, GHSA-r28c-9q8g-f849).
+overrides:
+  postcss: ^8.5.18
+
+# Dependencies allowed to run install scripts (pnpm blocks all others).
+allowBuilds:
+  "@parcel/watcher": true
+  "@swc/core": true
+  esbuild: true
+  unrs-resolver: true

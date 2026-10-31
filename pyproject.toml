@@ -1,0 +1,52 @@
+[project]
+name = "sijil"
+version = "0.0.0"
+requires-python = ">=3.13,<3.14"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["libs/*", "services/*"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.28",
+  "mypy>=1.13",
+  "ruff>=0.8",
+  "celery-types>=0.22",
+  # fixtures/ generator and its tests
+  "reportlab>=4.2",
+  "arabic-reshaper>=3.0",
+  "python-bidi>=0.6",
+  "pypdf>=5.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["sijil_core", "sijil_cp", "sijil_worker"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["reportlab.*", "arabic_reshaper", "bidi.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--import-mode=importlib"

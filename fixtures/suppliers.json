@@ -1,0 +1,10 @@
+[
+  {"name": "Atlas Télécom Services SARL", "name_ar": "أطلس لخدمات الاتصالات", "ice": "001905837000041", "city": "Casablanca", "vat_rate": 20},
+  {"name": "Société Hydro Souss SA", "name_ar": "شركة هيدرو سوس", "ice": "002118460000072", "city": "Agadir", "vat_rate": 7},
+  {"name": "Papeterie Al Manar SARL", "name_ar": "مكتبة المنار", "ice": "001477392000015", "city": "Rabat", "vat_rate": 20},
+  {"name": "Transports Oued Draa SARL", "name_ar": "نقل وادي درعة", "ice": "002560913000038", "city": "Ouarzazate", "vat_rate": 14},
+  {"name": "Riad Tensift Hôtellerie SARL", "name_ar": "رياض تانسيفت للفندقة", "ice": "001736205000094", "city": "Marrakech", "vat_rate": 10},
+  {"name": "Énergie Bouregreg SA", "name_ar": "طاقة أبي رقراق", "ice": "002049178000056", "city": "Salé", "vat_rate": 14},
+  {"name": "Zénith Informatique SARL", "name_ar": "زينيث للمعلوميات", "ice": "001682754000023", "city": "Tanger", "vat_rate": 20},
+  {"name": "Pâtisserie Moderne Fès SARL", "name_ar": "الحلويات العصرية فاس", "ice": "002295046000087", "city": "Fès", "vat_rate": 10}
+]
