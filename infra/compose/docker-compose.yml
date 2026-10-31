@@ -1,0 +1,157 @@
+# Sijil local stack. Two networks:
+#   core    — our services; only the control plane publishes a port.
+#   tenants — internal (no route out): Paperless-ngx tenants and their helpers.
+# Only the control plane and the worker sit on both.
+
+x-paperless: &paperless
+  image: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
+  restart: unless-stopped
+  env_file: paperless/tenant.env
+  networks: [tenants]
+  depends_on:
+    postgres: { condition: service_healthy }
+    paperless-redis: { condition: service_started }
+    tika: { condition: service_started }
+    gotenberg: { condition: service_started }
+  healthcheck:
+    test: ["CMD", "curl", "-fs", "-o", "/dev/null", "http://localhost:8000/accounts/login/"]
+    interval: 15s
+    timeout: 5s
+    retries: 20
+    start_period: 60s
+
+x-sijil-env: &sijil-env
+  SIJIL_REGION: ${SIJIL_REGION}
+  SIJIL_ENVIRONMENT: dev
+  SIJIL_REDIS_URL: redis://redis:6379/0
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.7-pg17-trixie
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SIJIL_CP_DB_PASSWORD: ${SIJIL_CP_DB_PASSWORD}
+      T1_DB_PASSWORD: ${T1_DB_PASSWORD}
+      T2_DB_PASSWORD: ${T2_DB_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./postgres/init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+    ports: ["127.0.0.1:55432:5432"] # host access for integration tests only
+    networks: [core, tenants]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4.12-alpine
+    restart: unless-stopped
+    networks: [core]
+
+  paperless-redis:
+    image: redis:7.4.12-alpine
+    restart: unless-stopped
+    networks: [tenants]
+
+  objectstore:
+    image: rustfs/rustfs:1.0.4
+    restart: unless-stopped
+    environment:
+      RUSTFS_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY}
+    volumes: [objectstore:/data]
+    networks: [core]
+
+  ollama:
+    image: ollama/ollama:0.40.13
+    restart: unless-stopped
+    volumes: [ollama:/root/.ollama]
+    networks: [core, tenants]
+
+  tika:
+    image: apache/tika:3.3.1.0
+    restart: unless-stopped
+    networks: [tenants]
+
+  gotenberg:
+    image: gotenberg/gotenberg:8.37.0
+    restart: unless-stopped
+    command:
+      - gotenberg
+      - --chromium-disable-javascript=true
+      - --chromium-allow-list=^file:///tmp/.*
+    networks: [tenants]
+
+  paperless-t1:
+    <<: *paperless
+    environment:
+      PAPERLESS_DBNAME: paperless_t1
+      PAPERLESS_DBUSER: paperless_t1
+      PAPERLESS_DBPASS: ${T1_DB_PASSWORD}
+      PAPERLESS_REDIS: redis://paperless-redis:6379/1
+      PAPERLESS_SECRET_KEY: ${T1_SECRET_KEY}
+      PAPERLESS_ADMIN_USER: sijil-admin
+      PAPERLESS_ADMIN_PASSWORD: ${T1_ADMIN_PASSWORD}
+      PAPERLESS_URL: http://paperless-t1:8000
+    volumes:
+      - t1_data:/usr/src/paperless/data
+      - t1_media:/usr/src/paperless/media
+      - ./tessdata/ara.traineddata:/usr/share/tesseract-ocr/5/tessdata/ara.traineddata:ro
+
+  paperless-t2:
+    <<: *paperless
+    environment:
+      PAPERLESS_DBNAME: paperless_t2
+      PAPERLESS_DBUSER: paperless_t2
+      PAPERLESS_DBPASS: ${T2_DB_PASSWORD}
+      PAPERLESS_REDIS: redis://paperless-redis:6379/2
+      PAPERLESS_SECRET_KEY: ${T2_SECRET_KEY}
+      PAPERLESS_ADMIN_USER: sijil-admin
+      PAPERLESS_ADMIN_PASSWORD: ${T2_ADMIN_PASSWORD}
+      PAPERLESS_URL: http://paperless-t2:8000
+    volumes:
+      - t2_data:/usr/src/paperless/data
+      - t2_media:/usr/src/paperless/media
+      - ./tessdata/ara.traineddata:/usr/share/tesseract-ocr/5/tessdata/ara.traineddata:ro
+
+  control-plane:
+    build:
+      context: ../..
+      dockerfile: services/control-plane/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *sijil-env
+      SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp:${SIJIL_CP_DB_PASSWORD}@postgres:5432/sijil_cp
+    ports: ["8000:8000"]
+    networks: [core, tenants]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *sijil-env
+    networks: [core, tenants]
+    depends_on:
+      redis: { condition: service_started }
+
+networks:
+  core: {}
+  tenants:
+    internal: true
+
+volumes:
+  postgres:
+  objectstore:
+  ollama:
+  t1_data:
+  t1_media:
+  t2_data:
+  t2_media:
