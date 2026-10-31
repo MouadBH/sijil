@@ -166,6 +166,8 @@ services:
     environment:
       <<: *sijil-env
       SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+      SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
+      SIJIL_COOKIE_SECURE: "false" # dev runs over http on localhost
     ports: ["127.0.0.1:8000:8000"]
     networks: [core, ai, tenant_t1, tenant_t2]
     healthcheck:
