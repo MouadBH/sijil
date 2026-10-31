@@ -1,0 +1,16 @@
+{
+  "shell": {
+    "title": "Sijil",
+    "subtitle": "Vos pièces comptables, captées, scellées et conservées au Maroc."
+  },
+  "site": {
+    "meta": {
+      "title": "Sijil — l'archive de conformité des PME marocaines",
+      "description": "Captez factures et reçus, gardez-les inaltérables au Maroc, et remettez un dossier prêt pour le contrôle fiscal."
+    },
+    "hero": {
+      "title": "L'archive qui tient le contrôle fiscal.",
+      "subtitle": "Chaque pièce captée, vérifiée, scellée et conservée dix ans au Maroc."
+    }
+  }
+}
