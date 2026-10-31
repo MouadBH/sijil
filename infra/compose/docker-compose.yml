@@ -1,16 +1,18 @@
-# Sijil local stack. Two networks:
-#   core    — our services; only the control plane publishes a port.
-#   tenants — internal (no route out): Paperless-ngx tenants and their helpers.
-# Only the control plane and the worker sit on both.
+# Sijil local stack. Networks:
+#   core       — our services; the only network with a route out. Only the control
+#                plane publishes a port, and only on localhost.
+#   ai         — internal: control plane / worker → ollama.
+#   tenant_tN  — internal, one per workspace: that tenant's Paperless-ngx and its redis.
+#                Shared helpers (postgres, tika, gotenberg, ollama) and the control
+#                plane / worker are attached to every tenant network, so a tenant
+#                reaches them but never another tenant.
 
 x-paperless: &paperless
   image: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
   restart: unless-stopped
   env_file: paperless/tenant.env
-  networks: [tenants]
   depends_on:
     postgres: { condition: service_healthy }
-    paperless-redis: { condition: service_started }
     tika: { condition: service_started }
     gotenberg: { condition: service_started }
   healthcheck:
@@ -21,9 +23,11 @@ x-paperless: &paperless
     start_period: 60s
 
 x-sijil-env: &sijil-env
-  SIJIL_REGION: ${SIJIL_REGION}
+  SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
   SIJIL_ENVIRONMENT: dev
   SIJIL_REDIS_URL: redis://redis:6379/0
+
+x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
 services:
   postgres:
@@ -31,15 +35,18 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      SIJIL_CP_DB_PASSWORD: ${SIJIL_CP_DB_PASSWORD}
-      T1_DB_PASSWORD: ${T1_DB_PASSWORD}
-      T2_DB_PASSWORD: ${T2_DB_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      SIJIL_CP_OWNER_DB_PASSWORD: ${SIJIL_CP_OWNER_DB_PASSWORD:?}
+      SIJIL_CP_APP_DB_PASSWORD: ${SIJIL_CP_APP_DB_PASSWORD:?}
+      T1_DB_PASSWORD: ${T1_DB_PASSWORD:?}
+      T1_INDEX_DB_PASSWORD: ${T1_INDEX_DB_PASSWORD:?}
+      T2_DB_PASSWORD: ${T2_DB_PASSWORD:?}
+      T2_INDEX_DB_PASSWORD: ${T2_INDEX_DB_PASSWORD:?}
     volumes:
       - postgres:/var/lib/postgresql/data
       - ./postgres/init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
     ports: ["127.0.0.1:55432:5432"] # host access for integration tests only
-    networks: [core, tenants]
+    networks: [core, tenant_t1, tenant_t2]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -51,17 +58,12 @@ services:
     restart: unless-stopped
     networks: [core]
 
-  paperless-redis:
-    image: redis:7.4.12-alpine
-    restart: unless-stopped
-    networks: [tenants]
-
   objectstore:
     image: rustfs/rustfs:1.0.4
     restart: unless-stopped
     environment:
-      RUSTFS_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY}
-      RUSTFS_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY}
+      RUSTFS_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY:?}
+      RUSTFS_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY:?}
     volumes: [objectstore:/data]
     networks: [core]
 
@@ -69,12 +71,23 @@ services:
     image: ollama/ollama:0.40.13
     restart: unless-stopped
     volumes: [ollama:/root/.ollama]
-    networks: [core, tenants]
+    # Not on `core`: tenants can call it, so it must have no route out itself.
+    networks: [ai, tenant_t1, tenant_t2]
+
+  ollama-pull:
+    # `make models`: the only Ollama process with internet, run on demand to fill the volume.
+    image: ollama/ollama:0.40.13
+    profiles: [models]
+    entrypoint: ["sh", "-c", "ollama serve & sleep 3 && ollama pull \"$$OLLAMA_MODEL\""]
+    environment:
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+    volumes: [ollama:/root/.ollama]
+    networks: [core]
 
   tika:
     image: apache/tika:3.3.1.0
     restart: unless-stopped
-    networks: [tenants]
+    networks: *all-tenant-networks
 
   gotenberg:
     image: gotenberg/gotenberg:8.37.0
@@ -83,18 +96,29 @@ services:
       - gotenberg
       - --chromium-disable-javascript=true
       - --chromium-allow-list=^file:///tmp/.*
-    networks: [tenants]
+    networks: *all-tenant-networks
+
+  paperless-redis-t1:
+    image: redis:7.4.12-alpine
+    restart: unless-stopped
+    networks: [tenant_t1]
+
+  paperless-redis-t2:
+    image: redis:7.4.12-alpine
+    restart: unless-stopped
+    networks: [tenant_t2]
 
   paperless-t1:
     <<: *paperless
+    networks: [tenant_t1]
     environment:
       PAPERLESS_DBNAME: paperless_t1
       PAPERLESS_DBUSER: paperless_t1
-      PAPERLESS_DBPASS: ${T1_DB_PASSWORD}
-      PAPERLESS_REDIS: redis://paperless-redis:6379/1
-      PAPERLESS_SECRET_KEY: ${T1_SECRET_KEY}
+      PAPERLESS_DBPASS: ${T1_DB_PASSWORD:?}
+      PAPERLESS_REDIS: redis://paperless-redis-t1:6379
+      PAPERLESS_SECRET_KEY: ${T1_SECRET_KEY:?}
       PAPERLESS_ADMIN_USER: sijil-admin
-      PAPERLESS_ADMIN_PASSWORD: ${T1_ADMIN_PASSWORD}
+      PAPERLESS_ADMIN_PASSWORD: ${T1_ADMIN_PASSWORD:?}
       PAPERLESS_URL: http://paperless-t1:8000
     volumes:
       - t1_data:/usr/src/paperless/data
@@ -103,19 +127,35 @@ services:
 
   paperless-t2:
     <<: *paperless
+    networks: [tenant_t2]
     environment:
       PAPERLESS_DBNAME: paperless_t2
       PAPERLESS_DBUSER: paperless_t2
-      PAPERLESS_DBPASS: ${T2_DB_PASSWORD}
-      PAPERLESS_REDIS: redis://paperless-redis:6379/2
-      PAPERLESS_SECRET_KEY: ${T2_SECRET_KEY}
+      PAPERLESS_DBPASS: ${T2_DB_PASSWORD:?}
+      PAPERLESS_REDIS: redis://paperless-redis-t2:6379
+      PAPERLESS_SECRET_KEY: ${T2_SECRET_KEY:?}
       PAPERLESS_ADMIN_USER: sijil-admin
-      PAPERLESS_ADMIN_PASSWORD: ${T2_ADMIN_PASSWORD}
+      PAPERLESS_ADMIN_PASSWORD: ${T2_ADMIN_PASSWORD:?}
       PAPERLESS_URL: http://paperless-t2:8000
     volumes:
       - t2_data:/usr/src/paperless/data
       - t2_media:/usr/src/paperless/media
       - ./tessdata/ara.traineddata:/usr/share/tesseract-ocr/5/tessdata/ara.traineddata:ro
+
+  migrate:
+    # One-shot: schema changes run as the owner role, never as the app role.
+    build:
+      context: ../..
+      dockerfile: services/control-plane/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    environment:
+      SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
+      SIJIL_ENVIRONMENT: dev
+      SIJIL_MIGRATION_DATABASE_URL: postgresql+asyncpg://sijil_cp_owner:${SIJIL_CP_OWNER_DB_PASSWORD:?}@postgres:5432/sijil_cp
+    networks: [core]
+    depends_on:
+      postgres: { condition: service_healthy }
 
   control-plane:
     build:
@@ -124,11 +164,16 @@ services:
     restart: unless-stopped
     environment:
       <<: *sijil-env
-      SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp:${SIJIL_CP_DB_PASSWORD}@postgres:5432/sijil_cp
-    ports: ["8000:8000"]
-    networks: [core, tenants]
+      SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+    ports: ["127.0.0.1:8000:8000"]
+    networks: [core, ai, tenant_t1, tenant_t2]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     depends_on:
-      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
       redis: { condition: service_started }
 
   worker:
@@ -138,13 +183,17 @@ services:
     restart: unless-stopped
     environment:
       <<: *sijil-env
-    networks: [core, tenants]
+    networks: [core, ai, tenant_t1, tenant_t2]
     depends_on:
       redis: { condition: service_started }
 
 networks:
   core: {}
-  tenants:
+  ai:
+    internal: true
+  tenant_t1:
+    internal: true
+  tenant_t2:
     internal: true
 
 volumes:

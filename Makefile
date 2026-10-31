@@ -35,4 +35,4 @@ smoke:
 	infra/scripts/smoke.sh
 
 models:
-	$(COMPOSE) exec ollama ollama pull $${OLLAMA_MODEL:-qwen3:8b}
+	$(COMPOSE) --profile models run --rm ollama-pull
