@@ -217,7 +217,7 @@ Seeded sample data lives in `fixtures/`, clearly labelled as sample data: French
 10. The acceptance criteria for restore within the RTO and for the pen test move to the later production milestone. The extraction-accuracy criterion is reported only, until real invoices are supplied.
 11. Rules for removing a file uploaded by mistake (before sealing, Owner only) and for account closure with documents still under retention, both added. They need legal confirmation.
 
-**Proposed during M0, pending the product owner's sign-off:**
+**Proposed during M0, approved by the product owner on 2026-10-31:**
 
 12. Arabic OCR data (`ara.traineddata`, tessdata_fast 4.1.0, checksummed) is bind-mounted read-only into the official Paperless-ngx image. The image ships without Arabic, and tenants have no internet to install it. This is a file mount, not an image change.
 13. RustFS replaces MinIO as the local object store, because MinIO stopped publishing images. Production uses the region's own object storage. Whether RustFS enforces object lock is proven in M2 before anything relies on it.
