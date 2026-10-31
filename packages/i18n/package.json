@@ -5,6 +5,7 @@
   "type": "module",
   "exports": {
     ".": "./index.ts",
+    "./eslint": "./eslint.mjs",
     "./messages/*.json": "./messages/*.json"
   },
   "scripts": {
