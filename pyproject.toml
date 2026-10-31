@@ -17,6 +17,11 @@ dev = [
   "mypy>=1.13",
   "ruff>=0.8",
   "celery-types>=0.22",
+  # fixtures/ generator and its tests
+  "reportlab>=4.2",
+  "arabic-reshaper>=3.0",
+  "python-bidi>=0.6",
+  "pypdf>=5.1",
 ]
 
 [tool.ruff]
@@ -36,6 +41,10 @@ known-first-party = ["sijil_core", "sijil_cp", "sijil_worker"]
 strict = true
 python_version = "3.13"
 plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["reportlab.*", "arabic_reshaper", "bidi.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
