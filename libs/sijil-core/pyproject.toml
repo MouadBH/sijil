@@ -8,6 +8,7 @@ dependencies = [
   "pydantic-settings>=2.6",
   "sqlalchemy[asyncio]>=2.0.36",
   "asyncpg>=0.30",
+  "cryptography>=44",
 ]
 
 [build-system]
