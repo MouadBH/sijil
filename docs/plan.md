@@ -247,16 +247,21 @@ def test_assert_region_refuses_other_region():
 | --- | --- | --- | --- |
 | postgres | `pgvector/pgvector:pg17` | core, tenants | healthcheck `pg_isready` |
 | redis | `redis:7.4-alpine` | core | |
-| paperless-redis | `redis:7.4-alpine` | tenants | Paperless broker, separate from ours |
+| paperless-redis-t1, -t2 | `redis:7.4.12-alpine` | own tenant network | one Paperless broker per tenant |
 | objectstore | `rustfs/rustfs:1.0.4` | core | S3 API with object lock; the locked bucket is created by `ObjectStore` in M2 |
 | ollama | `ollama/ollama` (pinned) | core, tenants | volume `ollama`, no model pull at boot (`make models` pulls) |
 | tika | `apache/tika` (pinned) | tenants | for DOCX/XLSX |
 | gotenberg | `gotenberg/gotenberg:8` | tenants | for DOCX/XLSX |
-| paperless-t1, paperless-t2 | `ghcr.io/paperless-ngx/paperless-ngx:3.4.1` | tenants only | `env_file: paperless/tenant.env` + per-tenant `PAPERLESS_DBNAME`, `PAPERLESS_SECRET_KEY`, `PAPERLESS_ADMIN_USER/PASSWORD`; `PAPERLESS_OCR_LANGUAGES=ara fra`, `PAPERLESS_OCR_LANGUAGE=ara+fra+eng`, `PAPERLESS_TIKA_ENABLED=1`; volumes `t1_data`, `t1_media`; **no `ports:`** |
+| paperless-t1, paperless-t2 | `ghcr.io/paperless-ngx/paperless-ngx:3.4.1` | own `tenant_tN` network only | `env_file: paperless/tenant.env` + per-tenant `PAPERLESS_DBNAME`, `PAPERLESS_SECRET_KEY`, `PAPERLESS_ADMIN_USER/PASSWORD`; `PAPERLESS_OCR_LANGUAGE=ara+fra+eng` (ara.traineddata bind-mounted, see below), `PAPERLESS_TIKA_ENABLED=1`; volumes `t1_data`, `t1_media`; **no `ports:`** |
 | control-plane | build | core, tenants | port `8000` |
 | worker | build | core, tenants | the Docker socket mount for `DockerRuntime` arrives with M1 |
 
-- Networks: `tenants` is `internal: true`, so tenants have no route out and no published ports. `core` is a normal bridge network, because the control-plane port is published on it.
+- Networks (revised after the M0 review):
+  - One `internal: true` network per tenant (`tenant_t1`, `tenant_t2`), so there is no route out and no tenant-to-tenant path.
+  - Shared helpers (postgres, tika, gotenberg, ollama) and cp/worker are attached to every tenant network.
+  - `ai` (internal) links cp/worker to ollama. Ollama is not on `core`; `ollama-pull` (profile `models`) is the only Ollama process with egress.
+  - `core` is the only network with egress, and the control plane publishes `127.0.0.1:8000` on it.
+- Database roles: `sijil_cp_owner` (migrations only, in the one-shot `migrate` service) and `sijil_cp_app` (DML only, used by cp/worker). Each `index_tN` role has its own password, never given to Paperless.
 - Arabic OCR: `tessdata/ara.traineddata` (tessdata_fast 4.1.0, checksummed) is mounted read-only into each tenant.
 
 - [ ] **Step 1:** Write `smoke.sh`. It waits up to 300 s, then asserts:
@@ -356,7 +361,7 @@ Branch `m2-capture`. Covers **CAP-1, CAP-2, CAP-4, ARC-4**.
 
 | Task | Deliverable | Acceptance tests |
 | --- | --- | --- |
-| 2.1 Object store | `sijil_core.storage.ObjectStore` protocol + `S3ObjectStore` (boto3; RustFS locally); `put_original(sha256, bytes, retain_until)` in COMPLIANCE mode; `extend_retention`; `governance_remove` (used only by the pre-seal removal flow, M4) | `test_locked_object_cannot_be_deleted`; `test_retention_can_only_extend` |
+| 2.1 Object store | `sijil_core.storage.ObjectStore` protocol + `S3ObjectStore` (boto3; RustFS locally); `put_original(sha256, bytes, retain_until)` in **GOVERNANCE** mode (unsealed); `seal_original(sha256, retain_until)` switches to **COMPLIANCE** (S3 allows governance → compliance, never back); `extend_retention`; `governance_remove` (pre-seal removal flow only, M4) | **First:** `test_store_honours_governance_and_compliance` (integration against RustFS 1.0.4: a governance object deletes only with `x-amz-bypass-governance-retention`, a compliance object never deletes, retention can't be shortened). If RustFS fails it, stop and choose another store. Then `test_locked_object_cannot_be_deleted`; `test_sealed_object_ignores_governance_bypass`; `test_retention_can_only_extend` |
 | 2.2 Ledger model | `DocumentLedger` (design §5.5): states, `sha256`, `object_key`, `fields_sha256`, `retention_until` (provisional), unique `(workspace_id, sha256)`; DB trigger rejecting UPDATE of `sha256`/`object_key` and DELETE of any row whose state ≠ `removed` tombstone flow | `test_ledger_sha_immutable`; `test_ledger_row_delete_rejected_by_db` |
 | 2.3 Upload API | `POST /v1/workspaces/{id}/uploads` (multipart, ≤ 100 MB, MIME sniffing on the allow-list) → hash while streaming → object store → ledger `received` → enqueue `ingest` → `202 {task_id}` in < 2 s; worker pushes the file to Paperless and polls the task; `paperless_doc_id` stored | `test_upload_rejects_101mb`; `test_upload_rejects_exe`; `test_each_cap2_format_ingests` (integration, per format; failures recorded and handled per design §5.7); `test_concurrent_identical_uploads_create_one_row`; `test_upload_accepted_when_tenant_unreachable`; `test_upload_p95_under_2s` |
 | 2.4 Duplicates | Content-hash duplicate → `409 document.duplicate` with the existing id; invoice-number + supplier + amount duplicate → flagged `possible_duplicate` (needs M3 fields; the hook and test are added in 2.4 and activated in 3.4) | `test_same_hash_rejected`; `test_duplicate_logged_in_audit` |

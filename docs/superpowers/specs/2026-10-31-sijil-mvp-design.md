@@ -83,7 +83,7 @@ The product promise comes down to three things that must hold under test:
 
 ### 5.2a Original files and official field values (decided)
 
-- **Paperless-ngx is a working copy, not the record.** Every original file is also written to **our own write-once, in-region object storage with object lock**, in compliance mode until `retention_until`. Locally this is RustFS (S3 API with object lock; MinIO stopped publishing images in 2025), behind an `ObjectStore` interface.
+- **Paperless-ngx is a working copy, not the record.** Every original file is also written to **our own write-once, in-region object storage with object lock**. While unsealed it is locked in governance mode, so that only the Owner's pre-seal removal flow (§5.4) can bypass it. At sealing it switches to compliance mode until `retention_until`, after which nobody can remove it. Locally this is RustFS (S3 API with object lock; MinIO stopped publishing images in 2025), behind an `ObjectStore` interface.
   - The object key is the SHA-256 hash.
   - The lock is extended when sealing sets the final retention date.
 - **Official field values** are the ledger's sealed fields (see §5.5 for where they are stored). Paperless-ngx custom fields are only a mirror for search.
@@ -216,6 +216,13 @@ Seeded sample data lives in `fixtures/`, clearly labelled as sample data: French
 9. Field values, OCR text and embeddings live in a per-workspace index database, not in the shared ledger.
 10. The acceptance criteria for restore within the RTO and for the pen test move to the later production milestone. The extraction-accuracy criterion is reported only, until real invoices are supplied.
 11. Rules for removing a file uploaded by mistake (before sealing, Owner only) and for account closure with documents still under retention, both added. They need legal confirmation.
+
+**Proposed during M0, pending the product owner's sign-off:**
+
+12. Arabic OCR data (`ara.traineddata`, tessdata_fast 4.1.0, checksummed) is bind-mounted read-only into the official Paperless-ngx image. The image ships without Arabic, and tenants have no internet to install it. This is a file mount, not an image change.
+13. RustFS replaces MinIO as the local object store, because MinIO stopped publishing images. Production uses the region's own object storage. Whether RustFS enforces object lock is proven in M2 before anything relies on it.
+14. Object lock is governance mode while unsealed and compliance mode once sealed (§5.2a). This resolves a contradiction between §5.2a and §5.4.
+15. One internal network and one Redis per tenant (tightening SPEC's "network policies deny cross-tenant traffic"), and separate database roles for migrations and for the app.
 
 ## 8. Left to the builder
 

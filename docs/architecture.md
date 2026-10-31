@@ -20,7 +20,7 @@ flowchart LR
     ollama[ollama<br/>in-region AI]
   end
 
-  subgraph tenants[tenants network — internal, no route out]
+  subgraph tenants[one internal network per tenant — no route out, no tenant-to-tenant path]
     p1[paperless-ngx<br/>workspace A]
     p2[paperless-ngx<br/>workspace B]
     tdb[(postgres<br/>paperless_* + index_*)]
@@ -55,7 +55,12 @@ flowchart LR
 ## Trust boundaries
 
 1. **Browser → control plane.** This is the only way in: session cookie, CSRF, rate limits. Every `/v1/workspaces/{id}/…` route goes through, in order: authenticate, then `authorize(user, workspace, action)`, then `assert_region(workspace.region)`, then the handler, then an audit append.
-2. **Control plane / worker → tenants network.** Only these two services sit on both networks. Tenants publish no ports (smoke-tested) and have no route out (smoke-tested), so a compromised tenant can't send data anywhere.
+2. **Control plane / worker → tenant networks.** Each tenant has its own internal network (`tenant_<ws>`) and its own Redis.
+   - The control plane, the worker and the stateless or shared helpers (Postgres, Tika, Gotenberg, Ollama) are attached to every tenant network, so a tenant can reach them but never another tenant.
+   - Tenants publish no ports, have no route out (by name or by raw IP), can't reach another tenant's Paperless-ngx or Redis, and can't log into their Sijil index database.
+   - Ollama is on no network with a route out either, so it can't be used as a relay. Models are pulled by a separate on-demand `ollama-pull` service (`make models`).
+   - All of the above is smoke-tested.
+   - The control plane must never trust a request because of its network origin: tenants can reach it too.
 3. **Tenant → tenant.** Each tenant has its own database, volumes, Paperless secret key and API token. The control plane holds tokens encrypted with a per-tenant data key, and never lends a token to the browser.
 
 ## Where data lives
@@ -124,7 +129,10 @@ canonical_json = sorted keys, no whitespace, UTF-8, timestamps ISO-8601 UTC with
 ```
 
 - There is one chain per workspace. Appends take a per-workspace Postgres advisory lock, so concurrent writers can't fork the chain.
-- The app's database role has `INSERT` and `SELECT` on `audit_event`, and a trigger rejects `UPDATE` and `DELETE`.
+- Two database roles:
+  - `sijil_cp_owner` owns the schema and runs only in the one-shot `migrate` service.
+  - The API and worker connect as `sijil_cp_app`, which can't create, alter or drop tables, triggers or grants (smoke-tested).
+- The `audit_event` migration revokes `UPDATE` and `DELETE` from `sijil_cp_app`, and a trigger rejects them as defence in depth.
 - `sijil-cp audit verify --workspace <id>` walks the chain. Export integrity reports include the chain head.
 
 ## Region enforcement
@@ -138,7 +146,9 @@ canonical_json = sorted keys, no whitespace, UTF-8, timestamps ISO-8601 UTC with
 ## `TenantRuntime` lifecycle (M1)
 
 ```
-provision(workspace) → creates databases paperless_<ws> + index_<ws>, volumes, container on `tenants`
+provision(workspace) → creates network tenant_<ws> (internal) + redis on it, databases paperless_<ws>
+                       and index_<ws> (separate roles and passwords), volumes, container on tenant_<ws>;
+                       attaches control plane, worker and shared helpers to tenant_<ws>
                      → waits for health → creates service user (view/add/change, no delete)
                        and read-only support user → takes token → stores it encrypted
                      → workspace.state = active
