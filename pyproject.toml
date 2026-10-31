@@ -35,7 +35,10 @@ select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
 known-first-party = ["sijil_core", "sijil_cp", "sijil_worker"]
 
 [tool.ruff.lint.per-file-ignores]
-"**/tests/**" = ["S101"]
+"**/tests/**" = ["S101", "S105", "S106"]
+"conftest.py" = ["S106"]
+# Enum member values name kinds of secret; they are not secrets.
+"libs/sijil-core/src/sijil_core/db/models.py" = ["S105"]
 
 [tool.mypy]
 strict = true
@@ -50,3 +53,4 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--import-mode=importlib"
+markers = ["db: needs Postgres (set SIJIL_TEST_DATABASE_URL)"]

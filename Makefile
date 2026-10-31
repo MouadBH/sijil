@@ -15,6 +15,8 @@ typecheck:
 	uv run mypy libs services fixtures
 	pnpm typecheck
 
+test: export SIJIL_TEST_DATABASE_URL ?= postgresql+asyncpg://postgres:dev-postgres-change-me@127.0.0.1:55432/postgres
+test: export SIJIL_TEST_REDIS_URL ?= redis://127.0.0.1:56379/15
 test:
 	uv run pytest
 	pnpm test

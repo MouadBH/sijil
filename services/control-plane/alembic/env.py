@@ -4,10 +4,11 @@ from alembic import context
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from sijil_core.db import models  # noqa: F401  (registers the tables on Base.metadata)
+from sijil_core.db.base import Base
 from sijil_cp.settings import MigrationSettings
 
-# Models register their tables on this metadata from M1 onwards.
-target_metadata = None
+target_metadata = Base.metadata
 
 # Migrations run as the schema owner, never as the app role the API uses.
 url = str(MigrationSettings().migration_database_url)
