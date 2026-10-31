@@ -127,6 +127,39 @@ async def test_region_mismatch_maps_to_421(
     assert r.json() == {"error": {"code": "region.mismatch"}}
 
 
+async def test_unknown_route_uses_envelope(
+    app: FastAPI, client_for: Callable[[FastAPI], httpx.AsyncClient]
+) -> None:
+    async with client_for(app) as c:
+        r = await c.get("/v1/does-not-exist")
+    assert r.status_code == 404
+    assert r.json() == {"error": {"code": "not_found"}}
+
+
+async def test_wrong_method_uses_envelope_and_keeps_allow(
+    app: FastAPI, client_for: Callable[[FastAPI], httpx.AsyncClient]
+) -> None:
+    async with client_for(app) as c:
+        c.cookies.set("sijil_csrf", "x")
+        r = await c.put("/v1/health", headers={"X-CSRF-Token": "x"})
+    assert r.status_code == 405
+    assert r.json() == {"error": {"code": "method_not_allowed"}}
+    assert "GET" in r.headers["allow"]
+
+
+async def test_unhandled_exception_is_internal_without_detail(app: FastAPI) -> None:
+    @app.get("/v1/_t/boom")
+    async def boom() -> None:
+        raise RuntimeError("secret-detail")
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp") as c:
+        r = await c.get("/v1/_t/boom")
+    assert r.status_code == 500
+    assert r.json() == {"error": {"code": "internal"}}
+    assert "secret-detail" not in r.text
+
+
 @pytest.mark.db
 async def test_client_fixture_serves_ready_on_real_db_and_redis(client: httpx.AsyncClient) -> None:
     r = await client.get("/v1/health/ready")
