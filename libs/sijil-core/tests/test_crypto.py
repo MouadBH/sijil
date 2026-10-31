@@ -77,6 +77,16 @@ def test_master_key_must_be_32_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     assert KeySettings().master_key_bytes() == good
 
 
+def test_bad_master_key_not_echoed_in_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SIJIL_REGION", "ma-cas")
+    monkeypatch.setenv("SIJIL_ENVIRONMENT", "test")
+    bad = base64.b64encode(os.urandom(31)).decode()
+    monkeypatch.setenv("SIJIL_MASTER_KEY", bad)
+    with pytest.raises(ValidationError) as exc:
+        KeySettings()
+    assert bad not in str(exc.value)
+
+
 def test_nonce_unique_per_seal(ks: LocalKeyService) -> None:
     nonces = {seal(b"x", ks, "ws1", CTX).nonce for _ in range(1000)}
     assert len(nonces) == 1000

@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from pydantic import SecretStr, field_validator
+from pydantic_settings import SettingsConfigDict
 
 from sijil_core.settings import CoreSettings
 
@@ -30,6 +31,11 @@ class DecryptionError(Exception):
 
 
 class KeySettings(CoreSettings):
+    # Never echo the raw (possibly near-miss) key in validation errors.
+    model_config = SettingsConfigDict(
+        env_prefix="SIJIL_", extra="ignore", hide_input_in_errors=True
+    )
+
     master_key: SecretStr
 
     @field_validator("master_key")
