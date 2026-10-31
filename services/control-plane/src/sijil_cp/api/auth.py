@@ -159,15 +159,16 @@ async def login(
 ) -> LoginOut:
     ip, user_agent = _client(request)
     key = ratelimit.login_key(body.email, ip)
-    if await ratelimit.too_many(redis, key, ratelimit.LOGIN_LIMIT, ratelimit.LOGIN_WINDOW_S):
+    # Counted before verifying, atomically, so parallel requests can't share one read of the count.
+    if not await ratelimit.hit(redis, key, ratelimit.LOGIN_LIMIT, ratelimit.LOGIN_WINDOW_S):
         raise ApiError("auth.rate_limited", 429)
     user = await db.scalar(select(User).where(User.email == body.email))
     # Exactly one argon2 verify whether or not the account exists.
     stored = user.password_hash if user is not None else None
     ok = await asyncio.to_thread(passwords.verify_password, stored, body.password)
     if user is None or not ok:
-        await ratelimit.record_failure(redis, key, ratelimit.LOGIN_WINDOW_S)
         raise ApiError("auth.invalid_credentials", 401)
+    # Success forgives earlier failures; the attempt itself was counted above.
     await ratelimit.clear(redis, key)
     await _retire_presented_token(db, request, now)
     _, raw = await sessions.create_session(

@@ -6,13 +6,14 @@ from datetime import timedelta
 import httpx
 import pytest
 from fastapi import FastAPI
+from redis.asyncio import Redis
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import User, UserSession
 from sijil_cp import deps
-from sijil_cp.auth import passwords
+from sijil_cp.auth import passwords, ratelimit
 
 pytestmark = pytest.mark.db
 
@@ -258,6 +259,35 @@ async def test_login_rate_limited_after_10_failures(
     # Another account from the same IP is not locked out.
     assert (await signup(client, "other@example.com")).status_code == 201
     assert (await login(client, "other@example.com")).status_code == 200
+
+
+async def test_parallel_login_burst_is_rate_limited(
+    make_db_app: Callable[..., FastAPI],
+    csrf_client_for: Callable[..., httpx.AsyncClient],
+    db: AsyncSession,
+) -> None:
+    app = make_db_app()
+    async with csrf_client_for(app) as c:
+        assert (await signup(c)).status_code == 201
+    clients = [csrf_client_for(app) for _ in range(20)]
+    try:
+        results = await asyncio.gather(*(login(cl, password="wrong password!!") for cl in clients))
+    finally:
+        for cl in clients:
+            await cl.aclose()
+    codes = [r.status_code for r in results]
+    assert set(codes) <= {401, 429}
+    assert codes.count(401) <= ratelimit.LOGIN_LIMIT
+    assert codes.count(429) >= 20 - ratelimit.LOGIN_LIMIT
+
+
+async def test_login_failure_counter_expires(
+    client: httpx.AsyncClient, db: AsyncSession, redis: Redis
+) -> None:
+    assert (await signup(client)).status_code == 201
+    assert (await login(client, password="wrong password!!")).status_code == 401
+    ttl = await redis.ttl(ratelimit.login_key(EMAIL, "127.0.0.1"))
+    assert 0 < ttl <= ratelimit.LOGIN_WINDOW_S
 
 
 async def test_login_with_totp_returns_pending_session(

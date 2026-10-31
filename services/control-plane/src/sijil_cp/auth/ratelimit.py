@@ -1,4 +1,4 @@
-"""Fixed-window failure counters in Redis."""
+"""Fixed-window attempt counters in Redis."""
 
 import hashlib
 
@@ -14,17 +14,17 @@ def login_key(email: str, ip: str) -> str:
     return f"ratelimit:login:{digest}"
 
 
-async def too_many(redis: Redis, key: str, limit: int, window_s: int) -> bool:
-    # window_s is part of the interface; the window itself lives in the key's TTL.
-    count = await redis.get(key)
-    return count is not None and int(count) >= limit
+async def hit(redis: Redis, key: str, limit: int, window_s: int) -> bool:
+    """Count one attempt atomically, before doing the work; True while within the limit.
 
-
-async def record_failure(redis: Redis, key: str, window_s: int) -> None:
+    Counting first means a burst of parallel requests can't all slip past a read-only check.
+    The window starts with the first attempt (EXPIRE NX) and is not extended by later ones.
+    """
     async with redis.pipeline(transaction=True) as pipe:
         pipe.incr(key)
         pipe.expire(key, window_s, nx=True)
-        await pipe.execute()
+        count, _ = await pipe.execute()
+    return int(count) <= limit
 
 
 async def clear(redis: Redis, key: str) -> None:
