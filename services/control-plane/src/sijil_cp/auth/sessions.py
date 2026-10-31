@@ -15,6 +15,8 @@ from sijil_core.db.models import User, UserSession
 COOKIE = "sijil_session"
 ABSOLUTE_TTL = timedelta(hours=12)
 IDLE_TTL = timedelta(hours=2)
+# A session that has passed the password but not yet TOTP lives only this long.
+PENDING_TTL = timedelta(minutes=10)
 # last_seen_at is written at most this often.
 TOUCH_EVERY = timedelta(minutes=1)
 _TOKEN_BYTES = 32
@@ -37,16 +39,25 @@ async def create_session(
     user_agent: str,
     pending_totp: bool,
     now: datetime | None = None,
+    totp_verified_at: datetime | None = None,
+    expires_at: datetime | None = None,
 ) -> tuple[UserSession, str]:
+    """A new session and its raw token.
+
+    `expires_at` lets a rotated session keep the absolute expiry of the one it replaces;
+    it can only shorten the default, never extend it.
+    """
     now = now or utcnow()
     raw = new_token()
+    ceiling = now + (PENDING_TTL if pending_totp else ABSOLUTE_TTL)
     row = UserSession(
         user_id=user.id,
         token_hash=token_hash(raw),
         created_at=now,
-        expires_at=now + ABSOLUTE_TTL,
+        expires_at=min(expires_at, ceiling) if expires_at is not None else ceiling,
         last_seen_at=now,
         pending_totp=pending_totp,
+        totp_verified_at=totp_verified_at,
         ip=ip,
         user_agent=user_agent[:_UA_MAX],
     )
@@ -78,5 +89,17 @@ async def revoke(db: AsyncSession, session_id: UUID, *, now: datetime | None = N
         update(UserSession)
         .where(UserSession.id == session_id, UserSession.revoked_at.is_(None))
         .values(revoked_at=now or utcnow())
+    )
+    await db.commit()
+
+
+async def revoke_token(db: AsyncSession, raw_token: str | None, now: datetime) -> None:
+    """Revoke the session a raw token belongs to, if any (no session fixation on rotation)."""
+    if not raw_token:
+        return
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.token_hash == token_hash(raw_token), UserSession.revoked_at.is_(None))
+        .values(revoked_at=now)
     )
     await db.commit()

@@ -1,17 +1,25 @@
 """Fixed-window attempt counters in Redis."""
 
 import hashlib
+from uuid import UUID
 
 from redis.asyncio import Redis
 
 LOGIN_LIMIT = 10
 LOGIN_WINDOW_S = 15 * 60
+TOTP_LIMIT = 5
+TOTP_WINDOW_S = 15 * 60
 
 
 def login_key(email: str, ip: str) -> str:
     # Hashed so Redis never holds addresses in clear.
     digest = hashlib.sha256(f"{email.strip().lower()}\x00{ip}".encode()).hexdigest()
     return f"ratelimit:login:{digest}"
+
+
+def totp_key(user_id: UUID) -> str:
+    # Per user, not per session: a fresh login must not reset the counter.
+    return f"ratelimit:totp:{user_id}"
 
 
 async def hit(redis: Redis, key: str, limit: int, window_s: int) -> bool:
