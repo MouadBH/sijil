@@ -1,4 +1,4 @@
-"""Celery entrypoint: `celery -A sijil_worker.main worker -Q default,provisioning,ingest,extraction`."""
+"""Celery entrypoint, see the worker Dockerfile CMD for the queue list."""
 
 from sijil_worker.app import make_celery
 from sijil_worker.settings import WorkerSettings
