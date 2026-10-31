@@ -74,11 +74,32 @@ async def unreachable_client(
 
 
 @pytest.fixture
-async def client(migrated_db: Any, redis: Redis) -> AsyncIterator[CsrfClient]:
+def make_db_app(migrated_db: Any, redis: Redis) -> Callable[..., FastAPI]:
+    """Build an app on the migrated test DB and test Redis; override any setting by keyword."""
+
+    def _make(**overrides: str) -> FastAPI:
+        settings = make_settings(
+            database_url=migrated_db.app_url,
+            redis_url=os.environ["SIJIL_TEST_REDIS_URL"],
+            **overrides,
+        )
+        return create_app(settings)
+
+    return _make
+
+
+@pytest.fixture
+def csrf_client_for() -> Callable[..., CsrfClient]:
+    def _make(app: FastAPI, base_url: str = "http://cp") -> CsrfClient:
+        return CsrfClient(transport=httpx.ASGITransport(app=app), base_url=base_url)
+
+    return _make
+
+
+@pytest.fixture
+async def client(
+    make_db_app: Callable[..., FastAPI], csrf_client_for: Callable[..., CsrfClient]
+) -> AsyncIterator[CsrfClient]:
     """App on the migrated test DB and test Redis; unsafe requests carry a CSRF token."""
-    settings = make_settings(
-        database_url=migrated_db.app_url, redis_url=os.environ["SIJIL_TEST_REDIS_URL"]
-    )
-    app = create_app(settings)
-    async with CsrfClient(transport=httpx.ASGITransport(app=app), base_url="http://cp") as c:
+    async with csrf_client_for(make_db_app()) as c:
         yield c
