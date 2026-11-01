@@ -1,9 +1,9 @@
 """Nightly integrity drift check.
 
-For every `consumed` document of a workspace it confirms that
-- the original is still in the tenant's Paperless-ngx and unchanged (Paperless 3.4.1 reports the
-  SHA-256 of the original as `original_checksum`; it must equal the ledger's `sha256`), and
-- our object-locked copy still exists with the size the ledger recorded.
+For every ledger row of a workspace it confirms that our object-locked copy still exists with
+the size the ledger recorded, and for every `consumed` one also that the original is still in the
+tenant's Paperless-ngx and unchanged (Paperless 3.4.1 reports the SHA-256 of the original as
+`original_checksum`; it must equal the ledger's `sha256`).
 
 Every problem becomes an `IntegrityAlert` (never a second open one for the same document and
 kind) plus an `integrity.drift` audit event; the run ends with `integrity.check_ok` or
@@ -152,11 +152,9 @@ async def _page(
             DocumentLedger.object_key,
             DocumentLedger.object_version_id,
             DocumentLedger.paperless_doc_id,
+            DocumentLedger.ingest_state,
         )
-        .where(
-            DocumentLedger.workspace_id == workspace_id,
-            DocumentLedger.ingest_state == IngestState.consumed,
-        )
+        .where(DocumentLedger.workspace_id == workspace_id)
         .order_by(DocumentLedger.id)
         .limit(BATCH_SIZE)
     )
@@ -170,7 +168,8 @@ async def _page(
             r.sha256,
             r.size_bytes,
             ObjectRef(r.object_key, r.object_version_id),
-            r.paperless_doc_id,
+            # Paperless is asked only about what it consumed; the object, about every row.
+            r.paperless_doc_id if r.ingest_state == IngestState.consumed else None,
         )
         for r in rows
     ]

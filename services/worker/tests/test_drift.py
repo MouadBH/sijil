@@ -167,17 +167,19 @@ async def test_clean_workspace_reports_ok(
     tmp_path: Path,
 ) -> None:
     docs = [await make_doc(db, memory_store, ready, tmp_path, i) for i in (1, 2)]
-    await make_doc(db, memory_store, ready, tmp_path, 3, state=IngestState.queued)  # not checked
+    # Not in Paperless yet: only its object is checked.
+    await make_doc(db, memory_store, ready, tmp_path, 3, state=IngestState.queued)
     with respx.mock(assert_all_called=True) as router:
         for i, doc in enumerate(docs, start=1):
             metadata(router, i, doc.sha256.upper())  # case does not matter
         report = await run(ready, sessions, keys, memory_store)
-    assert report == DriftReport(checked=2, problems=0)
+        assert router.calls.call_count == 2
+    assert report == DriftReport(checked=3, problems=0)
     assert await alerts(db) == []
     (event,) = await events(db, ready)
     assert event.action == "integrity.check_ok"
     assert event.actor_type.value == "system"
-    assert event.data == {"checked": 2}
+    assert event.data == {"checked": 3}
     assert (await audit.verify(db, ready.id)).ok
 
 
@@ -247,6 +249,29 @@ async def test_object_missing_flagged(
         metadata(router, 1, doc.sha256)
         report = await run(ready, sessions, keys, memory_store)
     assert report.problems == 1
+    (alert,) = await alerts(db)
+    assert (alert.ledger_id, alert.kind) == (doc.id, "object_missing")
+
+
+@pytest.mark.parametrize(
+    "state", [IngestState.unsupported, IngestState.failed, IngestState.queued, IngestState.sending]
+)
+async def test_object_checked_for_every_row_whatever_its_ingest_state(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    state: IngestState,
+) -> None:
+    # An archived original is ours to keep even when Paperless never consumed it.
+    doc = await make_doc(db, memory_store, ready, tmp_path, 1, state=state)
+    memory_store.objects.clear()
+    with respx.mock(assert_all_called=False) as router:
+        report = await run(ready, sessions, keys, memory_store)
+        assert router.calls.call_count == 0  # never asked Paperless about it
+    assert report == DriftReport(checked=1, problems=1)
     (alert,) = await alerts(db)
     assert (alert.ledger_id, alert.kind) == (doc.id, "object_missing")
 
