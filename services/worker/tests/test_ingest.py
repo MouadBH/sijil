@@ -1,5 +1,6 @@
 """Ingest of an accepted original into the workspace's Paperless (respx + in-memory store)."""
 
+import asyncio
 import hashlib
 import logging
 import uuid
@@ -467,7 +468,8 @@ async def test_other_consume_failure_is_retried_then_failed(
     failure = task_row("failure", result_data={"error_message": "x.pdf: Error while consuming"})
     for will_retry, state in ((True, IngestState.queued), (False, IngestState.failed)):
         with respx.mock(assert_all_called=False) as router:
-            mock_flow(router, tasks=[httpx.Response(200, json=failure)])
+            # The second run first resumes the stored task (failed), then uploads afresh.
+            mock_flow(router, tasks=[httpx.Response(200, json=failure)] * 3)
             with pytest.raises(Exception, match="consume"):
                 await run(ledger, sessions, keys, memory_store, will_retry=will_retry)
         row = await reload(db, ledger)
@@ -619,3 +621,208 @@ async def test_requeue_sweep_survives_a_failed_enqueue(
 
     assert await requeue_stuck_ingest(sessions, flaky) == 1
     assert len(calls) == 2
+
+
+async def test_requeue_sweep_skips_rows_with_a_pending_retry(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    enqueued: list[tuple[uuid.UUID, uuid.UUID]],
+    enqueue: Callable[[uuid.UUID, uuid.UUID], Any],
+) -> None:
+    now = utcnow()
+    waiting = await make_ledger(
+        db, memory_store, ready, tmp_path, data=PDF + b"w", age=timedelta(hours=1)
+    )
+    overdue = await make_ledger(
+        db, memory_store, ready, tmp_path, data=PDF + b"o", age=timedelta(hours=1)
+    )
+    waiting.ingest_next_attempt_at = now + timedelta(minutes=5)  # Celery's countdown is running
+    overdue.ingest_next_attempt_at = now - timedelta(minutes=11)  # the retry never came
+    await db.commit()
+    assert await requeue_stuck_ingest(sessions, enqueue) == 1
+    assert enqueued == [(overdue.id, ready.id)]
+
+
+async def test_requeue_sweep_recovers_an_expired_sending_lease(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    enqueued: list[tuple[uuid.UUID, uuid.UUID]],
+    enqueue: Callable[[uuid.UUID, uuid.UUID], Any],
+) -> None:
+    now = utcnow()
+    dead = await make_ledger(db, memory_store, ready, tmp_path, data=PDF + b"d")
+    live = await make_ledger(db, memory_store, ready, tmp_path, data=PDF + b"l")
+    for row, claimed in ((dead, now - timedelta(minutes=30)), (live, now - timedelta(minutes=1))):
+        row.ingest_state = IngestState.sending
+        row.ingest_claimed_at = claimed
+    await db.commit()
+    assert await requeue_stuck_ingest(sessions, enqueue) == 1
+    assert enqueued == [(dead.id, ready.id)]
+
+
+async def test_transient_failure_records_when_the_retry_is_due(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    before = utcnow()
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/").respond(503)
+        with pytest.raises(PaperlessUnavailable):
+            await ingest_document(
+                ledger.id,
+                sessions=sessions,
+                keys=keys,
+                store=memory_store,
+                paperless=paperless,
+                settings=SETTINGS,
+                will_retry=lambda _exc: True,
+                retry_after_s=90,
+            )
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.queued
+    assert row.ingest_claimed_at is None
+    assert row.ingest_attempts == 1
+    assert row.ingest_next_attempt_at is not None
+    assert before + timedelta(seconds=89) < row.ingest_next_attempt_at
+    assert row.ingest_next_attempt_at < utcnow() + timedelta(seconds=91)
+
+
+async def test_failed_row_is_terminal_for_automatic_paths(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    ledger.ingest_state = IngestState.failed
+    ledger.ingest_error_code = "ingest.consume_failed"
+    await db.commit()
+    with respx.mock(assert_all_called=False) as router:
+        await run(ledger, sessions, keys, memory_store, will_retry=True)
+        assert router.calls.call_count == 0
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.failed
+    assert row.ingest_attempts == 0
+    assert await events(db, ready) == []
+
+
+async def test_row_held_by_a_live_claim_is_left_alone_but_an_expired_one_is_taken(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    ledger.ingest_state = IngestState.sending
+    ledger.ingest_claimed_at = utcnow() - timedelta(minutes=1)
+    await db.commit()
+    with respx.mock(assert_all_called=False) as router:
+        await run(ledger, sessions, keys, memory_store)
+        assert router.calls.call_count == 0
+    assert (await reload(db, ledger)).ingest_state is IngestState.sending
+
+    ledger.ingest_claimed_at = utcnow() - timedelta(minutes=30)
+    await db.commit()
+    with respx.mock(assert_all_called=False) as router:
+        mock_flow(router)
+        await run(ledger, sessions, keys, memory_store)
+    assert (await reload(db, ledger)).ingest_state is IngestState.consumed
+
+
+async def test_overlapping_runs_on_one_row_upload_once(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+
+    async def slow_lookup(_request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.3)  # keeps the first run busy while the second one starts
+        return httpx.Response(200, json={"results": []})
+
+    with respx.mock(assert_all_called=False) as router:
+        upload, _ = mock_flow(router)
+        router.get(f"{URL}/api/documents/").mock(side_effect=slow_lookup)
+        await asyncio.gather(
+            run(ledger, sessions, keys, memory_store), run(ledger, sessions, keys, memory_store)
+        )
+        assert upload.call_count == 1
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.consumed
+    assert row.ingest_attempts == 1
+    assert len(await events(db, ready)) == 1
+
+
+async def test_stored_task_id_is_resumed_without_a_second_upload(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    ledger.paperless_task_id = TASK_ID
+    await db.commit()
+    with respx.mock(assert_all_called=False) as router:
+        upload, tasks = mock_flow(router)
+        await run(ledger, sessions, keys, memory_store)
+        assert not upload.called
+        assert tasks.called
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.consumed
+    assert row.paperless_doc_id == 7
+
+
+@pytest.mark.parametrize("answer", ["unknown", "failed"])
+async def test_stored_task_that_is_unknown_or_failed_is_replaced_by_a_new_upload(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    answer: str,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    ledger.paperless_task_id = "old-task"
+    await db.commit()
+    old = (
+        httpx.Response(200, json=[])
+        if answer == "unknown"
+        else httpx.Response(
+            200, json=task_row("failure", result_data={"error_message": "x.pdf: Error consuming"})
+        )
+    )
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/").respond(200, json={"results": []})
+        upload = router.post(f"{URL}/api/documents/post_document/").respond(200, json=TASK_ID)
+        tasks = router.get(f"{URL}/api/tasks/")
+        tasks.side_effect = [
+            old,
+            httpx.Response(200, json=task_row("success", related_document_ids=[5])),
+        ]
+        await run(ledger, sessions, keys, memory_store)
+        assert upload.call_count == 1
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.consumed
+    assert row.paperless_task_id == TASK_ID
+    assert row.paperless_doc_id == 5

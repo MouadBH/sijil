@@ -158,10 +158,14 @@ INGEST_KWARGS = {"ledger_id": ARGS[0], "workspace_id": ARGS[1]}
 
 def _ingest_recording(
     error: Exception, decisions: list[bool]
-) -> Callable[[str, str, Callable[[Exception], bool]], object]:
+) -> Callable[[str, str, Callable[[Exception], bool], float], object]:
     async def fake(
-        ledger_id: str, workspace_id: str, will_retry: Callable[[Exception], bool]
+        ledger_id: str,
+        workspace_id: str,
+        will_retry: Callable[[Exception], bool],
+        retry_after_s: float,
     ) -> None:
+        assert retry_after_s >= 0
         decisions.append(will_retry(error))
         raise error
 

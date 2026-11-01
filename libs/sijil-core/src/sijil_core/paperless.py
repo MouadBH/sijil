@@ -62,6 +62,8 @@ class PaperlessTask:
     # Paperless's own failure text for a FAILURE task (`result_data.error_message`). Used to
     # classify the failure; callers must not log it or store it.
     error: str | None = None
+    # False when Paperless has no record of the task id (never seen, or purged).
+    known: bool = True
 
 
 def _related_document(row: dict[str, Any]) -> int | None:
@@ -232,7 +234,8 @@ class PaperlessClient:
     async def upload(self, content: bytes, filename: str, title: str | None = None) -> str:
         """Queue `content` for consumption and return the Paperless task id.
 
-        Raises PaperlessUnsupportedType when Paperless refuses the file type outright.
+        Raises PaperlessUnsupportedType when Paperless refuses the file type outright. Retries
+        only connection failures (nothing was sent); gateway errors surface as Unavailable.
         """
         where = "POST /api/documents/post_document/"
         data = {"title": title} if title else None
@@ -254,10 +257,11 @@ class PaperlessClient:
             else:
                 if response.status_code == 400 and _is_unsupported_type(response):
                     raise PaperlessUnsupportedType(f"{where}: HTTP 400", 400)
-                if response.status_code not in _RETRY_STATUS:
-                    return str(self._checked(where, response).json())
-                if last:
+                if response.status_code in _RETRY_STATUS:
+                    # Not retried here: the POST may already have been applied, so the caller
+                    # resumes by task id / checksum instead of uploading again.
                     raise PaperlessUnavailable(f"{where}: HTTP {response.status_code}")
+                return str(self._checked(where, response).json())
             await asyncio.sleep(_BACKOFF_S * 2**attempt)
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -281,7 +285,9 @@ class PaperlessClient:
         if isinstance(rows, dict):
             rows = rows.get("results", [])
         if not rows:
-            return PaperlessTask(task_id=task_id, status="PENDING", related_document=None)
+            return PaperlessTask(
+                task_id=task_id, status="PENDING", related_document=None, known=False
+            )
         row = rows[0]
         return PaperlessTask(
             task_id=task_id,

@@ -194,3 +194,25 @@ async def test_transport_errors_are_unavailable_and_post_is_sent_once(
             await client.obtain_token("svc", "pw-secret")
     assert route.call_count == 1
     assert "pw-secret" not in str(exc.value)
+
+
+@pytest.mark.parametrize("status", [502, 503, 504])
+@respx.mock
+async def test_upload_is_never_retried_on_gateway_errors(status: int) -> None:
+    route = respx.post(f"{BASE}/api/documents/post_document/").mock(
+        return_value=httpx.Response(status)
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.upload(b"%PDF-1", "a.pdf")
+    assert route.call_count == 1  # the POST may have been applied: the caller resumes safely
+
+
+@respx.mock
+async def test_upload_retries_only_when_the_request_was_never_sent() -> None:
+    route = respx.post(f"{BASE}/api/documents/post_document/").mock(
+        side_effect=[httpx.ConnectError("refused"), httpx.Response(200, json="task-1")]
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.upload(b"%PDF-1", "a.pdf") == "task-1"
+    assert route.call_count == 2

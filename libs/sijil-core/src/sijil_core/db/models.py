@@ -276,6 +276,11 @@ class DocumentLedger(Base):
     __table_args__ = (
         UniqueConstraint("workspace_id", "sha256", name="uq_document_ledger_workspace_sha256"),
         Index("ix_document_ledger_workspace_ingested", "workspace_id", text("ingested_at DESC")),
+        Index(
+            "ix_document_ledger_ingest_pending",
+            "ingest_next_attempt_at",
+            postgresql_where=text("ingest_state IN ('queued','sending')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -296,6 +301,10 @@ class DocumentLedger(Base):
         _enum(IngestState), default=IngestState.queued
     )
     ingest_error_code: Mapped[str | None] = mapped_column(String)
+    # Claim lease, attempt counter and the earliest retry time of the ingest worker.
+    ingest_claimed_at: Mapped[datetime | None] = _tstz()
+    ingest_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    ingest_next_attempt_at: Mapped[datetime | None] = _tstz()
     paperless_task_id: Mapped[str | None] = mapped_column(String)
     paperless_doc_id: Mapped[int | None] = mapped_column(Integer)
     retention_until: Mapped[date] = mapped_column(Date)

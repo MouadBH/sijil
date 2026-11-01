@@ -140,7 +140,10 @@ def reconcile_tenants_task() -> list[str]:
 
 
 async def _ingest(
-    ledger_id: str, workspace_id: str, will_retry: Callable[[Exception], bool]
+    ledger_id: str,
+    workspace_id: str,
+    will_retry: Callable[[Exception], bool],
+    retry_after_s: float,
 ) -> None:
     settings = WorkerSettings()
     engine = make_engine(settings.database_url)
@@ -154,6 +157,7 @@ async def _ingest(
             settings=settings,
             workspace_id=UUID(workspace_id),
             will_retry=will_retry,
+            retry_after_s=retry_after_s,
         )
     finally:
         await engine.dispose()
@@ -171,17 +175,19 @@ def ingest_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: s
     def will_retry(exc: Exception) -> bool:
         return is_ingest_transient(exc) and retries < INGEST_MAX_RETRIES
 
+    # Chosen up front so the ledger records exactly when Celery will retry, and the requeue
+    # sweep leaves the row alone until then.
+    countdown = get_exponential_backoff_interval(
+        factor=INGEST_BACKOFF_FACTOR_S,
+        retries=retries,
+        maximum=INGEST_BACKOFF_MAX_S,
+        full_jitter=True,
+    )
     try:
-        asyncio.run(_ingest(ledger_id, workspace_id, will_retry))
+        asyncio.run(_ingest(ledger_id, workspace_id, will_retry, float(countdown)))
     except Exception as exc:
         if not will_retry(exc):
             raise
-        countdown = get_exponential_backoff_interval(
-            factor=INGEST_BACKOFF_FACTOR_S,
-            retries=retries,
-            maximum=INGEST_BACKOFF_MAX_S,
-            full_jitter=True,
-        )
         raise self.retry(exc=exc, countdown=countdown) from exc
 
 
