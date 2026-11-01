@@ -5,6 +5,7 @@ import asyncio
 import sys
 import time
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 import httpx
@@ -12,6 +13,9 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_cp.storage_admin import AppCredentialSettings, ensure_app_user
+
+if TYPE_CHECKING:
+    from sijil_cp.settings import CpSettings
 
 _BOOTSTRAP_ATTEMPTS = 30
 
@@ -48,21 +52,36 @@ def bootstrap_storage() -> None:
             return
 
 
-def audit_verify(workspace_id: UUID) -> int:
-    """Recompute a workspace's audit chain. Exit code 0 when intact, 1 when broken."""
+def audit_verify(workspace_id: UUID, settings: "CpSettings | None" = None) -> int:
+    """Recompute a workspace's audit chain.
+
+    Exit code 0 when intact, 1 when broken, 2 when it could not be verified at all (an unknown
+    workspace, or the database unreachable): an empty chain for a mistyped id is not "ok".
+    """
     from sijil_core import audit
+    from sijil_core.db.models import Workspace
     from sijil_cp.db import make_engine, make_sessionmaker
     from sijil_cp.settings import CpSettings
 
-    async def _run() -> audit.VerifyResult:
-        engine = make_engine(CpSettings())
+    async def _run() -> audit.VerifyResult | None:
+        engine = make_engine(settings or CpSettings())
         try:
             async with make_sessionmaker(engine)() as db:
+                if await db.get(Workspace, workspace_id) is None:
+                    return None
                 return await audit.verify(db, workspace_id)
         finally:
             await engine.dispose()
 
-    result = asyncio.run(_run())
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        # The type only: messages can carry the connection string.
+        print(f"database error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    if result is None:
+        print("unknown workspace", file=sys.stderr)  # noqa: T201
+        return 2
     print(f"ok {result.count}" if result.ok else f"broken at seq {result.first_bad_seq}")  # noqa: T201
     return 0 if result.ok else 1
 
