@@ -31,11 +31,23 @@ x-sijil-env: &sijil-env
   SIJIL_INBOUND_DOMAIN: in.sijil.local
   SIJIL_REDIS_URL: redis://redis:6379/0
 
+# Every running service gets the least-privilege `sijil-app` key (put, read, list; no delete,
+# no BypassGovernanceRetention), which `migrate` provisions. Only `migrate` and the test runner
+# hold the RustFS root key.
 x-objectstore-env: &objectstore-env
+  SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
+  SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_APP_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_APP_SECRET_KEY:?}
+  SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
+
+x-objectstore-root-env: &objectstore-root-env
   SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
   SIJIL_OBJECTSTORE_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY:?}
   SIJIL_OBJECTSTORE_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY:?}
   SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
+  # The credential `sijil-cp bootstrap-storage` provisions (and the tests check).
+  SIJIL_OBJECTSTORE_APP_ACCESS_KEY: ${SIJIL_OBJECTSTORE_APP_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_APP_SECRET_KEY: ${SIJIL_OBJECTSTORE_APP_SECRET_KEY:?}
 
 x-worker-env: &worker-env
   <<: [*sijil-env, *objectstore-env]
@@ -188,7 +200,7 @@ services:
     command: ["sh", "-c", "alembic upgrade head && sijil-cp bootstrap-storage"]
     restart: "no"
     environment:
-      <<: *objectstore-env
+      <<: *objectstore-root-env
       SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
       SIJIL_ENVIRONMENT: dev
       SIJIL_MIGRATION_DATABASE_URL: postgresql+asyncpg://sijil_cp_owner:${SIJIL_CP_OWNER_DB_PASSWORD:?}@postgres:5432/sijil_cp
@@ -279,7 +291,8 @@ services:
       # tenant networks they create. The socket is root on the host; never do this in production.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      <<: *worker-env
+      # Root key: the store tests exercise seal and governance removal (bypass).
+      <<: [*objectstore-root-env, *worker-env]
       UV_PROJECT_ENVIRONMENT: /opt/venv
       SIJIL_IT_T1_URL: http://paperless-t1:8000
       SIJIL_IT_T1_ADMIN_PASSWORD: ${T1_ADMIN_PASSWORD:?}

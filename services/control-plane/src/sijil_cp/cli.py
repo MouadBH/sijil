@@ -7,9 +7,11 @@ import time
 from collections.abc import Sequence
 from uuid import UUID
 
+import httpx
 from botocore.exceptions import BotoCoreError, ClientError
 
 from sijil_core.storage import S3ObjectStore, StorageSettings
+from sijil_cp.storage_admin import AppCredentialSettings, ensure_app_user
 
 _BOOTSTRAP_ATTEMPTS = 30
 
@@ -21,17 +23,20 @@ def serve() -> None:
 
 
 def bootstrap_storage() -> None:
-    """Create the object-locked bucket if missing. Safe to run repeatedly.
+    """Create the object-locked bucket and the services' least-privilege user if missing.
 
-    The store may still be starting when the one-shot `migrate` service reaches this point, so
-    connection errors are retried for about a minute.
+    Runs with the root key (only `migrate` holds it). Safe to run repeatedly. The store may
+    still be starting when the one-shot `migrate` service reaches this point, so connection
+    errors are retried for about a minute.
     """
     settings = StorageSettings()
+    app = AppCredentialSettings()
     store = S3ObjectStore(settings)
     for attempt in range(1, _BOOTSTRAP_ATTEMPTS + 1):
         try:
             asyncio.run(store.ensure_bucket())
-        except (BotoCoreError, ClientError) as exc:
+            ensure_app_user(settings, app)
+        except (BotoCoreError, ClientError, httpx.TransportError) as exc:
             if attempt == _BOOTSTRAP_ATTEMPTS:
                 raise
             print(  # noqa: T201
@@ -39,7 +44,7 @@ def bootstrap_storage() -> None:
             )
             time.sleep(2)
         else:
-            print(f"bucket {settings.objectstore_bucket} ready")  # noqa: T201
+            print(f"bucket {settings.objectstore_bucket} and app user ready")  # noqa: T201
             return
 
 
