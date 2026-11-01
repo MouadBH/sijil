@@ -27,12 +27,17 @@ SUPPORT_PERMISSIONS: tuple[str, ...] = (
 )
 
 _RETRY_STATUS = frozenset({502, 503, 504})
+_READY_ERRORS = frozenset({401, 403, 406})
 _ATTEMPTS = 3
 _BACKOFF_S = 0.5
 
 
 class PaperlessError(Exception):
     """A Paperless call failed. The message never includes credentials or bodies."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class PaperlessForbidden(PaperlessError):  # noqa: N818
@@ -118,9 +123,9 @@ class PaperlessClient:
     def _checked(where: str, response: httpx.Response) -> httpx.Response:
         status = response.status_code
         if status == 403:
-            raise PaperlessForbidden(f"{where}: HTTP 403")
+            raise PaperlessForbidden(f"{where}: HTTP 403", 403)
         if status >= 400:
-            raise PaperlessError(f"{where}: HTTP {status}")
+            raise PaperlessError(f"{where}: HTTP {status}", status)
         return response
 
     async def api_version(self) -> int:
@@ -140,10 +145,11 @@ class PaperlessClient:
         while True:
             try:
                 await self._request("GET", "/api/")
-            except PaperlessUnavailable:
-                pass
-            except PaperlessError:
-                return  # a 4xx still proves the server is answering
+            except PaperlessError as exc:
+                # 401/403/406 prove the app is answering; 5xx (e.g. migrations running) and
+                # transport errors (status None) mean not ready yet.
+                if exc.status in _READY_ERRORS:
+                    return
             else:
                 return
             if time.monotonic() >= deadline:
@@ -165,19 +171,24 @@ class PaperlessClient:
 
     async def ensure_user(self, username: str, password: str, permissions: Sequence[str]) -> int:
         existing = await self._find_user(username)
-        perms = list(permissions)
+        # Exactly these grants and nothing inherited: no groups, never staff/superuser, so an
+        # existing user cannot keep a delete_* right from elsewhere.
+        grants: dict[str, Any] = {
+            "user_permissions": list(permissions),
+            "groups": [],
+            "is_superuser": False,
+            "is_staff": False,
+        }
         if existing is not None:
             user_id = int(existing["id"])
             await self._request(
                 "PATCH",
                 f"/api/users/{user_id}/",
-                json={"password": password, "user_permissions": perms, "is_active": True},
+                json={**grants, "password": password, "is_active": True},
             )
             return user_id
         response = await self._request(
-            "POST",
-            "/api/users/",
-            json={"username": username, "password": password, "user_permissions": perms},
+            "POST", "/api/users/", json={**grants, "username": username, "password": password}
         )
         return int(response.json()["id"])
 

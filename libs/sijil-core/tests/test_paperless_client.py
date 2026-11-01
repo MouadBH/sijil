@@ -116,3 +116,59 @@ def test_service_permissions_have_no_delete() -> None:
 def test_support_permissions_view_only() -> None:
     assert SUPPORT_PERMISSIONS
     assert all(p.startswith("view_") for p in SUPPORT_PERMISSIONS)
+
+
+@respx.mock
+async def test_wait_ready_keeps_polling_through_500() -> None:
+    route = respx.get(f"{BASE}/api/").mock(
+        side_effect=[httpx.Response(500), httpx.Response(500), httpx.Response(302)]
+    )
+    async with PaperlessClient(BASE) as client:
+        await client.wait_ready(60)
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_wait_ready_keeps_polling_through_read_timeout() -> None:
+    route = respx.get(f"{BASE}/api/").mock(
+        side_effect=[httpx.ReadTimeout("slow"), httpx.Response(401)]
+    )
+    async with PaperlessClient(BASE) as client:
+        await client.wait_ready(60)
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_wait_ready_gives_up_on_persistent_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    respx.get(f"{BASE}/api/").mock(return_value=httpx.Response(500))
+    clock = iter(range(0, 1000, 5))
+    monkeypatch.setattr("sijil_core.paperless.time.monotonic", lambda: float(next(clock)))
+    async with PaperlessClient(BASE) as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.wait_ready(12)
+
+
+@respx.mock
+async def test_ensure_user_strips_groups_and_superuser() -> None:
+    respx.get(f"{BASE}/api/users/").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": 7, "username": "svc"}]})
+    )
+    patch = respx.patch(f"{BASE}/api/users/7/").mock(return_value=httpx.Response(200, json={}))
+    async with PaperlessClient(BASE, basic=("a", "b")) as client:
+        await client.ensure_user("svc", "pw", ["view_document"])
+    body = json.loads(patch.calls.last.request.content)
+    assert body["groups"] == []
+    assert body["is_superuser"] is False
+    assert body["is_staff"] is False
+
+
+@respx.mock
+async def test_ensure_user_create_has_no_extra_grants() -> None:
+    respx.get(f"{BASE}/api/users/").mock(return_value=httpx.Response(200, json={"results": []}))
+    post = respx.post(f"{BASE}/api/users/").mock(return_value=httpx.Response(201, json={"id": 9}))
+    async with PaperlessClient(BASE, basic=("a", "b")) as client:
+        await client.ensure_user("svc", "pw", ["view_document"])
+    body = json.loads(post.calls.last.request.content)
+    assert body["groups"] == []
+    assert body["is_superuser"] is False
+    assert body["is_staff"] is False
