@@ -12,6 +12,8 @@ def make_engine(url: str) -> AsyncEngine:
     return create_async_engine(
         url,
         pool_pre_ping=True,
+        # Bound values (emails, password hashes, sealed secrets) never appear in error messages.
+        hide_parameters=True,
         connect_args={"timeout": CONNECT_TIMEOUT_S},
     )
 

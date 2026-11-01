@@ -125,6 +125,7 @@ async def test_unknown_country_rejected(make_actor: MakeActor) -> None:
     alice = await make_actor("alice@example.com")
     r = await alice.client.post("/v1/orgs", json={"name": "X", "type": "business", "country": "ZZ"})
     assert r.status_code == 422
+    assert error(r) == "org.country_unsupported"
 
 
 async def test_org_region_cannot_change_via_api(make_actor: MakeActor) -> None:

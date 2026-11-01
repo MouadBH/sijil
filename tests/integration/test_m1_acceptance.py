@@ -30,6 +30,7 @@ pytestmark = pytest.mark.integration
 
 CP_URL = os.environ.get("SIJIL_IT_CP_URL", "http://control-plane:8000")
 PROVISION_BUDGET_S = 180
+STEP_MARGIN_S = 10
 PASSWORD = "it-acceptance-Passw0rd"
 # Long enough that a name-derived hostname would break DNS's 63-character label.
 ORG_NAME = "Société Marocaine de Distribution et de Commerce SARL"
@@ -48,6 +49,11 @@ async def _sign_up_with_totp(http: httpx.AsyncClient) -> None:
     assert r.status_code == 200, r.text
     secret = parse_qs(urlparse(r.json()["otpauth_uri"]).query)["secret"][0]
     totp = pyotp.TOTP(secret)
+    # Start early in a fresh 30 s step (same clock as the server), so the two calls below can
+    # never straddle a step boundary and leave the confirm code outside the ±1 window.
+    left = totp.interval - time.time() % totp.interval
+    if left < STEP_MARGIN_S:
+        await asyncio.sleep(left + 0.5)
     now = time.time()
     # Each time-step is spent once: confirm with the previous step, verify with the current.
     r = await _post(http, "/v1/auth/totp/confirm", {"code": totp.at(now - 30)})

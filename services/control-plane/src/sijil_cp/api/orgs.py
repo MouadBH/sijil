@@ -133,7 +133,7 @@ async def create_org(
         raise ApiError("org.type_unsupported", 422)
     region = COUNTRY_REGIONS.get(body.country)
     if region is None:
-        raise ApiError("validation", 422)
+        raise ApiError("org.country_unsupported", 422)
     # Before anything is written: this service only creates organisations of its own region.
     assert_region(region, request.app.state.settings)
 
