@@ -127,3 +127,13 @@ Minor findings from the M2 per-task reviews and the final review, deferred by th
 - The beat entries lack `expires` (burst after worker downtime); `beat` gets the full worker environment, secrets included.
 - Reconcile: per-member `network.containers` lookups, duplicate except branches, a possible race with `destroy`; the subnet pool is not in `.env.example` and a pool smaller than /28 gives a bare `ValueError`.
 - Seed: `KeyError` when `SIJIL_DATABASE_URL` is unset, unguarded `SIJIL_IT_CP_URL` override, a wrong password's 401 falls through to signup, no pytest timeout, the engine is not disposed on failure.
+
+### From the M2 fix-wave re-review
+- **Paperless HTTP 500 is final.** Ingest treats a 500 as non-transient (`ingest.paperless_error`) → `failed`, and re-upload is refused 409; a tenant whose own DB is down answers 500. Treat 500 as transient (bounded by the 24 h delay cap) — do this early in M3.
+- `delay_after` assumes one attempt per Celery retry; sweep restarts can advance the doubling by one cycle (bounded, cosmetic).
+- `bootstrap-storage` does not retry admin-API 503s while RustFS starts (`migrate` fails once; re-run works).
+- `ensure_app_user` closes a caller-supplied httpx client.
+- App-credential test doesn't assert the key cannot switch GOVERNANCE→COMPLIANCE; the key can extend a GOVERNANCE lock arbitrarily (non-destructive).
+- `clean-tenants.sh` exits without a warning when the Docker daemon is down.
+- DB connection loss surfaces as SQLAlchemy InterfaceError/DBAPIError, not always OperationalError — widen `is_transient_cause`.
+- A workspace stuck in error/hibernated writes one `document.ingest_delayed` per document per day — watch audit-chain growth.
