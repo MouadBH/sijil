@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.models import OrgType, Role, User, Workspace, WorkspaceState
+from sijil_core.tenancy import tenant_db_names
 from sijil_cp.deps import get_db, require_totp_compliance
 from sijil_cp.errors import ApiError
 from sijil_cp.permissions import Action, WorkspaceContext, authorize_org, require_workspace
@@ -57,7 +58,7 @@ def make_slug(name: str) -> str:
 def new_workspace(org_id: UUID, name: str) -> Workspace:
     """A workspace in `provisioning`, with the names its tenant stack will use."""
     slug = make_slug(name)
-    slug_ = slug.replace("-", "_")
+    db_name, index_db_name = tenant_db_names(slug)
     # The key id embeds the primary key, so it is assigned here rather than at flush.
     workspace_id = uuid.uuid4()
     return Workspace(
@@ -66,8 +67,8 @@ def new_workspace(org_id: UUID, name: str) -> Workspace:
         name=name,
         slug=slug,
         state=WorkspaceState.provisioning,
-        db_name=f"paperless_{slug_}",
-        index_db_name=f"index_{slug_}",
+        db_name=db_name,
+        index_db_name=index_db_name,
         kms_key_id=f"ws-{workspace_id}",
     )
 

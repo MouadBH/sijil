@@ -18,6 +18,7 @@ dev = [
   "mypy>=1.13",
   "ruff>=0.8",
   "celery-types>=0.22",
+  "types-docker>=7.1",
   # fixtures/ generator and its tests
   "reportlab>=4.2",
   "arabic-reshaper>=3.0",
@@ -47,7 +48,7 @@ python_version = "3.13"
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["reportlab.*", "arabic_reshaper", "bidi.*"]
+module = ["reportlab.*", "arabic_reshaper", "bidi.*", "asyncpg", "asyncpg.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

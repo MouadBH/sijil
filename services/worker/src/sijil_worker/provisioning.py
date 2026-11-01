@@ -116,7 +116,8 @@ async def _fail(
         if job is not None:
             job.status = JobStatus.failed
             job.error_code = f"provision.{step}"
-        if workspace is not None:
+        # A failed re-run never takes a working tenant down: only `provisioning` becomes `error`.
+        if workspace is not None and workspace.state is WorkspaceState.provisioning:
             workspace.state = WorkspaceState.error
         await session.commit()
 
@@ -138,6 +139,9 @@ async def provision_workspace(
             workspace = await session.get(Workspace, workspace_id)
             if job is None or workspace is None:
                 raise LookupError("job or workspace not found")
+            if job.status is JobStatus.succeeded:
+                # Redelivered (acks_late) or duplicated: the work is done, touch nothing.
+                return
             job.status = JobStatus.running
             job.error_code = None
             if workspace.state is WorkspaceState.error:

@@ -159,12 +159,30 @@ destroy              → only after closure rules allow it (design §5.4)
 
 `DockerRuntime` drives the Docker Engine API in development. A Kubernetes implementation of the same interface comes with the production milestone.
 
+What `DockerRuntime` creates for a workspace with slug `<slug>` (compose project `<project>`, default `sijil`):
+
+| Resource | Name | Notes |
+| --- | --- | --- |
+| Network | `<project>_tenant_<slug>` | `internal: true`. A pre-existing network that isn't internal is refused |
+| Redis | `<project>-paperless-redis-<slug>` | On the tenant network only |
+| Paperless-ngx | `<project>-paperless-<slug>` | The official image, the same base env as `infra/compose/paperless/tenant.env` (a unit test keeps them equal), no published port. URL `http://<project>-paperless-<slug>:8000` |
+| Volumes | `<project>_<slug>_data`, `<project>_<slug>_media` | Per tenant |
+| Tessdata | `<project>_tessdata`, mounted read-only | Filled once by the one-shot `tessdata-init` service: the image's languages plus `infra/compose/tessdata/ara.traineddata`. The sample tenants mount it too |
+| Databases | `paperless_<slug_>` and `index_<slug_>` (`-` → `_`), each owned by a role of the same name | `REVOKE ALL … FROM PUBLIC`; the index DB is cloned from `template_index` (pgvector) |
+
+- **Labels.** Every container, network and volume carries `sijil.tenant=<slug>`, `sijil.workspace=<id>` and `sijil.role` (`paperless`, `redis`, `network`, `data`, `media`). `destroy` and `make smoke` find tenants by these labels. Labels never carry secrets; secrets go only into the container environment, as for the compose tenants.
+- **Attached services.** The compose `control-plane`, `worker`, `postgres`, `tika`, `gotenberg` and `ollama` containers (found by their compose labels) are connected to the tenant network with their service name as alias, so the tenant resolves `postgres`, `tika`, … and nothing else. Recreating one of these containers drops the attachment; the next `ensure_running` restores it.
+- **Provisioner role.** The worker creates tenant roles and databases as `sijil_provisioner` (`LOGIN CREATEDB CREATEROLE`, not superuser, created by `infra/compose/postgres/init.sh`). On PG 16+ it administers only the roles it created, and `createrole_self_grant = 'set'` lets it `SET ROLE` to them (to give them their databases and drop them) without inheriting their rights. Identifiers are checked against `^[a-z0-9_]{1,63}$` and quoted by Postgres's `format('%I')`.
+- **Docker socket.** The worker mounts `/var/run/docker.sock` in development only. That is root on the host, which is one reason production uses another runtime.
+- **Idempotency.** Every step is get-or-create, passwords are reset on each run, and `destroy` removes containers, network, volumes, databases and roles, ignoring whatever is already gone.
+
 ## Local development
 
 `make up` boots the stack in `infra/compose/`. The two sample tenants (`paperless-t1`, `paperless-t2`) exist so the stack can be demoed straight away, and real signups provision their own. `make smoke` checks:
 
 - the control plane is ready and in region `ma-cas`;
 - both tenants answer from inside, have no published port, have Arabic OCR and have no route out;
+- every running provisioned tenant (label `sijil.tenant`) passes the same checks and can't reach `paperless-t1`;
 - Ollama, the object store and the worker all answer.
 
 The object store in development is RustFS (Apache-2.0, S3 API with object lock). MinIO stopped publishing images in 2025. Production uses the region's own object storage behind the same `ObjectStore` interface.

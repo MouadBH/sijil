@@ -1,3 +1,5 @@
+# The worker joins the Docker socket's group (GNU stat on Linux; Docker Desktop uses group 0).
+export DOCKER_SOCKET_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo 0)
 COMPOSE := docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env
 
 .PHONY: install lint typecheck test check itest e2e up down smoke models

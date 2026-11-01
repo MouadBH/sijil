@@ -221,7 +221,11 @@ async def test_service_token_replaced_not_duplicated(
         mock_paperless(router)
         await run(sessions, keys, FakeRuntime(), workspace, job)
         before = (await creds(db, workspace.id))[CredentialKind.service_token]
-        await run(sessions, keys, FakeRuntime(), workspace, job)
+        # A fresh provisioning job for the same workspace (a finished job is never re-run).
+        again = Job(kind=JobKind.provision_workspace, workspace_id=workspace.id)
+        db.add(again)
+        await db.commit()
+        await run(sessions, keys, FakeRuntime(), workspace, again)
     rows = await creds(db, workspace.id)
     assert len(rows) == len(CredentialKind)
     assert rows[CredentialKind.service_token] != before
@@ -261,3 +265,52 @@ async def test_unavailable_is_reraised_for_celery_retry(
         await run(sessions, keys, Down(), workspace, job)
     _, jb = await reload(db, workspace, job)
     assert jb.error_code == "provision.ensure_running"
+
+
+async def test_already_succeeded_job_is_a_no_op(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    workspace: Workspace,
+    job: Job,
+) -> None:
+    """A redelivered task (acks_late) must not re-run provisioning of a finished job."""
+    job.status = JobStatus.succeeded
+    workspace.state = WorkspaceState.active
+    await db.commit()
+
+    class Untouchable(FakeRuntime):
+        async def ensure_databases(self, spec: TenantSpec) -> None:
+            raise AssertionError("runtime must not be called for a finished job")
+
+    runtime = Untouchable()
+    await run(sessions, keys, runtime, workspace, job)
+    ws, jb = await reload(db, workspace, job)
+    assert runtime.calls == []
+    assert jb.status == JobStatus.succeeded
+    assert ws.state == WorkspaceState.active
+    assert await creds(db, workspace.id) == {}
+
+
+async def test_failure_never_downgrades_an_active_workspace(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    workspace: Workspace,
+    job: Job,
+) -> None:
+    workspace.state = WorkspaceState.active
+    await db.commit()
+    with pytest.raises(RuntimeError):
+        await run(sessions, keys, FakeRuntime(fail_running_once=True), workspace, job)
+    ws, jb = await reload(db, workspace, job)
+    assert jb.status == JobStatus.failed
+    assert jb.error_code == "provision.ensure_running"
+    assert ws.state == WorkspaceState.active
+
+
+def test_provision_task_routes_to_provisioning_queue() -> None:
+    from sijil_worker.tasks import provision_workspace_task
+
+    # celery-types does not declare the option attributes set by the decorator.
+    assert provision_workspace_task.queue == "provisioning"  # type: ignore[attr-defined]
