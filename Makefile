@@ -35,8 +35,10 @@ up:
 	test -f infra/compose/.env || cp infra/compose/.env.example infra/compose/.env
 	$(COMPOSE) up -d --build
 
+# Plain `make down` only stops the compose services: provisioned tenants stay, because their
+# rows stay in the database. `ARGS=-v` wipes the database too, so it removes the tenants first.
 down:
-	infra/scripts/clean-tenants.sh $(if $(findstring -v,$(ARGS)),--volumes)
+	$(if $(findstring -v,$(ARGS)),infra/scripts/clean-tenants.sh --volumes)
 	$(COMPOSE) down $(ARGS)
 
 smoke:

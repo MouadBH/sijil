@@ -3,8 +3,10 @@
 # compose project; with --volumes also their data/media volumes. `docker compose down` knows
 # nothing about them. Only resources labelled sijil.tenant on a network labelled
 # sijil.project=<this project> are touched, so other projects on the same engine are safe.
+# `make down ARGS=-v` runs it (the database goes too, so the tenants must); plain `make down`
+# does not, since the tenants' rows survive it.
 # Usage: clean-tenants.sh [--volumes]
-set -uo pipefail
+set -euo pipefail
 
 cd "$(dirname "$0")/../compose"
 project="${COMPOSE_PROJECT_NAME:-}"
@@ -15,21 +17,30 @@ project="${project:-sijil}"
 volumes=0
 [ "${1:-}" = "--volumes" ] && volumes=1
 
+warn() { echo "clean-tenants: warning: $*" >&2; }
+
 networks="$(docker network ls --filter "label=sijil.project=$project" --filter label=sijil.tenant --format '{{.Name}}')"
 for net in $networks; do
-  ref="$(docker network inspect "$net" --format '{{index .Labels "sijil.tenant"}}')"
+  ref="$(docker network inspect "$net" --format '{{index .Labels "sijil.tenant"}}' || true)"
   [ -n "$ref" ] || continue
   echo "removing tenant $ref of project $project"
-  docker ps -a -q --filter "label=sijil.tenant=$ref" | xargs -r docker rm -f -v >/dev/null
+  containers="$(docker ps -a -q --filter "label=sijil.tenant=$ref")"
+  if [ -n "$containers" ]; then
+    # shellcheck disable=SC2086  # one id per word
+    docker rm -f -v $containers >/dev/null || warn "could not remove the containers of $ref"
+  fi
   # Compose services (control-plane, worker, postgres, ...) are attached to the tenant network.
-  for endpoint in $(docker network inspect "$net" --format '{{range .Containers}}{{.Name}} {{end}}'); do
-    docker network disconnect -f "$net" "$endpoint" >/dev/null
+  for endpoint in $(docker network inspect "$net" --format '{{range .Containers}}{{.Name}} {{end}}' || true); do
+    docker network disconnect -f "$net" "$endpoint" >/dev/null \
+      || warn "could not disconnect $endpoint from $net"
   done
-  docker network rm "$net" >/dev/null
+  docker network rm "$net" >/dev/null || warn "could not remove network $net"
   if [ "$volumes" = 1 ]; then
     for kind in data media; do
-      docker volume rm "${project}_${ref}_${kind}" >/dev/null 2>&1 || true
+      volume="${project}_${ref}_${kind}"
+      if docker volume inspect "$volume" >/dev/null 2>&1; then
+        docker volume rm "$volume" >/dev/null || warn "could not remove volume $volume"
+      fi
     done
   fi
 done
-exit 0
