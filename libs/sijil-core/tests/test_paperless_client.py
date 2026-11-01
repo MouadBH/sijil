@@ -1,0 +1,118 @@
+import asyncio
+import json
+
+import httpx
+import pytest
+import respx
+
+from sijil_core.paperless import (
+    SERVICE_PERMISSIONS,
+    SUPPORT_PERMISSIONS,
+    PaperlessClient,
+    PaperlessError,
+    PaperlessForbidden,
+    PaperlessUnavailable,
+)
+
+BASE = "http://paperless.test"
+
+
+@pytest.fixture(autouse=True)
+def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def instant(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant)
+
+
+@respx.mock
+async def test_obtain_token_posts_credentials() -> None:
+    route = respx.post(f"{BASE}/api/token/").mock(
+        return_value=httpx.Response(200, json={"token": "tok-1"})
+    )
+    async with PaperlessClient(BASE) as client:
+        assert await client.obtain_token("svc", "pw-secret") == "tok-1"
+    assert json.loads(route.calls.last.request.content) == {
+        "username": "svc",
+        "password": "pw-secret",
+    }
+
+
+@respx.mock
+async def test_ensure_user_is_idempotent() -> None:
+    respx.get(f"{BASE}/api/users/").mock(
+        return_value=httpx.Response(200, json={"results": [{"id": 7, "username": "svc"}]})
+    )
+    patch = respx.patch(f"{BASE}/api/users/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    post = respx.post(f"{BASE}/api/users/").mock(return_value=httpx.Response(201, json={"id": 9}))
+    async with PaperlessClient(BASE, basic=("a", "b")) as client:
+        assert await client.ensure_user("svc", "pw", ["view_document"]) == 7
+    assert patch.called
+    assert not post.called
+    body = json.loads(patch.calls.last.request.content)
+    assert body["user_permissions"] == ["view_document"]
+    assert body["password"] == "pw"
+
+
+@respx.mock
+async def test_ensure_user_creates_when_missing() -> None:
+    respx.get(f"{BASE}/api/users/").mock(return_value=httpx.Response(200, json={"results": []}))
+    post = respx.post(f"{BASE}/api/users/").mock(return_value=httpx.Response(201, json={"id": 9}))
+    async with PaperlessClient(BASE, basic=("a", "b")) as client:
+        assert await client.ensure_user("svc", "pw", ["view_document"]) == 9
+    assert json.loads(post.calls.last.request.content)["username"] == "svc"
+
+
+@respx.mock
+async def test_delete_403_raises_forbidden() -> None:
+    respx.delete(f"{BASE}/api/documents/3/").mock(return_value=httpx.Response(403))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessForbidden):
+            await client.delete_document(3)
+
+
+@respx.mock
+async def test_retries_on_503_then_succeeds() -> None:
+    route = respx.get(f"{BASE}/api/").mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.ConnectError("down"),
+            httpx.Response(200, json={}, headers={"X-Api-Version": "9"}),
+        ]
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.api_version() == 9
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_retries_give_up_as_unavailable() -> None:
+    route = respx.get(f"{BASE}/api/").mock(return_value=httpx.Response(502))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.api_version()
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_no_retry_on_400() -> None:
+    route = respx.post(f"{BASE}/api/token/").mock(return_value=httpx.Response(400, json={}))
+    async with PaperlessClient(BASE) as client:
+        with pytest.raises(PaperlessError) as exc:
+            await client.obtain_token("svc", "pw-secret")
+    assert route.call_count == 1
+    assert "pw-secret" not in str(exc.value)
+
+
+def test_service_permissions_have_no_delete() -> None:
+    assert SERVICE_PERMISSIONS
+    assert not [p for p in SERVICE_PERMISSIONS if p.startswith("delete_")]
+    assert "view_paperlesstask" in SERVICE_PERMISSIONS
+    assert "add_document" in SERVICE_PERMISSIONS
+
+
+def test_support_permissions_view_only() -> None:
+    assert SUPPORT_PERMISSIONS
+    assert all(p.startswith("view_") for p in SUPPORT_PERMISSIONS)

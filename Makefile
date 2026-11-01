@@ -1,6 +1,6 @@
 COMPOSE := docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env
 
-.PHONY: install lint typecheck test check e2e up down smoke models
+.PHONY: install lint typecheck test check itest e2e up down smoke models
 
 install:
 	uv sync --all-packages
@@ -20,6 +20,9 @@ test: export SIJIL_TEST_REDIS_URL ?= redis://127.0.0.1:56379/15
 test:
 	uv run pytest
 	pnpm test
+
+itest:
+	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m integration
 
 e2e:
 	pnpm e2e
