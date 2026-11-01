@@ -19,6 +19,7 @@ from sijil_cp.deps import (
     require_totp_compliance,
 )
 from sijil_cp.errors import ApiError
+from sijil_cp.org_audit import audit_org_event
 from sijil_cp.permissions import Action, authorize_org
 
 router = APIRouter(tags=["members"], dependencies=[Depends(require_totp_compliance)])
@@ -111,6 +112,22 @@ async def add_member(
         raise ApiError("member.user_not_found", 404)
     db.add(Membership(user_id=target.id, org_id=org_id, role=body.role))
     try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise ApiError("member.exists", 409) from None
+    await audit_org_event(
+        db,
+        request,
+        org_id=org_id,
+        actor=user,
+        action="member.added",
+        target_type="user",
+        target_id=str(target.id),
+        data={"role": body.role.value},
+        now=now,
+    )
+    try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
@@ -141,7 +158,19 @@ async def change_role(
         owners = await _lock_owners(db, org_id)
         if len(owners) <= 1:
             raise ApiError("org.last_owner", 409)
+    previous = membership.role
     membership.role = body.role
+    await audit_org_event(
+        db,
+        request,
+        org_id=org_id,
+        actor=user,
+        action="member.role_changed",
+        target_type="user",
+        target_id=str(user_id),
+        data={"from": previous.value, "to": body.role.value},
+        now=now,
+    )
     await db.commit()
     target = await db.get(User, user_id)
     if target is None:  # unreachable: the membership's foreign key guarantees the user
@@ -170,6 +199,18 @@ async def remove_member(
         owners = await _lock_owners(db, org_id)
         if len(owners) <= 1:
             raise ApiError("org.last_owner", 409)
+    removed_role = membership.role
     await db.delete(membership)
+    await audit_org_event(
+        db,
+        request,
+        org_id=org_id,
+        actor=user,
+        action="member.removed",
+        target_type="user",
+        target_id=str(user_id),
+        data={"role": removed_role.value},
+        now=now,
+    )
     await db.commit()
     return Response(status_code=204)

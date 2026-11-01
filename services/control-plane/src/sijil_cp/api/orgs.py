@@ -36,6 +36,7 @@ from sijil_cp.deps import (
 )
 from sijil_cp.enqueue import Enqueuer, get_enqueuer
 from sijil_cp.errors import ApiError
+from sijil_cp.org_audit import audit_org_event
 from sijil_cp.permissions import Action, authorize_org
 
 logger = logging.getLogger(__name__)
@@ -199,7 +200,19 @@ async def patch_org(
         raise ApiError("org.region_immutable", 409)
     if body.require_totp is not None:
         ensure_step_up(session, user, now)
-        org.require_totp = body.require_totp
+        if org.require_totp != body.require_totp:
+            org.require_totp = body.require_totp
+            await audit_org_event(
+                db,
+                request,
+                org_id=org_id,
+                actor=user,
+                action="org.require_totp_changed",
+                target_type="org",
+                target_id=str(org_id),
+                data={"require_totp": body.require_totp},
+                now=now,
+            )
     if body.name is not None:
         org.name = body.name
     await db.commit()
