@@ -1,17 +1,11 @@
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
+from sijil_core.db.engine import make_engine as _make_engine
+from sijil_core.db.engine import make_sessionmaker
 from sijil_cp.settings import CpSettings
 
-CONNECT_TIMEOUT_S = 2
+__all__ = ["make_engine", "make_sessionmaker"]
 
 
 def make_engine(settings: CpSettings) -> AsyncEngine:
-    return create_async_engine(
-        str(settings.database_url),
-        pool_pre_ping=True,
-        connect_args={"timeout": CONNECT_TIMEOUT_S},
-    )
-
-
-def make_sessionmaker(engine: AsyncEngine) -> async_sessionmaker:  # type: ignore[type-arg]
-    return async_sessionmaker(engine, expire_on_commit=False)
+    return _make_engine(str(settings.database_url))

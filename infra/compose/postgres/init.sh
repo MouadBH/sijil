@@ -6,6 +6,10 @@
 #   sijil_cp_app    DML on sijil_cp; what the API and worker connect as
 #   paperless_tN    owns paperless_tN; handed to that tenant's Paperless-ngx
 #   index_tN        owns index_tN (pgvector); Sijil only, never handed to Paperless
+#   sijil_provisioner  creates provisioned tenants' roles and databases (worker only):
+#                   CREATEDB CREATEROLE, not superuser; may SET ROLE to the roles it creates
+#                   (to own their databases) but never inherits their rights
+#   template_index  pgvector template that every provisioned index_<ws> is cloned from
 set -euo pipefail
 
 sql() { psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" "$@"; }
@@ -42,3 +46,14 @@ create_owned_db paperless_t1 "$T1_DB_PASSWORD" paperless_t1
 create_owned_db paperless_t2 "$T2_DB_PASSWORD" paperless_t2
 create_owned_db index_t1 "$T1_INDEX_DB_PASSWORD" index_t1 vector
 create_owned_db index_t2 "$T2_INDEX_DB_PASSWORD" index_t2 vector
+
+# Provisioned tenants. PG16+: a CREATEROLE role administers only the roles it creates.
+sql -v pw="$SIJIL_PROVISIONER_DB_PASSWORD" <<'SQL'
+CREATE ROLE sijil_provisioner LOGIN CREATEDB CREATEROLE NOSUPERUSER PASSWORD :'pw';
+ALTER ROLE sijil_provisioner SET createrole_self_grant = 'set';
+GRANT CONNECT ON DATABASE postgres TO sijil_provisioner;
+CREATE DATABASE template_index;
+REVOKE ALL ON DATABASE template_index FROM PUBLIC;
+SQL
+sql --dbname template_index <<<'CREATE EXTENSION vector;'
+sql <<<'ALTER DATABASE template_index WITH IS_TEMPLATE true;'

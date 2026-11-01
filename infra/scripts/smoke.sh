@@ -65,6 +65,44 @@ psycopg.connect(host='postgres', dbname='index_t1', user='index_t1',
                 password=os.environ['PAPERLESS_DBPASS'], connect_timeout=5)" 2>/dev/null \
   && fail "paperless-t1 can log into index_t1" || pass "paperless-t1 cannot log into index_t1"
 
+# Tenants provisioned by the worker (DockerRuntime) get the same checks, found by label.
+project=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' .env)
+provisioned=$(docker ps --filter label=sijil.tenant --filter label=sijil.role=paperless \
+  --format '{{.Names}}' | grep "^${project:-sijil}-paperless-" || true)
+for name in $provisioned; do
+  case "$(probe "http://$name:8000/api/")" in
+    200|401|403) pass "$name answers on its tenant network" ;;
+    *) fail "$name unreachable from control plane" ;;
+  esac
+  [ -z "$(docker port "$name" 2>/dev/null)" ] \
+    && pass "$name has no published port" || fail "$name is published to the host"
+  docker exec "$name" tesseract --list-langs 2>/dev/null | grep -qx ara \
+    && pass "$name has Arabic OCR" || fail "$name missing tesseract ara"
+  docker exec "$name" curl -s --max-time 5 -o /dev/null https://example.com \
+    && fail "$name can reach the internet by name" || pass "$name has no route out (DNS)"
+  docker exec "$name" curl -s --max-time 5 -o /dev/null https://1.1.1.1 \
+    && fail "$name can reach the internet by IP" || pass "$name has no route out (raw IP)"
+  docker exec "$name" curl -s --max-time 5 -o /dev/null http://paperless-t1:8000/ \
+    && fail "$name reaches paperless-t1" || pass "$name cannot reach paperless-t1"
+  # Its own role opens its own database (the control) and nothing else: not a sample
+  # tenant's, not its own index.
+  db_login() {
+    docker exec "$name" python3 -c "
+import os, sys, psycopg
+psycopg.connect(host='postgres', dbname=sys.argv[1] or os.environ['PAPERLESS_DBNAME'],
+                user=os.environ['PAPERLESS_DBUSER'], password=os.environ['PAPERLESS_DBPASS'],
+                connect_timeout=5)" "$1" 2>/dev/null
+  }
+  db_login "" && pass "$name's db role logs into its own database" \
+    || fail "$name's db role cannot log into its own database"
+  ref=${name#"${project:-sijil}-paperless-"}
+  for other in paperless_t1 "index_${ref}"; do
+    db_login "$other" \
+      && fail "$name's db role can log into $other" || pass "$name's db role cannot log into $other"
+  done
+done
+[ -n "$provisioned" ] || echo "  (no provisioned tenants running)"
+
 # Ollama serves tenants but must not be a way out for them.
 compose exec -T ollama timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' 2>/dev/null \
   && fail "ollama can reach the internet" || pass "ollama has no route out"
@@ -79,6 +117,19 @@ app_sql 'create table smoke_probe(i int)' >/dev/null \
   && fail "app role can create tables" || pass "app role cannot create tables"
 app_sql 'drop table alembic_version' >/dev/null \
   && fail "app role can drop tables" || pass "app role cannot drop tables"
+# Tenant provisioning: a non-superuser role, kept out of the control-plane database.
+prov_sql() {
+  compose exec -T postgres sh -c \
+    "PGPASSWORD=\"\$SIJIL_PROVISIONER_DB_PASSWORD\" psql -h localhost -U sijil_provisioner -d \"$1\" -tAc \"$2\"" 2>/dev/null
+}
+[ "$(prov_sql postgres 'select rolsuper from pg_roles where rolname = current_user')" = "f" ] \
+  && pass "provisioner role is not superuser" || fail "provisioner role missing or superuser"
+prov_sql sijil_cp 'select 1' >/dev/null \
+  && fail "provisioner role can connect to sijil_cp" || pass "provisioner role cannot connect to sijil_cp"
+[ "$(prov_sql postgres "select datistemplate from pg_database where datname = 'template_index'")" = "t" ] \
+  && pass "template_index is a template" || fail "template_index missing or not a template"
+compose exec -T worker python -c 'import docker; docker.from_env().ping()' >/dev/null 2>&1 \
+  && pass "worker reaches the Docker engine (dev only)" || fail "worker cannot reach the Docker engine"
 case "$(compose port control-plane 8000 2>/dev/null)" in
   127.0.0.1:*) pass "control plane bound to localhost only" ;;
   *) fail "control plane published beyond localhost" ;;

@@ -6,6 +6,8 @@
 #                Shared helpers (postgres, tika, gotenberg, ollama) and the control
 #                plane / worker are attached to every tenant network, so a tenant
 #                reaches them but never another tenant.
+#   {project}_tenant_{slug} — the same shape, created at run time by the worker's DockerRuntime
+#                for every provisioned workspace (labels sijil.tenant / sijil.workspace).
 
 x-paperless: &paperless
   image: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
@@ -15,6 +17,7 @@ x-paperless: &paperless
     postgres: { condition: service_healthy }
     tika: { condition: service_started }
     gotenberg: { condition: service_started }
+    tessdata-init: { condition: service_completed_successfully }
   healthcheck:
     test: ["CMD", "curl", "-fs", "-o", "/dev/null", "http://localhost:8000/accounts/login/"]
     interval: 15s
@@ -27,6 +30,15 @@ x-sijil-env: &sijil-env
   SIJIL_ENVIRONMENT: dev
   SIJIL_REDIS_URL: redis://redis:6379/0
 
+x-worker-env: &worker-env
+  <<: *sijil-env
+  SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
+  SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+  SIJIL_PROVISIONER_DATABASE_URL: postgresql+asyncpg://sijil_provisioner:${SIJIL_PROVISIONER_DB_PASSWORD:?}@postgres:5432/postgres
+  SIJIL_TENANT_IMAGE: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
+  SIJIL_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-sijil}
+  SIJIL_TESSDATA_VOLUME: ${COMPOSE_PROJECT_NAME:-sijil}_tessdata
+
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
 services:
@@ -38,6 +50,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
       SIJIL_CP_OWNER_DB_PASSWORD: ${SIJIL_CP_OWNER_DB_PASSWORD:?}
       SIJIL_CP_APP_DB_PASSWORD: ${SIJIL_CP_APP_DB_PASSWORD:?}
+      SIJIL_PROVISIONER_DB_PASSWORD: ${SIJIL_PROVISIONER_DB_PASSWORD:?}
       T1_DB_PASSWORD: ${T1_DB_PASSWORD:?}
       T1_INDEX_DB_PASSWORD: ${T1_INDEX_DB_PASSWORD:?}
       T2_DB_PASSWORD: ${T2_DB_PASSWORD:?}
@@ -56,6 +69,7 @@ services:
   redis:
     image: redis:7.4.12-alpine
     restart: unless-stopped
+    ports: ["127.0.0.1:56379:6379"]
     networks: [core]
 
   objectstore:
@@ -98,6 +112,22 @@ services:
       - --chromium-allow-list=^file:///tmp/.*
     networks: *all-tenant-networks
 
+  tessdata-init:
+    # One-shot: fills the `tessdata` volume with the image's own languages plus Arabic.
+    # Every tenant (sample or provisioned) mounts it read-only over the image's tessdata dir,
+    # because tenants have no internet to install language packs at start-up.
+    image: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
+    restart: "no"
+    network_mode: none
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - cp -a /usr/share/tesseract-ocr/5/tessdata/. /out/ && cp /seed/ara.traineddata /out/ara.traineddata && chmod -R a+rX /out
+    volumes:
+      - tessdata:/out
+      - ./tessdata/ara.traineddata:/seed/ara.traineddata:ro
+
   paperless-redis-t1:
     image: redis:7.4.12-alpine
     restart: unless-stopped
@@ -123,7 +153,7 @@ services:
     volumes:
       - t1_data:/usr/src/paperless/data
       - t1_media:/usr/src/paperless/media
-      - ./tessdata/ara.traineddata:/usr/share/tesseract-ocr/5/tessdata/ara.traineddata:ro
+      - tessdata:/usr/share/tesseract-ocr/5/tessdata:ro
 
   paperless-t2:
     <<: *paperless
@@ -140,7 +170,7 @@ services:
     volumes:
       - t2_data:/usr/src/paperless/data
       - t2_media:/usr/src/paperless/media
-      - ./tessdata/ara.traineddata:/usr/share/tesseract-ocr/5/tessdata/ara.traineddata:ro
+      - tessdata:/usr/share/tesseract-ocr/5/tessdata:ro
 
   migrate:
     # One-shot: schema changes run as the owner role, never as the app role.
@@ -165,6 +195,8 @@ services:
     environment:
       <<: *sijil-env
       SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+      SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
+      SIJIL_COOKIE_SECURE: "false" # dev runs over http on localhost
     ports: ["127.0.0.1:8000:8000"]
     networks: [core, ai, tenant_t1, tenant_t2]
     healthcheck:
@@ -181,11 +213,38 @@ services:
       context: ../..
       dockerfile: services/worker/Dockerfile
     restart: unless-stopped
-    environment:
-      <<: *sijil-env
+    environment: *worker-env
+    # DEV ONLY: the Docker socket lets DockerRuntime create tenant containers and networks.
+    # It is root-equivalent on the host; production uses a Kubernetes runtime instead.
+    volumes: [/var/run/docker.sock:/var/run/docker.sock]
+    # The socket's group (0 on Docker Desktop; the host's docker group on Linux, see Makefile).
+    group_add: ["${DOCKER_SOCKET_GID:-0}"]
     networks: [core, ai, tenant_t1, tenant_t2]
     depends_on:
       redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      tessdata-init: { condition: service_completed_successfully }
+
+  tests:
+    # `make itest`: pytest inside the tenant networks, which have no published ports.
+    build:
+      context: ../..
+      dockerfile: infra/compose/Dockerfile.tests
+    profiles: [test]
+    working_dir: /src
+    volumes:
+      - ../..:/src
+      # DEV/CI ONLY: the DockerRuntime tests drive the engine and attach this runner to the
+      # tenant networks they create. The socket is root on the host; never do this in production.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      <<: *worker-env
+      UV_PROJECT_ENVIRONMENT: /opt/venv
+      SIJIL_IT_T1_URL: http://paperless-t1:8000
+      SIJIL_IT_T1_ADMIN_PASSWORD: ${T1_ADMIN_PASSWORD:?}
+      SIJIL_TEST_DATABASE_URL: postgresql+asyncpg://postgres:${POSTGRES_PASSWORD:?}@postgres:5432/postgres
+      SIJIL_TEST_REDIS_URL: redis://redis:6379/15
+    networks: [core, ai, tenant_t1, tenant_t2]
 
 networks:
   core: {}
@@ -204,3 +263,4 @@ volumes:
   t1_media:
   t2_data:
   t2_media:
+  tessdata:

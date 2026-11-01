@@ -9,7 +9,15 @@ from sijil_worker.settings import WorkerSettings
 @pytest.fixture
 def eager_app() -> Iterator[None]:
     settings = WorkerSettings(
-        region="ma-cas", environment="test", redis_url="redis://127.0.0.1:1/0"
+        region="ma-cas",
+        environment="test",
+        redis_url="redis://127.0.0.1:1/0",
+        master_key="a" * 43 + "=",
+        database_url="postgresql+asyncpg://x:y@127.0.0.1:1/z",
+        provisioner_database_url="postgresql+asyncpg://x:y@127.0.0.1:1/z",
+        tenant_image="img:1",
+        compose_project="sijil",
+        tessdata_volume="sijil_tessdata",
     )
     app = make_celery(settings)
     app.conf.task_always_eager = True
