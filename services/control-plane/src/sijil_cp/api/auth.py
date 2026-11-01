@@ -156,8 +156,12 @@ def _set_session_cookie(request: Request, response: Response, raw: str) -> None:
 
 @router.post("/auth/signup", status_code=status.HTTP_201_CREATED)
 async def signup(
-    body: SignupIn, request: Request, response: Response, db: Db, now: Now
+    body: SignupIn, request: Request, response: Response, db: Db, redis: Rds, now: Now
 ) -> SignupOut:
+    ip, user_agent = _client(request)
+    key = ratelimit.ip_key("signup", ip)
+    if not await ratelimit.hit(redis, key, ratelimit.SIGNUP_LIMIT, ratelimit.SIGNUP_WINDOW_S):
+        raise ApiError("auth.rate_limited", 429)
     if not passwords.acceptable(body.password):
         raise ApiError("auth.weak_password", 422)
     password_hash = await asyncio.to_thread(passwords.hash_password, body.password)
@@ -171,7 +175,6 @@ async def signup(
             raise ApiError("user.email_taken", 409) from None
         raise
     await sessions.revoke_token(db, request.cookies.get(sessions.COOKIE), now)
-    ip, user_agent = _client(request)
     _, raw = await sessions.create_session(
         db, user, ip=ip, user_agent=user_agent, pending_totp=False, now=now
     )

@@ -1,4 +1,4 @@
-"""Fixed-window attempt counters in Redis."""
+"""Fixed-window attempt counters in Redis, and every abuse limit of the control plane."""
 
 import hashlib
 from uuid import UUID
@@ -9,12 +9,23 @@ LOGIN_LIMIT = 10
 LOGIN_WINDOW_S = 15 * 60
 TOTP_LIMIT = 5
 TOTP_WINDOW_S = 15 * 60
+# Each organisation provisions a whole tenant stack: bound what open signup can ask for.
+SIGNUP_LIMIT = 10  # per client IP
+SIGNUP_WINDOW_S = 60 * 60
+ORG_CREATE_LIMIT = 10  # per client IP
+ORG_CREATE_WINDOW_S = 60 * 60
+MAX_OWNED_ORGS = 3  # organisations a user may own
 
 
 def login_key(email: str, ip: str) -> str:
     # Hashed so Redis never holds addresses in clear.
     digest = hashlib.sha256(f"{email.strip().lower()}\x00{ip}".encode()).hexdigest()
     return f"ratelimit:login:{digest}"
+
+
+def ip_key(action: str, ip: str) -> str:
+    digest = hashlib.sha256(f"{action}\x00{ip}".encode()).hexdigest()
+    return f"ratelimit:{action}:{digest}"
 
 
 def totp_key(user_id: UUID) -> str:

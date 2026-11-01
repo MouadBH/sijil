@@ -319,3 +319,13 @@ async def test_csrf_required_on_login(
             assert r.status_code == 403
             assert r.json() == {"error": {"code": "auth.csrf"}}
     assert (await db.scalars(select(User))).all() == []
+
+
+async def test_signup_rate_limited_per_ip(client: httpx.AsyncClient, redis: Redis) -> None:
+    for i in range(ratelimit.SIGNUP_LIMIT):
+        assert (await signup(client, f"user{i}@example.com")).status_code == 201
+    r = await signup(client, "one-too-many@example.com")
+    assert r.status_code == 429
+    assert r.json() == {"error": {"code": "auth.rate_limited"}}
+    ttl = await redis.ttl(ratelimit.ip_key("signup", "127.0.0.1"))
+    assert 0 < ttl <= ratelimit.SIGNUP_WINDOW_S == 3600

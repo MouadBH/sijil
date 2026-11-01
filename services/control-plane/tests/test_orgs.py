@@ -21,6 +21,7 @@ from sijil_core.db.models import (
 )
 from sijil_core.tenancy import tenant_db_names, tenant_ref
 from sijil_cp.api import orgs
+from sijil_cp.auth import ratelimit
 from sijil_cp.enqueue import CeleryEnqueuer
 
 pytestmark = pytest.mark.db
@@ -285,3 +286,45 @@ async def test_long_org_name_gets_short_tenant_names(
     for identifier in (row.db_name, row.index_db_name):
         assert re.fullmatch(r"[a-z0-9_]{1,63}", identifier)
         assert "societe" not in identifier
+
+
+async def test_owner_can_create_at_most_three_orgs(
+    make_actor: MakeActor, enqueuer: Any, db: AsyncSession
+) -> None:
+    alice = await make_actor("alice@example.com")
+    assert ratelimit.MAX_OWNED_ORGS == 3
+    for i in range(ratelimit.MAX_OWNED_ORGS):
+        await create_org(alice, name=f"Atlas {i}")
+    r = await alice.client.post(
+        "/v1/orgs", json={"name": "One more", "type": "business", "country": "MA"}
+    )
+    assert r.status_code == 409
+    assert error(r) == "org.limit_reached"
+    owned = (await db.scalars(select(Organisation))).all()
+    assert len(owned) == 3
+    assert len(enqueuer.calls) == 3
+    # The cap is per owner: someone else still can.
+    bob = await make_actor("bob@example.com")
+    await create_org(bob)
+
+
+async def test_org_creation_rate_limited_per_ip(
+    make_actor: MakeActor, enqueuer: Any, db: AsyncSession
+) -> None:
+    created = 0
+    for n in range(4):
+        actor = await make_actor(f"user{n}@example.com")
+        for i in range(ratelimit.MAX_OWNED_ORGS):
+            if created < ratelimit.ORG_CREATE_LIMIT:
+                await create_org(actor, name=f"Org {n}-{i}")
+                created += 1
+                continue
+            r = await actor.client.post(
+                "/v1/orgs", json={"name": "Too many", "type": "business", "country": "MA"}
+            )
+            assert r.status_code == 429
+            assert error(r) == "auth.rate_limited"
+            assert ratelimit.ORG_CREATE_LIMIT == 10
+            assert len(enqueuer.calls) == 10
+            return
+    raise AssertionError("the limit was never reached")

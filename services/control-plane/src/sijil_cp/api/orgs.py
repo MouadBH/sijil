@@ -8,6 +8,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field, field_validator
+from redis.asyncio import Redis
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.models import (
@@ -23,11 +25,13 @@ from sijil_core.db.models import (
 )
 from sijil_core.region import assert_region
 from sijil_cp.api.workspaces import WorkspaceOut, new_workspace, workspace_out
+from sijil_cp.auth import ratelimit
 from sijil_cp.deps import (
     current_session,
     ensure_step_up,
     get_db,
     get_now,
+    get_redis,
     require_totp_compliance,
 )
 from sijil_cp.enqueue import Enqueuer, get_enqueuer
@@ -117,7 +121,14 @@ async def create_org(
     user: CurrentUser,
     db: Db,
     enqueuer: Annotated[Enqueuer, Depends(get_enqueuer)],
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> OrgCreated:
+    ip = request.client.host if request.client else ""
+    key = ratelimit.ip_key("org_create", ip)
+    if not await ratelimit.hit(
+        redis, key, ratelimit.ORG_CREATE_LIMIT, ratelimit.ORG_CREATE_WINDOW_S
+    ):
+        raise ApiError("auth.rate_limited", 429)
     if body.type != OrgType.business:
         raise ApiError("org.type_unsupported", 422)
     region = COUNTRY_REGIONS.get(body.country)
@@ -125,6 +136,20 @@ async def create_org(
         raise ApiError("validation", 422)
     # Before anything is written: this service only creates organisations of its own region.
     assert_region(region, request.app.state.settings)
+
+    # The user's row lock serialises their concurrent creations, so the cap holds under races.
+    await db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    owned = await db.scalar(
+        select(func.count())
+        .select_from(Membership)
+        .where(
+            Membership.user_id == user.id,
+            Membership.role == Role.owner,
+            Membership.org_id.is_not(None),
+        )
+    )
+    if (owned or 0) >= ratelimit.MAX_OWNED_ORGS:
+        raise ApiError("org.limit_reached", 409)
 
     org = Organisation(name=body.name, type=body.type, country=body.country, region=region)
     db.add(org)
