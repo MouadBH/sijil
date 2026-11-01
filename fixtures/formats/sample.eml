@@ -1,0 +1,9 @@
+From: Fournisseur Exemple <factures@example.com>
+To: atlas@in.sijil.local
+Subject: SAMPLE facture
+Date: Thu, 15 Jan 2026 10:00:00 +0000
+Message-ID: <sample-0001@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+SAMPLE: fictitious message.

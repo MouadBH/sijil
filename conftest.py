@@ -29,6 +29,7 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
+from tests.support.memory_store import MemoryObjectStore
 
 ROOT = Path(__file__).parent
 CP_DIR = ROOT / "services" / "control-plane"
@@ -216,3 +217,9 @@ async def workspace(db: AsyncSession, org: Organisation) -> Workspace:
 @pytest.fixture
 async def fixtures(user: User, org: Organisation, workspace: Workspace) -> Fixtures:
     return Fixtures(user=user, org=org, workspace=workspace)
+
+
+@pytest.fixture
+def memory_store() -> MemoryObjectStore:
+    """An in-memory object-locked store (see tests/support/memory_store.py)."""
+    return MemoryObjectStore()

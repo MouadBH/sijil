@@ -177,6 +177,10 @@ async def test_cli_verify_exit_codes(
     monkeypatch.setenv("SIJIL_REDIS_URL", "redis://127.0.0.1:1/0")
     monkeypatch.setenv("SIJIL_COOKIE_SECURE", "false")
     monkeypatch.setenv("SIJIL_INBOUND_DOMAIN", "in.sijil.local")
+    monkeypatch.setenv("SIJIL_OBJECTSTORE_ENDPOINT", "http://127.0.0.1:1")
+    monkeypatch.setenv("SIJIL_OBJECTSTORE_ACCESS_KEY", "test-access")
+    monkeypatch.setenv("SIJIL_OBJECTSTORE_SECRET_KEY", "test-secret")
+    monkeypatch.setenv("SIJIL_OBJECTSTORE_BUCKET", "sijil-originals-test")
     loop = asyncio.get_running_loop()
 
     def run() -> int:

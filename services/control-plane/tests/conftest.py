@@ -18,6 +18,7 @@ from sijil_core.db.models import JobKind
 from sijil_cp import deps
 from sijil_cp.main import create_app
 from sijil_cp.settings import CpSettings
+from tests.support.memory_store import MemoryObjectStore
 
 # Ports nothing listens on: readiness must report these as down.
 CLOSED_DB = "postgresql+asyncpg://sijil:sijil@127.0.0.1:1/sijil_cp"
@@ -36,6 +37,11 @@ def make_settings(**overrides: str) -> CpSettings:
         "master_key": TEST_MASTER_KEY,
         "cookie_secure": "false",
         "inbound_domain": "in.sijil.local",
+        # Never contacted in unit tests: cp_app swaps in the in-memory store.
+        "objectstore_endpoint": "http://127.0.0.1:1",
+        "objectstore_access_key": "test-access",
+        "objectstore_secret_key": "test-secret",
+        "objectstore_bucket": "sijil-originals-test",
     } | overrides
     return CpSettings.model_validate(values)
 
@@ -119,9 +125,13 @@ class RecordingEnqueuer:
 
     def __init__(self) -> None:
         self.calls: list[tuple[JobKind, UUID, UUID]] = []
+        self.ingests: list[tuple[UUID, UUID]] = []
 
     def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None:
         self.calls.append((kind, job_id, workspace_id))
+
+    def send_ingest(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self.ingests.append((ledger_id, workspace_id))
 
 
 @pytest.fixture
@@ -182,10 +192,14 @@ class Actor:
 
 @pytest.fixture
 def cp_app(
-    make_db_app: Callable[..., FastAPI], enqueuer: RecordingEnqueuer, clock: Clock
+    make_db_app: Callable[..., FastAPI],
+    enqueuer: RecordingEnqueuer,
+    clock: Clock,
+    memory_store: MemoryObjectStore,
 ) -> FastAPI:
     app = make_db_app()
     app.state.enqueuer = enqueuer
+    app.state.store = memory_store
     app.dependency_overrides[deps.get_now] = lambda: clock.now
     return app
 

@@ -56,6 +56,8 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--import-mode=importlib -m 'not integration'"
+# The repository root, so suites can import the shared doubles in `tests.support`.
+pythonpath = ["."]
 markers = [
   "db: needs Postgres (set SIJIL_TEST_DATABASE_URL)",
   "integration: needs the compose stack; run with `make itest`",

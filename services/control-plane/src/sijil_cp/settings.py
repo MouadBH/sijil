@@ -2,9 +2,11 @@ from pydantic import PostgresDsn, RedisDsn
 
 from sijil_core.crypto import KeySettings
 from sijil_core.settings import CoreSettings
+from sijil_core.storage import StorageSettings
 
 
-class CpSettings(KeySettings):
+class CpSettings(KeySettings, StorageSettings):
+    # Object-store fields come from StorageSettings (SIJIL_OBJECTSTORE_*).
     # The app role: DML only. It can't alter tables, triggers or grants (retention layer 3).
     database_url: PostgresDsn
     redis_url: RedisDsn

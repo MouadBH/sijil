@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- SAMPLE / ÉCHANTILLON / عينة: fictitious e-invoice -->
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2">
+  <ID>SAMPLE-0001</ID>
+  <IssueDate>2026-01-15</IssueDate>
+  <Note>SAMPLE</Note>
+</Invoice>
