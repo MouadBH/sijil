@@ -3,8 +3,8 @@
 These are minor findings from the M1 per-task reviews and the final review, deferred during the build. None blocks merge. Findings already fixed later in M1 are left out.
 
 ## First M2 task
-- **Reconciler.** Re-attach control-plane, worker and the shared helpers to `label=sijil.tenant` networks after compose recreates them. Today a `make up` that rebuilds those services silently cuts active tenants off.
-- **IP pool for dev tenant networks.** Use a dedicated small IPAM pool; Docker's default pools allow about 31 bridge networks.
+- ~~**Reconciler.** Re-attach control-plane, worker and the shared helpers to `label=sijil.tenant` networks after compose recreates them. Today a `make up` that rebuilds those services silently cuts active tenants off.~~ Done in M2: `sijil_worker.reconcile`, run when the worker starts and every 300 s by `beat`.
+- ~~**IP pool for dev tenant networks.** Use a dedicated small IPAM pool; Docker's default pools allow about 31 bridge networks.~~ Done in M2: tenant networks are /28s from `SIJIL_TENANT_SUBNET_POOL` (`10.240.0.0/16`).
 
 ## Production milestone
 - Set uvicorn `forwarded_allow_ips` to the real proxy, so rate limits key on the client IP and not the proxy's.

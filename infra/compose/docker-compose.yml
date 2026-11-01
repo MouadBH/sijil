@@ -38,6 +38,7 @@ x-worker-env: &worker-env
   SIJIL_TENANT_IMAGE: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
   SIJIL_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-sijil}
   SIJIL_TESSDATA_VOLUME: ${COMPOSE_PROJECT_NAME:-sijil}_tessdata
+  SIJIL_TENANT_SUBNET_POOL: 10.240.0.0/16
 
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
@@ -224,6 +225,18 @@ services:
       redis: { condition: service_started }
       postgres: { condition: service_healthy }
       tessdata-init: { condition: service_completed_successfully }
+
+  beat:
+    # Schedules the periodic tasks (re-attaching compose services to tenant networks).
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "sijil_worker.main", "beat", "--loglevel", "INFO", "-s", "/tmp/celerybeat-schedule"]
+    environment: *worker-env
+    networks: [core]
+    depends_on:
+      redis: { condition: service_started }
 
   tests:
     # `make itest`: pytest inside the tenant networks, which have no published ports.

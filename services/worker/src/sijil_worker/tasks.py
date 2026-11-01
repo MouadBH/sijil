@@ -14,6 +14,7 @@ from sijil_core.crypto import LocalKeyService
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.paperless import PaperlessClient, PaperlessUnavailable
 from sijil_worker.provisioning import provision_workspace, record_failure
+from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
 
@@ -98,3 +99,13 @@ def provision_workspace_task(self: "Task[Any, Any]", job_id: str, workspace_id: 
             factor=1, retries=retries, maximum=RETRY_BACKOFF_MAX_S, full_jitter=True
         )
         raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+@shared_task(name="sijil.reconcile_tenants")
+def reconcile_tenants_task() -> list[str]:
+    """Re-attach compose services to tenant networks (also run once when the worker starts)."""
+    client = docker.from_env()
+    try:
+        return reconcile_tenants(client, WorkerSettings())
+    finally:
+        client.close()

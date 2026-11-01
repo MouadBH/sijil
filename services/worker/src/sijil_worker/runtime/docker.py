@@ -16,12 +16,15 @@ import asyncio
 import contextlib
 import logging
 import re
+from collections.abc import Iterable
+from ipaddress import IPv4Network, ip_network
 from typing import Any, Final
 
 import docker
 from docker.errors import APIError, ImageNotFound, NotFound
 from docker.models.containers import Container
 from docker.models.networks import Network
+from docker.types import IPAMConfig, IPAMPool
 
 from sijil_core.tenancy import tenant_db_names
 from sijil_worker.runtime.base import ADMIN_USERNAME, TenantHandle, TenantSpec, TenantStatus
@@ -80,6 +83,34 @@ def validate_hostname(name: str) -> str:
     return name
 
 
+class SubnetPoolExhausted(RuntimeError):
+    """No free tenant subnet is left in the configured pool."""
+
+
+def allocate_subnet(
+    existing: Iterable[IPv4Network], pool: IPv4Network, prefix: int = 28
+) -> IPv4Network:
+    """The first `/prefix` in `pool` that overlaps none of `existing`."""
+    taken = list(existing)
+    for candidate in pool.subnets(new_prefix=prefix):
+        if not any(candidate.overlaps(other) for other in taken):
+            return candidate
+    raise SubnetPoolExhausted(f"no free /{prefix} left in {pool}")
+
+
+def _existing_subnets(client: docker.DockerClient) -> list[IPv4Network]:
+    found: list[IPv4Network] = []
+    for network in client.networks.list():
+        for config in (network.attrs.get("IPAM") or {}).get("Config") or []:
+            subnet = config.get("Subnet")
+            if not subnet:
+                continue
+            parsed = ip_network(subnet, strict=False)
+            if isinstance(parsed, IPv4Network):
+                found.append(parsed)
+    return found
+
+
 def _already(exc: APIError) -> bool:
     return exc.status_code == 409 or "already exists" in str(exc.explanation or "")
 
@@ -89,6 +120,8 @@ class DockerRuntime:
         self._client = client
         self._settings = settings
         self._project = settings.compose_project
+        # Serialises subnet allocation in this process (listing and creating aren't atomic).
+        self._network_lock = asyncio.Lock()
 
     # Names ---------------------------------------------------------------------------------
 
@@ -121,7 +154,11 @@ class DockerRuntime:
         await ensure_tenant_databases(self._settings.provisioner_database_url, spec)
 
     async def ensure_running(self, spec: TenantSpec) -> TenantHandle:
-        return await asyncio.to_thread(self._ensure_running, spec)
+        # Every name is built (and so validated) before anything is created.
+        self._validate_names(spec)
+        async with self._network_lock:
+            network = await asyncio.to_thread(self._ensure_network_checked, spec)
+        return await asyncio.to_thread(self._ensure_running, spec, network)
 
     async def status(self, ref: str) -> TenantStatus:
         return await asyncio.to_thread(self._status, ref)
@@ -133,16 +170,22 @@ class DockerRuntime:
 
     # Implementation (sync, run in a thread) ------------------------------------------------
 
-    def _ensure_running(self, spec: TenantSpec) -> TenantHandle:
-        ref = spec.ref
-        # Every name is built (and so validated) before anything is created.
-        redis_name, paperless_name = self.redis_name(ref), self.paperless_name(ref)
-        url = self.url(ref)
+    def _validate_names(self, spec: TenantSpec) -> None:
+        self.network_name(spec.ref)
+        self.redis_name(spec.ref)
+        self.paperless_name(spec.ref)
+
+    def _ensure_network_checked(self, spec: TenantSpec) -> Network:
         try:
             self._client.volumes.get(self._settings.tessdata_volume)
         except NotFound:
             raise RuntimeError("tessdata volume missing (run the tessdata-init service)") from None
-        network = self._ensure_network(spec)
+        return self._ensure_network(spec)
+
+    def _ensure_running(self, spec: TenantSpec, network: Network) -> TenantHandle:
+        ref = spec.ref
+        redis_name, paperless_name = self.redis_name(ref), self.paperless_name(ref)
+        url = self.url(ref)
         self._attach_shared(network)
         volumes = {}
         for kind, path in (
@@ -188,18 +231,33 @@ class DockerRuntime:
         try:
             network = self._client.networks.get(name)
         except NotFound:
-            try:
-                network = self._client.networks.create(
-                    name, driver="bridge", internal=True, labels=self._labels(spec, "network")
-                )
-            except APIError as exc:
-                if not _already(exc):
-                    raise
-                network = self._client.networks.get(name)
+            network = self._create_network(spec, name)
         # Never reuse a network that could route out, whoever created it.
         if network.attrs.get("Internal") is not True:
             raise RuntimeError(f"network {name} exists but is not internal")
         return network
+
+    def _create_network(self, spec: TenantSpec, name: str) -> Network:
+        # Another process may take the subnet between listing and creating: re-list and retry.
+        for attempt in range(3):
+            subnet = allocate_subnet(
+                _existing_subnets(self._client), self._settings.tenant_subnet_pool
+            )
+            try:
+                return self._client.networks.create(
+                    name,
+                    driver="bridge",
+                    internal=True,
+                    labels=self._labels(spec, "network"),
+                    ipam=IPAMConfig(pool_configs=[IPAMPool(subnet=str(subnet))]),
+                )
+            except APIError as exc:
+                overlap = "overlap" in str(exc.explanation or "").lower()
+                if _already(exc) and not overlap:
+                    return self._client.networks.get(name)  # created concurrently
+                if not overlap or attempt == 2:
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _attach_shared(self, network: Network) -> None:
         for service in ATTACHED_SERVICES:
