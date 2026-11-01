@@ -18,6 +18,7 @@ from sijil_core.db.models import (
     DocumentState,
     Organisation,
     OrgType,
+    User,
     Workspace,
     WorkspaceState,
 )
@@ -27,6 +28,7 @@ pytestmark = pytest.mark.db
 MakeActor = Callable[[str], Awaitable[Any]]
 SHA = "a" * 64
 IMMUTABLE_UPDATES = {
+    "id": "gen_random_uuid()",
     "workspace_id": "gen_random_uuid()",
     "sha256": f"'{'b' * 64}'",
     "md5": f"'{'c' * 32}'",
@@ -115,6 +117,34 @@ async def test_retention_can_only_increase_in_db(db: AsyncSession, workspace: Wo
         )
         await db.commit()
     await db.rollback()
+
+
+async def test_seal_fields_set_once_then_frozen(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User
+) -> None:
+    row = ledger(workspace.id)
+    db.add(row)
+    await db.commit()
+    # NULL -> value: sealing is allowed, once.
+    await owner_conn.execute(
+        text("UPDATE document_ledger SET sealed_at = now(), sealed_by = :u"), {"u": user.id}
+    )
+    other = User(email=f"{uuid.uuid4().hex[:8]}@example.com", name="Other", password_hash="x")
+    db.add(other)
+    await db.commit()
+    for assignment, params in (
+        ("sealed_at = sealed_at + interval '1 second'", {}),
+        ("sealed_at = NULL", {}),
+        ("sealed_by = :u", {"u": other.id}),
+        ("sealed_by = NULL", {}),
+    ):
+        with pytest.raises(DBAPIError, match="ledger.immutable"):
+            await owner_conn.execute(
+                text(f"UPDATE document_ledger SET {assignment}"),  # noqa: S608
+                params,
+            )
+    # Re-writing the same values (an ORM flush of an unchanged row) is not a change.
+    await owner_conn.execute(text("UPDATE document_ledger SET sealed_at = sealed_at"))
 
 
 async def test_ledger_unique_per_workspace_sha(db: AsyncSession, workspace: Workspace) -> None:
