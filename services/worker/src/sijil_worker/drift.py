@@ -8,7 +8,15 @@ For every `consumed` document of a workspace it confirms that
 Every problem becomes an `IntegrityAlert` (never a second open one for the same document and
 kind) plus an `integrity.drift` audit event; the run ends with `integrity.check_ok` or
 `integrity.drift_summary`. Paperless being unreachable is transient: the error propagates so the
-task is retried later, and nothing is flagged on its account.
+task is retried later, and nothing is flagged on its account until the retries run out.
+
+A check that cannot run is itself a finding, because the attacker the check defends against (one
+who deleted a document with the admin password) can also revoke the service token or its view
+permission. A refused token (401/403), a missing or undecryptable credential, an unexpected
+error response, and exhausted retries each open a workspace-level alert (`ledger_id` NULL, kind
+`engine_*`, deduplicated while open) and write `integrity.check_failed` on every run. Metadata
+of an unexpected shape for one document is a per-document `paperless_bad_metadata` finding, and
+the run goes on with the rest.
 
 The ledger is read page by page (keyset on id) in short sessions and the network checks run
 between them, so no transaction is ever held open across a network wait. Alerts and audit events
@@ -26,7 +34,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import audit
-from sijil_core.crypto import Envelope, KeyService, open_envelope
+from sijil_core.crypto import DecryptionError, Envelope, KeyService, open_envelope
 from sijil_core.db.models import (
     ActorType,
     CredentialKind,
@@ -38,7 +46,12 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
-from sijil_core.paperless import PaperlessClient, PaperlessError
+from sijil_core.paperless import (
+    PaperlessBadResponse,
+    PaperlessClient,
+    PaperlessError,
+    PaperlessUnavailable,
+)
 from sijil_core.region import assert_region
 from sijil_core.settings import CoreSettings
 from sijil_core.storage import ObjectRef, ObjectStore
@@ -52,12 +65,26 @@ PAPERLESS_MISSING = "paperless_missing"
 PAPERLESS_MODIFIED = "paperless_modified"
 OBJECT_MISSING = "object_missing"
 OBJECT_SIZE_MISMATCH = "object_size_mismatch"
+PAPERLESS_BAD_METADATA = "paperless_bad_metadata"
+# Workspace-level: the check could not run.
+ENGINE_FORBIDDEN = "engine_forbidden"
+ENGINE_CREDENTIAL_MISSING = "engine_credential_missing"
+ENGINE_BAD_RESPONSE = "engine_bad_response"
+ENGINE_UNREACHABLE = "engine_unreachable"
 
 
 @dataclass(frozen=True)
 class DriftReport:
     checked: int
     problems: int
+    # The engine_* code when the check could not finish (recorded as a finding).
+    failed: str | None = None
+
+
+class _CheckFailed(Exception):  # noqa: N818
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -71,7 +98,7 @@ class _Doc:
 
 @dataclass(frozen=True)
 class _Finding:
-    ledger_id: UUID
+    ledger_id: UUID | None
     kind: str
     detail: dict[str, int | str]
 
@@ -149,20 +176,35 @@ async def _page(
     ]
 
 
+async def _metadata(client: PaperlessClient, doc_id: int) -> dict[str, object] | None:
+    """Paperless's metadata for one document; a failure that is not about it ends the run."""
+    try:
+        return await client.document_metadata(doc_id)
+    except (PaperlessBadResponse, PaperlessUnavailable):
+        raise
+    except PaperlessError as exc:
+        if exc.status in {401, 403}:
+            raise _CheckFailed(ENGINE_FORBIDDEN) from None
+        raise _CheckFailed(ENGINE_BAD_RESPONSE) from None
+
+
 async def _check(doc: _Doc, client: PaperlessClient, store: ObjectStore) -> list[_Finding]:
     found: list[_Finding] = []
     if doc.paperless_doc_id is not None:
-        meta = await client.document_metadata(doc.paperless_doc_id)
         detail: dict[str, int | str] = {"paperless_doc_id": doc.paperless_doc_id}
+        try:
+            meta = await _metadata(client, doc.paperless_doc_id)
+        except PaperlessBadResponse:
+            meta, checksum = {}, None
+        else:
+            checksum = None if meta is None else meta.get("original_checksum")
         if meta is None:
             found.append(_Finding(doc.id, PAPERLESS_MISSING, detail))
-        else:
-            checksum = meta.get("original_checksum")
-            if not isinstance(checksum, str) or not checksum:
-                # Unknown shape: never guess a verdict on a document that may be fine.
-                raise PaperlessError("metadata: missing original_checksum")
-            if checksum.lower() != doc.sha256.lower():
-                found.append(_Finding(doc.id, PAPERLESS_MODIFIED, detail))
+        elif not isinstance(checksum, str) or not checksum:
+            # Unknown shape: never guess a verdict on the content, but say so.
+            found.append(_Finding(doc.id, PAPERLESS_BAD_METADATA, detail))
+        elif checksum.lower() != doc.sha256.lower():
+            found.append(_Finding(doc.id, PAPERLESS_MODIFIED, detail))
     size = await store.head(doc.ref)
     if size is None:
         found.append(_Finding(doc.id, OBJECT_MISSING, {"expected_size": doc.size_bytes}))
@@ -177,6 +219,70 @@ async def _check(doc: _Doc, client: PaperlessClient, store: ObjectStore) -> list
     return found
 
 
+async def _lock(session: AsyncSession, workspace_id: UUID) -> None:
+    """Serialises concurrent runs for the workspace, so the open-alert check cannot race."""
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended('drift:' || CAST(:ws AS text), 0))"),
+        {"ws": str(workspace_id)},
+    )
+
+
+async def _open_alert(
+    session: AsyncSession, workspace_id: UUID, finding: _Finding, now: datetime
+) -> bool:
+    """Add an alert unless one is open for the same document (or workspace) and kind."""
+    same_target = (
+        IntegrityAlert.ledger_id.is_(None)
+        if finding.ledger_id is None
+        else IntegrityAlert.ledger_id == finding.ledger_id
+    )
+    open_alert = await session.scalar(
+        select(IntegrityAlert.id).where(
+            IntegrityAlert.workspace_id == workspace_id,
+            same_target,
+            IntegrityAlert.kind == finding.kind,
+            IntegrityAlert.resolved_at.is_(None),
+        )
+    )
+    if open_alert is not None:
+        return False
+    session.add(
+        IntegrityAlert(
+            workspace_id=workspace_id,
+            ledger_id=finding.ledger_id,
+            kind=finding.kind,
+            detail=finding.detail,
+            detected_at=now,
+        )
+    )
+    return True
+
+
+async def record_check_failed(
+    sessions: async_sessionmaker[AsyncSession],
+    workspace_id: UUID,
+    code: str,
+    *,
+    now: datetime,
+) -> None:
+    """The check could not run: a workspace-level alert (once while open) and an audit event
+    (every time), in one transaction."""
+    async with sessions() as session:
+        await _lock(session, workspace_id)
+        await _open_alert(session, workspace_id, _Finding(None, code, {"code": code}), now)
+        await audit.append(
+            session,
+            workspace_id=workspace_id,
+            action="integrity.check_failed",
+            actor_type=ActorType.system,
+            actor_id=None,
+            data={"code": code},
+            now=now,
+        )
+        await session.commit()
+    log.warning("drift check %s could not run: %s", workspace_id, code)
+
+
 async def _record(
     sessions: async_sessionmaker[AsyncSession],
     workspace_id: UUID,
@@ -188,32 +294,10 @@ async def _record(
         return 0
     new = 0
     async with sessions() as session:
-        # Serialises concurrent runs for the workspace, so the open-alert check cannot race.
-        await session.execute(
-            text(
-                "SELECT pg_advisory_xact_lock(hashtextextended('drift:' || CAST(:ws AS text), 0))"
-            ),
-            {"ws": str(workspace_id)},
-        )
+        await _lock(session, workspace_id)
         for finding in findings:
-            open_alert = await session.scalar(
-                select(IntegrityAlert.id).where(
-                    IntegrityAlert.ledger_id == finding.ledger_id,
-                    IntegrityAlert.kind == finding.kind,
-                    IntegrityAlert.resolved_at.is_(None),
-                )
-            )
-            if open_alert is not None:
+            if not await _open_alert(session, workspace_id, finding, now):
                 continue
-            session.add(
-                IntegrityAlert(
-                    workspace_id=workspace_id,
-                    ledger_id=finding.ledger_id,
-                    kind=finding.kind,
-                    detail=finding.detail,
-                    detected_at=now,
-                )
-            )
             await audit.append(
                 session,
                 workspace_id=workspace_id,
@@ -265,7 +349,12 @@ async def drift_check(
     settings: CoreSettings,
     now: datetime,
 ) -> DriftReport:
-    target = await _target(sessions, keys, settings, workspace_id)
+    try:
+        target = await _target(sessions, keys, settings, workspace_id)
+    except (MissingCredential, DecryptionError, ValueError):
+        # ValueError: an envelope that does not even parse.
+        await record_check_failed(sessions, workspace_id, ENGINE_CREDENTIAL_MISSING, now=now)
+        return DriftReport(0, 0, failed=ENGINE_CREDENTIAL_MISSING)
     if target is None:
         return DriftReport(0, 0)
     checked = problems = new = 0
@@ -273,11 +362,19 @@ async def drift_check(
     async with paperless(target.paperless_url, token=target.token) as client:
         while page := await _page(sessions, workspace_id, after):
             findings: list[_Finding] = []
+            failed: str | None = None
             for doc in page:
-                findings += await _check(doc, client, store)
+                try:
+                    findings += await _check(doc, client, store)
+                except _CheckFailed as exc:
+                    failed = exc.code
+                    break
+                checked += 1
             new += await _record(sessions, workspace_id, findings, now)
-            checked += len(page)
             problems += len(findings)
+            if failed is not None:
+                await record_check_failed(sessions, workspace_id, failed, now=now)
+                return DriftReport(checked, problems, failed=failed)
             after = page[-1].id
     report = DriftReport(checked=checked, problems=problems)
     await _summarise(sessions, workspace_id, report, new, now)

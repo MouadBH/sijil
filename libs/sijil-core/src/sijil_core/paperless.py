@@ -49,6 +49,11 @@ class PaperlessUnavailable(PaperlessError):  # noqa: N818
     502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
 
 
+class PaperlessBadResponse(PaperlessError):  # noqa: N818
+    """Paperless answered 2xx with a body of an unexpected shape (not JSON, or not the object
+    the endpoint documents)."""
+
+
 class PaperlessUnsupportedType(PaperlessError):  # noqa: N818
     """Paperless refused the upload because it cannot consume this file type (HTTP 400,
     `{"document": ["File type text/xml not supported"]}` in 3.4.1). Final, never retried."""
@@ -317,9 +322,12 @@ class PaperlessClient:
             if exc.status == 404:
                 return None
             raise
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/documents/{id}/metadata/: not JSON") from None
         if not isinstance(body, dict):
-            raise PaperlessError("GET /api/documents/{id}/metadata/: unexpected body")
+            raise PaperlessBadResponse("GET /api/documents/{id}/metadata/: unexpected body")
         return dict(body)
 
     async def documents_by_ids(self, ids: Sequence[int]) -> dict[int, PaperlessDoc]:

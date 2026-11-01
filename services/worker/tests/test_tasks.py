@@ -219,3 +219,24 @@ def test_beat_runs_drift_check_nightly_at_0230_casablanca() -> None:
     assert app.conf.beat_schedule["reconcile-tenants"]["schedule"] == 300
     assert tasks.drift_check_all_task.name == "sijil.drift_check_all"
     assert tasks.drift_check_task.name == "sijil.drift_check"
+
+
+def test_drift_check_records_a_failed_check_when_retries_run_out(
+    eager_app: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    async def down(workspace_id: str) -> None:
+        attempts.append(workspace_id)
+        raise PaperlessUnavailable("down")
+
+    async def record(workspace_id: str, code: str) -> None:
+        failed.append((workspace_id, code))
+
+    monkeypatch.setattr(tasks, "_drift", down)
+    monkeypatch.setattr(tasks, "_drift_failed", record)
+    result = tasks.drift_check_task.apply(kwargs={"workspace_id": ARGS[1]})
+    assert isinstance(result.result, PaperlessUnavailable)
+    assert len(attempts) == tasks.DRIFT_MAX_RETRIES + 1
+    assert failed == [(ARGS[1], "engine_unreachable")]  # once, when nothing will retry

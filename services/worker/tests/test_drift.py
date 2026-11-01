@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 import respx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import audit
@@ -402,3 +402,132 @@ async def test_enqueue_covers_active_workspaces_of_this_region_only(
 
     assert await enqueue_drift_checks(sessions, SETTINGS, enqueue) == 1
     assert sent == [ready.id]
+
+
+async def workspace_alerts(db: AsyncSession) -> list[IntegrityAlert]:
+    return [a for a in await alerts(db) if a.ledger_id is None]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_revoked_service_token_is_a_finding(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    status: int,
+) -> None:
+    # An attacker who deleted a document then revokes the token: the check must not go quiet.
+    await make_doc(db, memory_store, ready, tmp_path, 1)
+    for _ in range(2):
+        with respx.mock(assert_all_called=False) as router:
+            router.get(f"{URL}/api/documents/1/metadata/").respond(status)
+            report = await run(ready, sessions, keys, memory_store)  # no exception
+        assert report.failed == "engine_forbidden"
+    (alert,) = await alerts(db)  # deduplicated across runs
+    assert (alert.ledger_id, alert.kind, alert.workspace_id) == (None, "engine_forbidden", ready.id)
+    assert alert.resolved_at is None
+    actions = [(e.action, e.data) for e in await events(db, ready)]
+    assert actions == [("integrity.check_failed", {"code": "engine_forbidden"})] * 2
+    assert (await audit.verify(db, ready.id)).ok
+
+
+async def test_missing_credential_is_a_finding(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    await make_doc(db, memory_store, ready, tmp_path, 1)
+    await db.execute(delete(TenantCredential).where(TenantCredential.workspace_id == ready.id))
+    await db.commit()
+    with respx.mock(assert_all_called=False) as router:
+        report = await run(ready, sessions, keys, memory_store)
+        assert router.calls.call_count == 0
+    assert report.failed == "engine_credential_missing"
+    (alert,) = await workspace_alerts(db)
+    assert alert.kind == "engine_credential_missing"
+    (event,) = await events(db, ready)
+    assert (event.action, event.data) == (
+        "integrity.check_failed",
+        {"code": "engine_credential_missing"},
+    )
+
+
+async def test_undecryptable_credential_is_a_finding(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    await make_doc(db, memory_store, ready, tmp_path, 1)
+    with respx.mock(assert_all_called=False):
+        report = await run(ready, sessions, LocalKeyService(b"x" * 32), memory_store)
+    assert report.failed == "engine_credential_missing"
+    (alert,) = await workspace_alerts(db)
+    assert alert.kind == "engine_credential_missing"
+
+
+async def test_unexpected_error_response_is_a_finding(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    await make_doc(db, memory_store, ready, tmp_path, 1)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/1/metadata/").respond(400)
+        report = await run(ready, sessions, keys, memory_store)
+    assert report.failed == "engine_bad_response"
+    (alert,) = await workspace_alerts(db)
+    assert alert.kind == "engine_bad_response"
+    assert [e.action for e in await events(db, ready)] == ["integrity.check_failed"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"original_size": 1}, {"original_checksum": ""}, ["not", "a", "dict"], "not json"],
+)
+async def test_bad_metadata_for_one_document_does_not_block_the_others(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    body: Any,
+) -> None:
+    odd = await make_doc(db, memory_store, ready, tmp_path, 1)
+    gone = await make_doc(db, memory_store, ready, tmp_path, 2)
+    fine = await make_doc(db, memory_store, ready, tmp_path, 3)
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get(f"{URL}/api/documents/1/metadata/")
+        if isinstance(body, str):
+            route.respond(200, text=body, headers={"Content-Type": "application/json"})
+        else:
+            route.respond(200, json=body)
+        metadata(router, 2, None)
+        metadata(router, 3, fine.sha256)
+        report = await run(ready, sessions, keys, memory_store)
+    assert report == DriftReport(checked=3, problems=2)
+    found = {(a.ledger_id, a.kind) for a in await alerts(db)}
+    assert found == {(odd.id, "paperless_bad_metadata"), (gone.id, "paperless_missing")}
+
+
+async def test_exhausted_retries_record_the_check_as_failed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    ready: Workspace,
+) -> None:
+    for _ in range(2):
+        await drift.record_check_failed(sessions, ready.id, "engine_unreachable", now=NOW)
+    (alert,) = await alerts(db)
+    assert (alert.ledger_id, alert.kind, alert.detected_at) == (None, "engine_unreachable", NOW)
+    actions = [(e.action, e.data) for e in await events(db, ready)]
+    assert actions == [("integrity.check_failed", {"code": "engine_unreachable"})] * 2

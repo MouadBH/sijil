@@ -20,7 +20,12 @@ from sijil_core.paperless import (
     PaperlessUnavailable,
 )
 from sijil_core.storage import S3ObjectStore, StorageSettings
-from sijil_worker.drift import drift_check, enqueue_drift_checks
+from sijil_worker.drift import (
+    ENGINE_UNREACHABLE,
+    drift_check,
+    enqueue_drift_checks,
+    record_check_failed,
+)
 from sijil_worker.ingest import (
     INGEST_MAX_RETRIES,
     ConsumeFailed,
@@ -246,13 +251,26 @@ async def _drift(workspace_id: str) -> None:
         await engine.dispose()
 
 
+async def _drift_failed(workspace_id: str, code: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await record_check_failed(make_sessionmaker(engine), UUID(workspace_id), code, now=utcnow())
+    finally:
+        await engine.dispose()
+
+
 @shared_task(bind=True, name="sijil.drift_check", max_retries=DRIFT_MAX_RETRIES)
 def drift_check_task(self: "Task[Any, Any]", workspace_id: str) -> None:
     """Integrity drift check of one workspace; retried later when a dependency is down."""
     try:
         asyncio.run(_drift(workspace_id))
     except Exception as exc:
-        if not (is_drift_transient(exc) and int(self.request.retries or 0) < DRIFT_MAX_RETRIES):
+        if not is_drift_transient(exc):
+            raise
+        if int(self.request.retries or 0) >= DRIFT_MAX_RETRIES:
+            # Retries ran out: a check that never runs must not be silent.
+            asyncio.run(_drift_failed(workspace_id, ENGINE_UNREACHABLE))
             raise
         countdown = get_exponential_backoff_interval(
             factor=DRIFT_BACKOFF_FACTOR_S,

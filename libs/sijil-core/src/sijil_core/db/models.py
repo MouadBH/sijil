@@ -340,7 +340,10 @@ class IntegrityAlert(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"), index=True)
-    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("document_ledger.id"), index=True)
+    # None for a workspace-level finding (the check itself could not run: engine_*).
+    ledger_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("document_ledger.id"), index=True
+    )
     kind: Mapped[str] = mapped_column(String(64))
     detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
