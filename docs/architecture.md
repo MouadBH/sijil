@@ -70,7 +70,7 @@ flowchart LR
 | `sijil_cp` (Postgres) | Shared per region | Users, orgs, workspaces, memberships, sessions, encrypted tenant credentials, `DocumentLedger` (hashes, states, retention dates), `AuditEvent` | **No** (hashes and metadata only) |
 | `index_<ws>` (Postgres + pgvector) | Per workspace | Extracted field values, correction notes, OCR-derived text for Ask, embeddings | Yes |
 | `paperless_<ws>` (Postgres) + tenant volumes | Per workspace | Paperless metadata, OCR text, original + archived PDFs (a working copy) | Yes |
-| Object store (`sijil-originals`) | Per region, one prefix per workspace | Write-once original of every ingested file, key = SHA-256, object lock until `retention_until` | Yes (the record of truth for files) |
+| Object store (`sijil-originals`) | Per region, one prefix per workspace | Write-once original of every ingested file, key `{tenant_ref}/{sha256}`, versioned, object lock until `retention_until` | Yes (the record of truth for files) |
 | Redis | Per region | Job queues and results | Transient job arguments only (ids, never file bytes) |
 
 ## Document lifecycle
@@ -108,6 +108,18 @@ sequenceDiagram
 ```
 
 States: `received → needs_review | filed → sealed`. A document can also become `removed` (a tombstone row), but only before sealing, only by an Owner, and only with a stated reason.
+
+### M2 capture: how a file gets in
+
+- **Originals.** `accept_file` streams the body to a spool while computing SHA-256 and MD5, sniffs the type from the content (never the extension or client `Content-Type`), and writes the original to the object store at `{tenant_ref}/{sha256}` (content-addressed, so a repeated put is harmless). The object carries a **GOVERNANCE** lock with a provisional `retain_until`: the end of the arrival's calendar year (region-local date) plus the country's years (`MA`: 10). Retention can only be extended. COMPLIANCE at seal is M3/M4.
+- **Ledger.** One `document_ledger` row per `(workspace_id, sha256)`, unique. It holds hashes, size, kind, source, object key and version, ingest state and dates, and never a filename, subject or sender. `sha256`, `md5` and the other identity columns are immutable (trigger), even for the app role. A second upload of the same bytes returns `409 document.duplicate` with the existing id and audits `document.duplicate_rejected`.
+- **Audit chain.** The ledger insert and its audit event (`document.uploaded`, or `email.received` for a raw `.eml`) commit in one transaction. Ingest, views, lists, integrity checks and org/member changes append to the same per-workspace chain.
+- **Ingest (claim, lease, resume).** After commit, `sijil.ingest_document` is enqueued on the `ingest` queue. The worker claims the row with a compare-and-set (`queued`, or `sending` whose lease expired) and stamps `ingest_claimed_at`; a crashed run is taken over once the lease lapses, and a beat task re-queues stranded rows. Before uploading it asks Paperless for the SHA-256: Paperless 3.4.1 accepts duplicate uploads, so an existing document is adopted instead of uploaded again. It then polls Paperless's task until `consumed`, records `paperless_doc_id`, and audits `document.ingested` or `document.ingest_failed`. Every write after the claim is guarded by the lease stamp.
+- **Per-format outcome (Paperless 3.4.1).** Consumed: PDF, JPEG, PNG, TIFF, DOCX, XLSX, EML. XML is refused by Paperless: the original stays archived and counted with `ingest_state = unsupported` (`ingest.unsupported_format`), audited, never retried. The HEIC sample is a bare `ftyp` box that Paperless cannot decode (also `unsupported`); a real HEIC is untested.
+- **Inbound SMTP.** The `smtp` service (published on `127.0.0.1:2525` in development, no Docker socket, no tenant network) accepts mail for `{slug}.{inbound_token}@{SIJIL_INBOUND_DOMAIN}`. An unknown recipient is refused at RCPT (`550 5.1.1`), over 100 MB with `552 5.3.4`. The raw `.eml` is archived as a document (`source = email`), and each attachment is archived as its own document linked by `source_email_id`. All of it goes through the same `accept_file`.
+- **Drift check.** `sijil.drift_check` runs nightly per active workspace (beat, 02:30). For every `consumed` row it checks that Paperless still has the document with `original_checksum` equal to the ledger `sha256`, and that the object still exists with the recorded size. A problem creates one open `IntegrityAlert` per document and kind plus an `integrity.drift` event; a clean run writes `integrity.check_ok`. Paperless being unreachable is retried, never flagged.
+- **Reconcile and the subnet pool.** Tenant networks get a `/28` from `SIJIL_TENANT_SUBNET_POOL` (see below), and `reconcile_tenants` re-attaches the shared services after any of them is recreated, so capture keeps reaching tenants.
+- **Try it.** `make seed` signs in as a SAMPLE user, provisions the SAMPLE workspace if needed, uploads `fixtures/invoices/sample-01..06`, emails `sample-07..12` to the workspace address and waits until all are consumed. `test_m2_acceptance` (`make itest`) runs the same flow in a throw-away organisation and checks hashes, consumption within 120 s, the 409 on re-upload, `sijil-cp audit verify`, the immutable `sha256`, and a drift alert after an admin deletes a document in Paperless.
 
 ## Retention lock: four layers
 

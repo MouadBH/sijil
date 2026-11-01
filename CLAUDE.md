@@ -47,6 +47,8 @@ make check      # lint + typecheck + unit tests, Python and JS
 make e2e        # Playwright
 make up         # boot the compose stack (copies .env.example on first run)
 make smoke      # assert every service is healthy and tenants are not exposed
+make seed       # 12 SAMPLE invoices (6 via the API, 6 by email) into the SAMPLE workspace; idempotent, prints the workspace id
+make itest      # integration tests in the compose `tests` runner (includes the M2 acceptance)
 make down ARGS=-v
 ```
 
