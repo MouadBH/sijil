@@ -160,7 +160,7 @@ class Actor:
         self.secret: str | None = None
 
     async def enable_totp(self) -> None:
-        r = await self.client.post("/v1/auth/totp/enrol")
+        r = await self.client.post("/v1/auth/totp/enrol", json={"password": PASSWORD})
         assert r.status_code == 200
         self.secret = parse_qs(urlparse(str(r.json()["otpauth_uri"])).query)["secret"][0]
         code = pyotp.TOTP(self.secret).at(self.clock.now)

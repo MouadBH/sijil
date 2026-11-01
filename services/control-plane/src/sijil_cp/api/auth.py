@@ -104,6 +104,11 @@ class TotpCodeIn(BaseModel):
     code: str = Field(max_length=_CODE_CAP)
 
 
+class EnrolIn(BaseModel):
+    # Required while the user has no TOTP yet (a session alone is not enough to add a factor).
+    password: str | None = Field(default=None, max_length=_PASSWORD_CAP)
+
+
 class TotpVerifyIn(BaseModel):
     code: str | None = Field(default=None, max_length=_CODE_CAP)
     recovery_code: str | None = Field(default=None, max_length=_CODE_CAP)
@@ -305,12 +310,26 @@ async def totp_enrol(
     session: Annotated[UserSession, Depends(current_session())],
     user: Annotated[User, Depends(current_user)],
     db: Db,
+    redis: Rds,
     keys: Keys,
     now: Now,
+    body: EnrolIn | None = None,
 ) -> EnrolOut:
-    # Replacing a working second factor is as sensitive as removing it.
-    if user.totp_enabled and not has_recent_totp(session, user, now):
-        raise ApiError("auth.step_up_required", 403)
+    if user.totp_enabled:
+        # Replacing a working second factor is as sensitive as removing it.
+        if not has_recent_totp(session, user, now):
+            raise ApiError("auth.step_up_required", 403)
+    else:
+        # Adding the first factor proves the password again, so a stolen session cannot turn
+        # itself into a permanent takeover. Counted per user, like TOTP codes.
+        key = await _count_totp_attempt(redis, user)
+        password = body.password if body is not None else None
+        ok = password is not None and await asyncio.to_thread(
+            passwords.verify_password, user.password_hash, password
+        )
+        if not ok:
+            raise ApiError("auth.invalid_credentials", 401)
+        await ratelimit.clear(redis, key)
     secret = totp.new_secret()
     user.totp_pending = seal(secret.encode(), keys, _TOTP_KEY_ID, _totp_context(user)).to_bytes()
     await db.commit()
@@ -320,6 +339,7 @@ async def totp_enrol(
 @router.post("/auth/totp/confirm")
 async def totp_confirm(
     body: TotpCodeIn,
+    session: Annotated[UserSession, Depends(current_session())],
     user: Annotated[User, Depends(current_user)],
     db: Db,
     redis: Rds,
@@ -349,6 +369,8 @@ async def totp_confirm(
     )
     await db.commit()
     await ratelimit.clear(redis, key)
+    # The second factor changed: every other session (perhaps a thief's) must log in again.
+    await sessions.revoke_others(db, user.id, keep=session.id, now=now)
     return RecoveryCodesOut(recovery_codes=codes)
 
 
@@ -416,9 +438,10 @@ async def totp_verify(
 
 @router.post("/auth/totp/disable", status_code=status.HTTP_204_NO_CONTENT)
 async def totp_disable(
-    _: Annotated[UserSession, Depends(require_recent_totp())],
+    session: Annotated[UserSession, Depends(require_recent_totp())],
     user: Annotated[User, Depends(current_user)],
     db: Db,
+    now: Now,
 ) -> Response:
     if await user_in_totp_org(db, user.id):
         raise ApiError("auth.totp_enforced", 409)
@@ -427,4 +450,5 @@ async def totp_disable(
     user.totp_pending = None
     await db.execute(delete(RecoveryCode).where(RecoveryCode.user_id == user.id))
     await db.commit()
+    await sessions.revoke_others(db, user.id, keep=session.id, now=now)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

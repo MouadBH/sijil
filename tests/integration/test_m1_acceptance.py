@@ -44,7 +44,7 @@ async def _sign_up_with_totp(http: httpx.AsyncClient) -> None:
     email = f"it-{uuid.uuid4().hex[:10]}@example.com"
     r = await _post(http, "/v1/auth/signup", {"email": email, "password": PASSWORD, "name": "IT"})
     assert r.status_code == 201, r.text
-    r = await _post(http, "/v1/auth/totp/enrol", {})
+    r = await _post(http, "/v1/auth/totp/enrol", {"password": PASSWORD})
     assert r.status_code == 200, r.text
     secret = parse_qs(urlparse(r.json()["otpauth_uri"]).query)["secret"][0]
     totp = pyotp.TOTP(secret)

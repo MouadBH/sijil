@@ -109,7 +109,7 @@ def wrong_code(secret: str, clock: "Clock") -> str:
 
 
 async def enrol(c: httpx.AsyncClient) -> str:
-    r = await c.post("/v1/auth/totp/enrol")
+    r = await c.post("/v1/auth/totp/enrol", json={"password": PASSWORD})
     assert r.status_code == 200
     uri = urlparse(str(r.json()["otpauth_uri"]))
     assert uri.scheme == "otpauth"
@@ -533,3 +533,68 @@ def test_verify_unit_window_and_replay() -> None:
     assert totp.verify(secret, t.at(now), step, now) is None
     assert totp.verify(secret, t.at(now + STEP), step, now) == step + 1
     assert "issuer=Sijil" in totp.provisioning_uri(secret, EMAIL)
+
+
+async def test_enrol_without_totp_needs_the_password(
+    c: httpx.AsyncClient, clock: Clock, db: AsyncSession
+) -> None:
+    """A stolen session alone cannot bind the thief's authenticator to the account."""
+    await signup(c)
+    for body in (None, {}, {"password": "not the password"}):
+        r = await c.post("/v1/auth/totp/enrol", json=body)
+        assert r.status_code == 401, body
+        assert error(r) == "auth.invalid_credentials"
+    user = await db.scalar(select(User).where(User.email == EMAIL))
+    assert user is not None
+    await db.refresh(user)
+    assert user.totp_pending is None
+    assert (await c.post("/v1/auth/totp/enrol", json={"password": PASSWORD})).status_code == 200
+
+
+async def test_enrol_password_attempts_are_rate_limited(
+    c: httpx.AsyncClient, clock: Clock, db: AsyncSession
+) -> None:
+    await signup(c)
+    for _ in range(5):
+        r = await c.post("/v1/auth/totp/enrol", json={"password": "wrong password!"})
+        assert r.status_code == 401
+    r = await c.post("/v1/auth/totp/enrol", json={"password": PASSWORD})
+    assert r.status_code == 429
+    assert error(r) == "auth.rate_limited"
+
+
+async def test_confirm_revokes_other_sessions(
+    app: FastAPI,
+    c: httpx.AsyncClient,
+    csrf_client_for: Callable[..., httpx.AsyncClient],
+    clock: Clock,
+    db: AsyncSession,
+) -> None:
+    await signup(c)
+    async with csrf_client_for(app) as other:
+        assert (await login(other)).json() == {"status": "ok"}
+        assert (await other.get("/v1/me")).status_code == 200
+        secret = await enrol(c)
+        r = await c.post("/v1/auth/totp/confirm", json={"code": code_at(secret, clock.now)})
+        assert r.status_code == 200
+        assert (await other.get("/v1/me")).status_code == 401
+    assert (await c.get("/v1/me")).status_code == 200
+
+
+async def test_disable_revokes_other_sessions(
+    app: FastAPI,
+    c: httpx.AsyncClient,
+    csrf_client_for: Callable[..., httpx.AsyncClient],
+    clock: Clock,
+    db: AsyncSession,
+) -> None:
+    secret, _ = await enable_totp(c, clock)
+    async with csrf_client_for(app) as other:
+        await login(other)
+        assert (await verify(other, code=code_at(secret, clock.now))).status_code == 200
+        clock.advance(STEP)
+        assert (await other.get("/v1/me")).status_code == 200
+        assert (await verify(c, code=code_at(secret, clock.now))).status_code == 200
+        assert (await c.post("/v1/auth/totp/disable")).status_code == 204
+        assert (await other.get("/v1/me")).status_code == 401
+    assert (await c.get("/v1/me")).status_code == 200

@@ -93,6 +93,20 @@ async def revoke(db: AsyncSession, session_id: UUID, *, now: datetime | None = N
     await db.commit()
 
 
+async def revoke_others(db: AsyncSession, user_id: UUID, keep: UUID, now: datetime) -> None:
+    """Revoke every live session of `user_id` except `keep` (after a second-factor change)."""
+    await db.execute(
+        update(UserSession)
+        .where(
+            UserSession.user_id == user_id,
+            UserSession.id != keep,
+            UserSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    await db.commit()
+
+
 async def revoke_token(db: AsyncSession, raw_token: str | None, now: datetime) -> None:
     """Revoke the session a raw token belongs to, if any (no session fixation on rotation)."""
     if not raw_token:
