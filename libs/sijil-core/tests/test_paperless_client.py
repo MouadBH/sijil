@@ -9,6 +9,7 @@ from sijil_core.paperless import (
     SERVICE_PERMISSIONS,
     SUPPORT_PERMISSIONS,
     PaperlessClient,
+    PaperlessDoc,
     PaperlessError,
     PaperlessForbidden,
     PaperlessUnavailable,
@@ -216,3 +217,40 @@ async def test_upload_retries_only_when_the_request_was_never_sent() -> None:
     async with PaperlessClient(BASE, token="t") as client:
         assert await client.upload(b"%PDF-1", "a.pdf") == "task-1"
     assert route.call_count == 2
+
+
+@respx.mock
+async def test_documents_by_ids_maps_titles() -> None:
+    route = respx.get(f"{BASE}/api/documents/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "id": 4,
+                        "title": "Facture",
+                        "created": "2026-10-01",
+                        "original_file_name": "f.pdf",
+                        "content": "x",
+                    }
+                ]
+            },
+        )
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        docs = await client.documents_by_ids([4, 9])
+        assert await client.documents_by_ids([]) == {}
+    assert set(docs) == {4}
+    assert docs[4] == PaperlessDoc(4, "Facture", "2026-10-01", "f.pdf")
+    params = route.calls.last.request.url.params
+    assert params["id__in"] == "4,9"
+    assert params["page_size"] == "2"
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_documents_by_ids_bad_body_is_paperless_error() -> None:
+    respx.get(f"{BASE}/api/documents/").mock(return_value=httpx.Response(200, json={"x": 1}))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessError):
+            await client.documents_by_ids([1])

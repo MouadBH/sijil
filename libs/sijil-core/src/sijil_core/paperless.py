@@ -95,6 +95,14 @@ def _is_unsupported_type(response: httpx.Response) -> bool:
     return isinstance(messages, list) and any("not supported" in str(m) for m in messages)
 
 
+@dataclass(frozen=True)
+class PaperlessDoc:
+    id: int
+    title: str | None
+    created: str | None
+    original_file_name: str | None
+
+
 class PaperlessClient:
     def __init__(
         self,
@@ -299,6 +307,34 @@ class PaperlessClient:
     async def get_document(self, doc_id: int) -> dict[str, Any]:
         response = await self._request("GET", f"/api/documents/{doc_id}/")
         return dict(response.json())
+
+    async def documents_by_ids(self, ids: Sequence[int]) -> dict[int, PaperlessDoc]:
+        """Titles and names of the given documents in one request (ids missing in Paperless
+        are simply absent). A malformed answer surfaces as PaperlessError."""
+        wanted = sorted(set(ids))
+        if not wanted:
+            return {}
+        response = await self._request(
+            "GET",
+            "/api/documents/",
+            params={
+                "id__in": ",".join(str(i) for i in wanted),
+                "page_size": len(wanted),
+                "fields": "id,title,created,original_file_name",
+            },
+        )
+        try:
+            return {
+                int(r["id"]): PaperlessDoc(
+                    id=int(r["id"]),
+                    title=r.get("title"),
+                    created=r.get("created"),
+                    original_file_name=r.get("original_file_name"),
+                )
+                for r in response.json()["results"]
+            }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise PaperlessError("GET /api/documents/: unexpected body") from None
 
     async def delete_document(self, doc_id: int) -> None:
         await self._request("DELETE", f"/api/documents/{doc_id}/")
