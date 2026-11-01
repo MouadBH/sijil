@@ -6,6 +6,8 @@ requires-python = ">=3.13,<3.14"
 dependencies = [
   "sijil-core",
   "celery[redis]>=5.4",
+  "docker>=7.1",
+  "asyncpg>=0.30",
 ]
 
 [tool.uv.sources]

@@ -75,6 +75,21 @@ jobs:
       - name: tessdata checksum
         run: cd infra/compose/tessdata && sha256sum -c SHA256SUMS
 
+  integration:
+    # The whole stack, then smoke, contract, DockerRuntime and M1 acceptance tests.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: make up
+      - run: make smoke
+      - run: make itest
+      - name: compose logs
+        if: failure()
+        run: docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env logs --no-color --tail 200
+      - if: always()
+        run: make down ARGS=-v
+
   security:
     runs-on: ubuntu-24.04
     steps:
