@@ -40,8 +40,34 @@ def _default(value: Any) -> str:
 
 def canonical_json(obj: Mapping[str, Any]) -> bytes:
     return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=_default
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+        default=_default,
     ).encode("utf-8")
+
+
+def _check_data(value: Any) -> None:
+    """Audit data holds only str, int, bool, None and lists/dicts (str keys) of those.
+
+    Floats are refused: JSONB stores numbers as numeric and prints them its own way, so a float
+    would hash differently after the round trip and verify would flag an untouched row.
+    """
+    if value is None or isinstance(value, str | bool | int):
+        return
+    if isinstance(value, list | tuple):
+        for item in value:
+            _check_data(item)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("audit data keys must be str")
+            _check_data(item)
+        return
+    raise TypeError(f"audit data does not accept {type(value).__name__}")
 
 
 def event_hash(prev_hash: str, event: Mapping[str, Any]) -> str:
@@ -104,6 +130,9 @@ async def append(
     now: datetime,
 ) -> AuditEvent:
     """Add the next event of the workspace's chain, in the caller's transaction."""
+    if now.tzinfo is None:
+        raise ValueError("audit timestamp must be timezone-aware")
+    _check_data(data or {})
     # The lock comes first: the last seq must be read only once no other append can interleave.
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended('audit:' || CAST(:ws AS text), 0))"),
@@ -158,7 +187,7 @@ async def verify(db: AsyncSession, workspace_id: UUID) -> VerifyResult:
         select(AuditEvent)
         .where(AuditEvent.workspace_id == workspace_id)
         .order_by(AuditEvent.seq)
-        .execution_options(yield_per=500)
+        .execution_options(yield_per=500, populate_existing=True)
     )
     expected_seq = 1
     prev_hash = GENESIS_HASH

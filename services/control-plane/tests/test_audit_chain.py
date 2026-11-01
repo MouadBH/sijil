@@ -49,41 +49,49 @@ async def _owner_edit(conn: AsyncConnection, sql: str) -> None:
 
 
 async def test_chain_links(db: AsyncSession, workspace: Workspace) -> None:
-    events = await _append(db, workspace.id, 3)
+    ws_id = workspace.id
+    events = await _append(db, ws_id, 3)
     assert [e.seq for e in events] == [1, 2, 3]
     assert events[0].prev_hash == "0" * 64
     assert events[1].prev_hash == events[0].hash
     assert events[2].prev_hash == events[1].hash
-    result = await audit.verify(db, workspace.id)
+    db.expire_all()
+    result = await audit.verify(db, ws_id)
     assert (result.ok, result.count, result.first_bad_seq) == (True, 3, None)
 
 
 async def test_tamper_detected_by_verify(
     db: AsyncSession, workspace: Workspace, owner_conn: AsyncConnection
 ) -> None:
-    await _append(db, workspace.id, 3)
+    ws_id = workspace.id
+    await _append(db, ws_id, 3)
     await _owner_edit(owner_conn, "UPDATE audit_event SET data = '{\"i\": 99}' WHERE seq = 2")
-    result = await audit.verify(db, workspace.id)
+    db.expire_all()
+    result = await audit.verify(db, ws_id)
     assert (result.ok, result.first_bad_seq) == (False, 2)
 
 
 async def test_gap_detected(
     db: AsyncSession, workspace: Workspace, owner_conn: AsyncConnection
 ) -> None:
-    await _append(db, workspace.id, 3)
+    ws_id = workspace.id
+    await _append(db, ws_id, 3)
     await _owner_edit(owner_conn, "DELETE FROM audit_event WHERE seq = 2")
-    result = await audit.verify(db, workspace.id)
+    db.expire_all()
+    result = await audit.verify(db, ws_id)
     assert (result.ok, result.first_bad_seq) == (False, 3)
 
 
 async def test_broken_link_detected(
     db: AsyncSession, workspace: Workspace, owner_conn: AsyncConnection
 ) -> None:
-    await _append(db, workspace.id, 3)
+    ws_id = workspace.id
+    await _append(db, ws_id, 3)
     await _owner_edit(
         owner_conn, "UPDATE audit_event SET prev_hash = repeat('f', 64) WHERE seq = 3"
     )
-    result = await audit.verify(db, workspace.id)
+    db.expire_all()
+    result = await audit.verify(db, ws_id)
     assert (result.ok, result.first_bad_seq) == (False, 3)
 
 
@@ -183,3 +191,61 @@ async def test_cli_verify_exit_codes(
     await _owner_edit(owner_conn, "UPDATE audit_event SET action = 'x' WHERE seq = 2")
     assert await loop.run_in_executor(None, run) == 1
     assert capsys.readouterr().out.strip() == "broken at seq 2"
+
+
+@pytest.mark.parametrize("bad", [1e20, 1.5, float("nan"), float("inf"), {"a": [0.1]}])
+async def test_float_data_rejected_and_nothing_written(
+    db: AsyncSession, workspace: Workspace, bad: Any
+) -> None:
+    with pytest.raises(TypeError):
+        await audit.append(
+            db,
+            workspace_id=workspace.id,
+            action="document.viewed",
+            actor_type=ActorType.system,
+            actor_id=None,
+            data={"x": bad},
+            now=NOW,
+        )
+    await db.rollback()
+    assert list(await db.scalars(select(AuditEvent))) == []
+
+
+async def test_naive_now_rejected(db: AsyncSession, workspace: Workspace) -> None:
+    with pytest.raises(ValueError, match="timezone"):
+        await audit.append(
+            db,
+            workspace_id=workspace.id,
+            action="document.viewed",
+            actor_type=ActorType.system,
+            actor_id=None,
+            now=datetime(2026, 11, 1, 10, 0, 0),  # noqa: DTZ001
+        )
+    await db.rollback()
+    assert list(await db.scalars(select(AuditEvent))) == []
+
+
+async def test_roundtrip_through_jsonb_verifies(
+    db: AsyncSession, workspace: Workspace, migrated_db: Any
+) -> None:
+    await audit.append(
+        db,
+        workspace_id=workspace.id,
+        action="document.viewed",
+        actor_type=ActorType.user,
+        actor_id="u",
+        data={
+            "big": 10**20,
+            "neg": -(10**25),
+            "nested": {"ب": [1, {"t": True, "f": False, "n": None}], "نص": "عربي"},
+        },
+        now=NOW,
+    )
+    await db.commit()
+    engine = make_engine(migrated_db.app_url)
+    try:
+        async with make_sessionmaker(engine)() as fresh:
+            result = await audit.verify(fresh, workspace.id)
+    finally:
+        await engine.dispose()
+    assert (result.ok, result.count) == (True, 1)
