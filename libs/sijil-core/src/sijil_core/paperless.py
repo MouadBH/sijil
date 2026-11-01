@@ -283,6 +283,10 @@ class PaperlessClient:
 
         Paperless 3.4.1 keys documents by the SHA-256 of the original and does not refuse
         duplicates, so this is what makes ingest idempotent.
+
+        `checksum__iexact`, never a bare `checksum=`: 3.4.1 declares only istartswith,
+        iendswith, icontains and iexact for this field, and silently ignores an undeclared
+        filter, which would return every document (tests/integration/test_paperless_contract).
         """
         response = await self._request(
             "GET",

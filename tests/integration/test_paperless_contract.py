@@ -1,6 +1,7 @@
 """Contract tests against the real Paperless-ngx in compose. Run with `make itest`."""
 
 import asyncio
+import hashlib
 import os
 import time
 import uuid
@@ -84,3 +85,27 @@ async def test_support_user_read_only(admin: PaperlessClient) -> None:
     assert perms == set(SUPPORT_PERMISSIONS)
     assert all(p.startswith("view_") for p in perms)
     await _assert_no_extra_grants(admin, "sijil-it-support")
+
+
+async def test_checksum_lookup_uses_the_filter_paperless_honours(admin: PaperlessClient) -> None:
+    """Paperless 3.4.1 declares `checksum` with istartswith/iendswith/icontains/iexact only.
+
+    A bare `checksum=` is not a filter there: django-filter ignores it and returns every
+    document, so an "exact" lookup would adopt an unrelated document. Hence `checksum__iexact`.
+    """
+    content = SAMPLE.read_bytes() + f"\n%sijil-it-{uuid.uuid4()}\n".encode()
+    sha256 = hashlib.sha256(content).hexdigest()
+    task_id = await admin.upload(content, SAMPLE.name)
+    deadline = time.monotonic() + 120
+    task = await admin.task(task_id)
+    while task.status not in ("SUCCESS", "FAILURE") and time.monotonic() < deadline:
+        await asyncio.sleep(2)
+        task = await admin.task(task_id)
+    assert task.status == "SUCCESS"
+    assert await admin.find_document_by_checksum(sha256) == task.related_document
+    absent = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    assert await admin.find_document_by_checksum(absent) is None
+    ignored = await admin._request(  # noqa: SLF001
+        "GET", "/api/documents/", params={"checksum": absent, "page_size": 1}
+    )
+    assert ignored.json()["count"] >= 1  # the bare filter matched documents it should not
