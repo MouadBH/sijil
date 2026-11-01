@@ -1,5 +1,6 @@
 """The object store honours governance and compliance lock. Run with `make itest`."""
 
+import base64
 import hashlib
 import subprocess
 import sys
@@ -135,3 +136,78 @@ def test_bootstrap_storage_idempotent() -> None:
             check=False,
         )
         assert done.returncode == 0, done.stderr
+
+
+async def test_put_with_wrong_checksum_is_rejected(store: S3ObjectStore) -> None:
+    wrong = base64.b64encode(hashlib.sha256(b"other bytes").digest()).decode()
+    with pytest.raises(ClientError) as rejected:
+        store.client.put_object(
+            Bucket=store.bucket,
+            Key=_key(),
+            Body=b"actual bytes",
+            ChecksumAlgorithm="SHA256",
+            ChecksumSHA256=wrong,
+        )
+    print("wrong-checksum response:", rejected.value.response)
+
+
+async def test_put_original_sends_sha256_checksum(
+    store: S3ObjectStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: dict[str, Any] = {}
+    real = store.client.put_object
+
+    def spy(**kwargs: Any) -> Any:
+        sent.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(store.client, "put_object", spy)
+    data = b"checksummed"
+    await store.put_original(_key(), _file(tmp_path, data), date.today() + timedelta(days=1))
+    assert sent["ChecksumAlgorithm"] == "SHA256"
+    assert sent["ChecksumSHA256"] == base64.b64encode(hashlib.sha256(data).digest()).decode()
+
+
+async def test_governance_shortening_without_bypass_is_refused(
+    store: S3ObjectStore, tmp_path: Path
+) -> None:
+    far = date.today() + timedelta(days=30)
+    ref = await store.put_original(_key(), _file(tmp_path, b"x"), far)
+    earlier = datetime.combine(date.today() + timedelta(days=2), datetime.min.time(), tzinfo=UTC)
+    with pytest.raises(ClientError) as refused:
+        store.client.put_object_retention(
+            Bucket=store.bucket,
+            Key=ref.key,
+            VersionId=ref.version_id,
+            Retention={"Mode": "GOVERNANCE", "RetainUntilDate": earlier},
+        )
+    assert _code(refused.value) == "AccessDenied"
+    assert _retention(store, ref)["RetainUntilDate"].date() == far
+
+
+async def test_seal_keeps_later_existing_date(store: S3ObjectStore, tmp_path: Path) -> None:
+    far = date.today() + timedelta(days=30)
+    ref = await store.put_original(_key(), _file(tmp_path, b"x"), far)
+    await store.seal(ref, date.today() + timedelta(days=2))
+    got = _retention(store, ref)
+    assert got["Mode"] == "COMPLIANCE"
+    assert got["RetainUntilDate"].date() == far
+
+
+async def test_seal_sets_requested_end_of_day(store: S3ObjectStore, tmp_path: Path) -> None:
+    ref = await store.put_original(_key(), _file(tmp_path, b"x"), date.today() + timedelta(days=1))
+    target = date.today() + timedelta(days=40)
+    await store.seal(ref, target)
+    got = _retention(store, ref)
+    assert got["Mode"] == "COMPLIANCE"
+    assert got["RetainUntilDate"].replace(microsecond=0) == datetime(
+        target.year, target.month, target.day, 23, 59, 59, tzinfo=UTC
+    )
+
+
+async def test_ensure_bucket_requires_versioning(
+    store: S3ObjectStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store.client, "get_bucket_versioning", lambda **_: {})
+    with pytest.raises(RuntimeError):
+        await store.ensure_bucket()

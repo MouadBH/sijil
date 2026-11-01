@@ -8,6 +8,8 @@ boto3 is synchronous, so every S3 call runs in `asyncio.to_thread`.
 """
 
 import asyncio
+import base64
+import hashlib
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -68,7 +70,11 @@ class ObjectStore(Protocol):
         ...
 
     async def seal(self, ref: ObjectRef, retain_until: date) -> None:
-        """Switch the object to COMPLIANCE mode."""
+        """Switch the object to COMPLIANCE mode, keeping any later existing date.
+
+        Callers must serialise seal/extend per object version (a DB row lock): the store cannot
+        make read-then-write atomic.
+        """
         ...
 
     async def governance_remove(self, ref: ObjectRef) -> None:
@@ -119,16 +125,28 @@ class S3ObjectStore(ObjectStore):
         enabled = config.get("ObjectLockConfiguration", {}).get("ObjectLockEnabled")
         if enabled != "Enabled":
             raise RuntimeError(f"bucket {self.bucket} does not have object lock enabled")
+        versioning = self.client.get_bucket_versioning(Bucket=self.bucket).get("Status")
+        if versioning != "Enabled":
+            raise RuntimeError(f"bucket {self.bucket} does not have versioning enabled")
 
     async def put_original(self, key: str, path: Path, retain_until: date) -> ObjectRef:
         return await asyncio.to_thread(self._put, key, path, retain_until)
 
     def _put(self, key: str, path: Path, retain_until: date) -> ObjectRef:
+        # The store verifies the bytes it received against this digest, so corruption in
+        # transit is rejected instead of being locked for the retention period.
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            while block := source.read(CHUNK_BYTES):
+                digest.update(block)
+        checksum = base64.b64encode(digest.digest()).decode()
         with path.open("rb") as body:
             out = self.client.put_object(
                 Bucket=self.bucket,
                 Key=key,
                 Body=body,
+                ChecksumAlgorithm="SHA256",
+                ChecksumSHA256=checksum,
                 ObjectLockMode="GOVERNANCE",
                 ObjectLockRetainUntilDate=_end_of_day(retain_until),
             )
@@ -185,15 +203,30 @@ class S3ObjectStore(ObjectStore):
         target = _end_of_day(retain_until)
         if target < current:
             raise ValueError("retention can only be extended, never shortened")
-        self._set(ref, mode, target)
+        try:
+            self._set(ref, mode, target)
+        except ClientError as exc:
+            # The store itself refuses shortening (e.g. a concurrent extend landed first).
+            if _error_code(exc) == "AccessDenied":
+                raise ValueError("retention can only be extended, never shortened") from exc
+            raise
 
     async def seal(self, ref: ObjectRef, retain_until: date) -> None:
         await asyncio.to_thread(self._seal, ref, retain_until)
 
     def _seal(self, ref: ObjectRef, retain_until: date) -> None:
-        _, current = self._current(ref)
-        # Replacing a GOVERNANCE retention needs the bypass flag, even to make it stricter.
-        self._set(ref, "COMPLIANCE", max(current, _end_of_day(retain_until)), bypass=True)
+        mode, current = self._current(ref)
+        target = max(current, _end_of_day(retain_until))
+        # (a) Extend in GOVERNANCE without bypass: the store refuses shortening here, so a
+        # concurrent extend cannot be overwritten by a stale date.
+        if mode == "GOVERNANCE" and target > current:
+            self._set(ref, "GOVERNANCE", target)
+        # (b) Flip the mode. Replacing a GOVERNANCE retention needs the bypass flag.
+        self._set(ref, "COMPLIANCE", target, bypass=True)
+        # (c) Verify, never assume.
+        final_mode, final_until = self._current(ref)
+        if final_mode != "COMPLIANCE" or final_until < target:
+            raise RuntimeError("seal did not result in COMPLIANCE at the requested date")
 
     async def governance_remove(self, ref: ObjectRef) -> None:
         await asyncio.to_thread(self._remove, ref)
