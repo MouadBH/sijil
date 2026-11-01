@@ -186,6 +186,12 @@ services:
     restart: unless-stopped
     environment:
       <<: *sijil-env
+      SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
+      SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+      SIJIL_PROVISIONER_DATABASE_URL: postgresql+asyncpg://sijil_provisioner:${SIJIL_PROVISIONER_DB_PASSWORD:?}@postgres:5432/postgres
+      SIJIL_TENANT_IMAGE: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
+      SIJIL_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-sijil}
+      SIJIL_TESSDATA_VOLUME: ${COMPOSE_PROJECT_NAME:-sijil}_tessdata
     networks: [core, ai, tenant_t1, tenant_t2]
     depends_on:
       redis: { condition: service_started }
