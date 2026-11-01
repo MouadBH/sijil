@@ -69,6 +69,9 @@ _REF: Final = re.compile(r"^t[a-z2-7]{16}$")
 # A container name is its hostname on the tenant network: one DNS label.
 _HOSTNAME: Final = re.compile(r"^(?=.{1,63}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 TENANT_LABEL: Final = "sijil.tenant"
+PROJECT_LABEL: Final = "sijil.project"
+# One lock for the whole process: DockerRuntime is built per task, allocation must not interleave.
+_NETWORK_LOCK: Final = asyncio.Lock()
 
 
 def validate_ref(ref: str) -> str:
@@ -121,7 +124,7 @@ class DockerRuntime:
         self._settings = settings
         self._project = settings.compose_project
         # Serialises subnet allocation in this process (listing and creating aren't atomic).
-        self._network_lock = asyncio.Lock()
+        self._network_lock = _NETWORK_LOCK
 
     # Names ---------------------------------------------------------------------------------
 
@@ -248,7 +251,7 @@ class DockerRuntime:
                     name,
                     driver="bridge",
                     internal=True,
-                    labels=self._labels(spec, "network"),
+                    labels={**self._labels(spec, "network"), PROJECT_LABEL: self._project},
                     ipam=IPAMConfig(pool_configs=[IPAMPool(subnet=str(subnet))]),
                 )
             except APIError as exc:

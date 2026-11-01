@@ -12,7 +12,7 @@ import logging
 import docker
 from docker.errors import APIError, NotFound
 
-from sijil_worker.runtime.docker import ATTACHED_SERVICES, TENANT_LABEL
+from sijil_worker.runtime.docker import ATTACHED_SERVICES, PROJECT_LABEL, TENANT_LABEL
 from sijil_worker.settings import WorkerSettings
 
 log = logging.getLogger(__name__)
@@ -22,7 +22,16 @@ def reconcile_tenants(client: docker.DockerClient, settings: WorkerSettings) -> 
     """Returns the `"<service>@<network>"` pairs it connected."""
     fixed: list[str] = []
     try:
-        networks = client.networks.list(filters={"label": TENANT_LABEL})
+        # Only this compose project's networks: another stack on the same daemon is not ours.
+        # The name check also covers networks created before the project label existed.
+        prefix = f"{settings.compose_project}_tenant_"
+        networks = [
+            n
+            for n in client.networks.list(filters={"label": TENANT_LABEL})
+            if (n.name or "").startswith(prefix)
+            and (n.attrs.get("Labels") or {}).get(PROJECT_LABEL, settings.compose_project)
+            == settings.compose_project
+        ]
         services = {
             service: client.containers.list(
                 filters={

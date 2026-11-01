@@ -94,3 +94,4 @@ def test_provisioned_network_uses_pool_subnet(
     assert subnet.prefixlen == 28
     assert subnet.subnet_of(worker_settings.tenant_subnet_pool)
     assert str(worker_settings.tenant_subnet_pool) == "10.240.0.0/16"
+    assert network.attrs["Labels"]["sijil.project"] == worker_settings.compose_project
