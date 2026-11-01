@@ -209,7 +209,9 @@ async def _requeue() -> int:
         )
 
     try:
-        return await requeue_stuck_ingest(make_sessionmaker(engine), enqueue)
+        return await requeue_stuck_ingest(
+            make_sessionmaker(engine), enqueue, region=settings.region
+        )
     finally:
         await engine.dispose()
 

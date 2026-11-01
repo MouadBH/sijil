@@ -24,16 +24,18 @@ from sijil_core.db.models import (
     DocumentLedger,
     DocumentSource,
     IngestState,
+    IntegrityAlert,
+    Organisation,
     TenantCredential,
     Workspace,
     WorkspaceState,
 )
 from sijil_core.filetypes import FileKind
 from sijil_core.paperless import PaperlessClient, PaperlessUnavailable
-from sijil_core.region import RegionMismatch
 from sijil_core.settings import CoreSettings
 from sijil_core.tenancy import tenant_ref
 from sijil_worker.ingest import (
+    OriginalCorrupt,
     WorkspaceNotActive,
     ingest_document,
     requeue_stuck_ingest,
@@ -593,7 +595,38 @@ async def test_inactive_workspace_is_transient(
     assert row.ingest_error_code == "ingest.workspace_not_active"
 
 
-async def test_region_mismatch_fails_at_once(
+async def test_foreign_region_row_is_neither_claimed_nor_settled(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A message that reached the wrong region's worker: the row belongs to its own region's
+    # worker, so this one must not touch it (not even the attempt counter).
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    with caplog.at_level(logging.WARNING), respx.mock(assert_all_called=False) as router:
+        await run(
+            ledger,
+            sessions,
+            keys,
+            memory_store,
+            will_retry=True,
+            settings=CoreSettings.model_construct(region="eu-fra", environment="test"),
+        )
+        assert router.calls.call_count == 0
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.queued
+    assert row.ingest_attempts == 0
+    assert row.ingest_claimed_at is None
+    assert row.ingest_error_code is None
+    assert await events(db, ready) == []
+    assert "region" in caplog.text
+
+
+async def test_corrupt_original_is_never_uploaded(
     db: AsyncSession,
     sessions: async_sessionmaker[AsyncSession],
     keys: LocalKeyService,
@@ -602,20 +635,30 @@ async def test_region_mismatch_fails_at_once(
     tmp_path: Path,
 ) -> None:
     ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    (stored,) = memory_store.objects.values()
+    stored.data = b"%PDF-" + b"tampered" * 10  # the store returns other bytes than were hashed
     with respx.mock(assert_all_called=False) as router:
-        with pytest.raises(RegionMismatch):
-            await run(
-                ledger,
-                sessions,
-                keys,
-                memory_store,
-                will_retry=True,  # never retried even so
-                settings=CoreSettings.model_construct(region="eu-fra", environment="test"),
-            )
-        assert router.calls.call_count == 0
+        upload, _ = mock_flow(router)
+        with pytest.raises(OriginalCorrupt):
+            await run(ledger, sessions, keys, memory_store, will_retry=True)
+        assert not upload.called
     row = await reload(db, ledger)
-    assert row.ingest_state is IngestState.failed
-    assert row.ingest_error_code == "ingest.region_mismatch"
+    assert row.ingest_state is IngestState.failed  # final: waiting cannot repair it
+    assert row.ingest_error_code == "ingest.original_corrupt"
+    (alert,) = list(await db.scalars(select(IntegrityAlert)))
+    assert (alert.workspace_id, alert.ledger_id, alert.kind) == (
+        ready.id,
+        ledger.id,
+        "object_corrupt",
+    )
+    assert alert.resolved_at is None
+    assert alert.detail == {"observed_sha256": hashlib.sha256(stored.data).hexdigest()}
+    actions = [(e.action, e.data) for e in await events(db, ready)]
+    assert actions == [
+        ("integrity.drift", {"kind": "object_corrupt"}),
+        ("document.ingest_failed", {"code": "ingest.original_corrupt", "sha256": PDF_SHA}),
+    ]
+    assert (await audit.verify(db, ready.id)).ok
 
 
 async def test_missing_original_is_final(
@@ -678,7 +721,7 @@ async def test_requeue_sweep_resends_old_queued_rows_only(
     sending.ingest_state = IngestState.sending
     await db.commit()
 
-    count = await requeue_stuck_ingest(sessions, enqueue)
+    count = await requeue_stuck_ingest(sessions, enqueue, region="ma-cas")
     assert count == 1
     assert enqueued == [(old.id, ready.id)]
 
@@ -696,7 +739,7 @@ async def test_requeue_sweep_is_bounded(
         await make_ledger(
             db, memory_store, ready, tmp_path, data=PDF + bytes([n]), age=timedelta(minutes=30 + n)
         )
-    assert await requeue_stuck_ingest(sessions, enqueue, limit=2) == 2
+    assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas", limit=2) == 2
     assert len(enqueued) == 2
 
 
@@ -718,7 +761,7 @@ async def test_requeue_sweep_survives_a_failed_enqueue(
         if len(calls) == 1:
             raise ConnectionError("broker down")
 
-    assert await requeue_stuck_ingest(sessions, flaky) == 1
+    assert await requeue_stuck_ingest(sessions, flaky, region="ma-cas") == 1
     assert len(calls) == 2
 
 
@@ -741,7 +784,7 @@ async def test_requeue_sweep_skips_rows_with_a_pending_retry(
     waiting.ingest_next_attempt_at = now + timedelta(minutes=5)  # Celery's countdown is running
     overdue.ingest_next_attempt_at = now - timedelta(minutes=11)  # the retry never came
     await db.commit()
-    assert await requeue_stuck_ingest(sessions, enqueue) == 1
+    assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas") == 1
     assert enqueued == [(overdue.id, ready.id)]
 
 
@@ -761,8 +804,41 @@ async def test_requeue_sweep_picks_a_delayed_row_once_it_is_due(
     later.ingest_next_attempt_at = now + timedelta(hours=1)
     await db.commit()
     # `due` arrived just now: its next-attempt time alone decides, not its arrival time.
-    assert await requeue_stuck_ingest(sessions, enqueue, now=now) == 1
+    assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas", now=now) == 1
     assert enqueued == [(due.id, ready.id)]
+
+
+async def test_requeue_sweep_covers_this_region_only(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    memory_store: MemoryObjectStore,
+    org: Organisation,
+    ready: Workspace,
+    tmp_path: Path,
+    enqueued: list[tuple[uuid.UUID, uuid.UUID]],
+    enqueue: Callable[[uuid.UUID, uuid.UUID], Any],
+) -> None:
+    eu = Organisation(name="EU", type=org.type, country="FR", region="eu-fra")
+    db.add(eu)
+    await db.flush()
+    slug = f"ws-{uuid.uuid4().hex[:8]}"
+    foreign = Workspace(
+        org_id=eu.id,
+        name="x",
+        slug=slug,
+        state=WorkspaceState.active,
+        db_name=f"p_{slug}",
+        index_db_name=f"i_{slug}",
+        kms_key_id=f"k{slug}",
+    )
+    db.add(foreign)
+    await db.commit()
+    local = await make_ledger(
+        db, memory_store, ready, tmp_path, data=PDF + b"m", age=timedelta(hours=1)
+    )
+    await make_ledger(db, memory_store, foreign, tmp_path, data=PDF + b"e", age=timedelta(hours=1))
+    assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas") == 1
+    assert enqueued == [(local.id, ready.id)]
 
 
 async def test_requeue_sweep_recovers_an_expired_sending_lease(
@@ -781,7 +857,7 @@ async def test_requeue_sweep_recovers_an_expired_sending_lease(
         row.ingest_state = IngestState.sending
         row.ingest_claimed_at = claimed
     await db.commit()
-    assert await requeue_stuck_ingest(sessions, enqueue) == 1
+    assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas") == 1
     assert enqueued == [(dead.id, ready.id)]
 
 

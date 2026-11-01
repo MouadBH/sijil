@@ -21,6 +21,7 @@ token, a Paperless message or a response body.
 """
 
 import asyncio
+import hashlib
 import logging
 import time
 from collections.abc import Callable
@@ -42,6 +43,7 @@ from sijil_core.db.models import (
     CredentialKind,
     DocumentLedger,
     IngestState,
+    IntegrityAlert,
     Organisation,
     TenantCredential,
     Workspace,
@@ -106,6 +108,14 @@ class MissingCredential(LookupError):
     """The workspace has no service token."""
 
 
+class OriginalCorrupt(Exception):  # noqa: N818
+    """The bytes read from the store do not hash to the ledger's SHA-256. Final."""
+
+    def __init__(self, observed_sha256: str) -> None:
+        super().__init__("original does not match its SHA-256")
+        self.observed_sha256 = observed_sha256
+
+
 class ConsumeFailed(Exception):  # noqa: N818
     """Paperless failed to consume the file for a reason that is not 'unsupported'."""
 
@@ -152,6 +162,8 @@ def error_code(exc: BaseException) -> str:
         return "ingest.no_credential"
     if isinstance(exc, ConsumeFailed):
         return "ingest.consume_failed"
+    if isinstance(exc, OriginalCorrupt):
+        return "ingest.original_corrupt"
     if isinstance(exc, FileNotFoundError):
         return "ingest.original_missing"
     if isinstance(exc, PaperlessUnavailable):
@@ -384,6 +396,10 @@ async def _push(
             return resumed
         await _set_task_id(sessions, ledger_id, claim, None)  # unknown or failed: start over
     content = await _read_original(store, claim.ref)
+    # Never hand Paperless (or lock in as "the document") bytes that are not the original.
+    observed = hashlib.sha256(content).hexdigest()
+    if observed != claim.sha256:
+        raise OriginalCorrupt(observed)
     filename = f"{claim.sha256[:12]}.{_EXTENSION[claim.kind]}"
     try:
         task_id = await client.upload(content, filename, title=job.title)
@@ -409,8 +425,10 @@ async def _settle(
     final: bool = True,
     delayed: bool = False,
     retry_after_s: float = 0.0,
+    corrupt_sha256: str | None = None,
 ) -> None:
-    """Record the outcome (and audit it) in one transaction.
+    """Record the outcome (and audit it) in one transaction. A corrupt original also opens an
+    `object_corrupt` integrity alert (with its `integrity.drift` event).
 
     Only the run that still owns the lease may write: a row another run took over, or one that
     is already settled, is left alone (so `failed` is never reopened).
@@ -455,6 +473,8 @@ async def _settle(
             ledger.ingest_error_code = code
             ledger.ingest_next_attempt_at = None
             action, data = "document.ingest_failed", {"code": code, "sha256": claim.sha256}
+            if corrupt_sha256 is not None:
+                await _alert_corrupt(session, ledger, corrupt_sha256, now)
         else:
             ledger.ingest_state = IngestState.queued
             ledger.ingest_error_code = code
@@ -476,6 +496,53 @@ async def _settle(
         await session.commit()
 
 
+async def _alert_corrupt(
+    session: AsyncSession, ledger: DocumentLedger, observed_sha256: str, now: datetime
+) -> None:
+    session.add(
+        IntegrityAlert(
+            workspace_id=ledger.workspace_id,
+            ledger_id=ledger.id,
+            kind="object_corrupt",
+            detail={"observed_sha256": observed_sha256},
+            detected_at=now,
+        )
+    )
+    await audit.append(
+        session,
+        workspace_id=ledger.workspace_id,
+        action="integrity.drift",
+        actor_type=ActorType.system,
+        actor_id=None,
+        target_type="document",
+        target_id=str(ledger.id),
+        data={"kind": "object_corrupt"},
+        now=now,
+    )
+
+
+async def _foreign_region(
+    sessions: async_sessionmaker[AsyncSession],
+    ledger_id: UUID,
+    settings: CoreSettings,
+) -> str | None:
+    """The row's region when it is not this worker's, else None (also for an unknown row)."""
+    async with sessions() as session:
+        region = await session.scalar(
+            select(Organisation.region)
+            .join(Workspace, Workspace.org_id == Organisation.id)
+            .join(DocumentLedger, DocumentLedger.workspace_id == Workspace.id)
+            .where(DocumentLedger.id == ledger_id)
+        )
+    if region is None:
+        return None
+    try:
+        assert_region(region, settings)
+    except RegionMismatch:
+        return str(region)
+    return None
+
+
 async def ingest_document(
     ledger_id: UUID,
     *,
@@ -491,7 +558,17 @@ async def ingest_document(
     retry_after_s: float = 0.0,
 ) -> None:
     """`will_retry(exc)` says whether the caller will run this again after `exc`, `retry_after_s`
-    seconds from now (the Celery countdown, recorded so the requeue sweep agrees with it)."""
+    seconds from now (the Celery countdown, recorded so the requeue sweep agrees with it).
+
+    A row of another region is left exactly as it is (not claimed, not settled): it belongs to
+    that region's worker.
+    """
+    foreign = await _foreign_region(sessions, ledger_id, settings)
+    if foreign is not None:
+        log.warning(
+            "ingest of document %s skipped: region %s is not served here", ledger_id, foreign
+        )
+        return
     claim = await _claim(
         sessions, ledger_id, workspace_id, timedelta(seconds=poll_timeout_s) + timedelta(minutes=5)
     )
@@ -510,7 +587,7 @@ async def ingest_document(
         # Only a machine code is recorded; the exception carries no secrets by contract.
         code = error_code(exc)
         log.error("ingest of document %s failed: %s", ledger_id, code)
-        retrying = not isinstance(exc, RegionMismatch) and will_retry(exc)
+        retrying = not isinstance(exc, RegionMismatch | OriginalCorrupt) and will_retry(exc)
         await _settle(
             sessions,
             ledger_id,
@@ -519,6 +596,7 @@ async def ingest_document(
             final=not retrying,
             delayed=not retrying and is_transient_cause(exc),
             retry_after_s=retry_after_s,
+            corrupt_sha256=exc.observed_sha256 if isinstance(exc, OriginalCorrupt) else None,
         )
         raise
 
@@ -527,6 +605,7 @@ async def requeue_stuck_ingest(
     sessions: async_sessionmaker[AsyncSession],
     enqueue: Enqueue,
     *,
+    region: str,
     now: datetime | None = None,
     older_than: timedelta = REQUEUE_AFTER,
     limit: int = REQUEUE_BATCH,
@@ -537,8 +616,8 @@ async def requeue_stuck_ingest(
     message or a failed enqueue); `queued` whose next attempt is over `older_than` past (a
     Celery retry that never came, or the long delay after exhausted retries being over); and
     `sending` whose lease expired (a dead worker). Rows waiting on a Celery countdown or a
-    delay are skipped. Safe to repeat: the claim admits one run per row. Returns how many were
-    sent.
+    delay are skipped. Only rows of workspaces in `region` (this worker's) are considered.
+    Safe to repeat: the claim admits one run per row. Returns how many were sent.
     """
     at = now or utcnow()
     cutoff = at - older_than
@@ -546,7 +625,10 @@ async def requeue_stuck_ingest(
         rows = (
             await session.execute(
                 select(DocumentLedger.id, DocumentLedger.workspace_id)
+                .join(Workspace, Workspace.id == DocumentLedger.workspace_id)
+                .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(
+                    Organisation.region == region,
                     or_(
                         and_(
                             DocumentLedger.ingest_state == IngestState.queued,
@@ -562,7 +644,7 @@ async def requeue_stuck_ingest(
                             DocumentLedger.ingest_state == IngestState.sending,
                             DocumentLedger.ingest_claimed_at < at - CLAIM_LEASE,
                         ),
-                    )
+                    ),
                 )
                 .order_by(DocumentLedger.ingested_at)
                 .limit(limit)
