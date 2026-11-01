@@ -10,6 +10,8 @@ class CpSettings(KeySettings):
     redis_url: RedisDsn
     # Required, no default: a forgotten flag must not silently ship non-Secure cookies.
     cookie_secure: bool
+    # Domain of the workspaces' inbound email addresses (`{slug}.{token}@{domain}`).
+    inbound_domain: str
 
 
 class MigrationSettings(CoreSettings):

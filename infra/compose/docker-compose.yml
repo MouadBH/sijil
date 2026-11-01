@@ -28,6 +28,7 @@ x-paperless: &paperless
 x-sijil-env: &sijil-env
   SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
   SIJIL_ENVIRONMENT: dev
+  SIJIL_INBOUND_DOMAIN: in.sijil.local
   SIJIL_REDIS_URL: redis://redis:6379/0
 
 x-objectstore-env: &objectstore-env

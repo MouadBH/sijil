@@ -35,6 +35,7 @@ def make_settings(**overrides: str) -> CpSettings:
         "redis_url": CLOSED_REDIS,
         "master_key": TEST_MASTER_KEY,
         "cookie_secure": "false",
+        "inbound_domain": "in.sijil.local",
     } | overrides
     return CpSettings.model_validate(values)
 

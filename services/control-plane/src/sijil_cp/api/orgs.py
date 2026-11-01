@@ -169,7 +169,7 @@ async def create_org(
         logger.exception("could not enqueue job %s", job.id)
     return OrgCreated(
         org=org_out(org, Role.owner),
-        workspace=workspace_out(workspace, Role.owner),
+        workspace=workspace_out(workspace, Role.owner, request.app.state.settings.inbound_domain),
         job_id=job.id,
     )
 

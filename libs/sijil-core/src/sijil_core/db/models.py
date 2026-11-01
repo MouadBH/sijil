@@ -1,23 +1,29 @@
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
     UniqueConstraint,
     Uuid,
     false,
+    text,
 )
-from sqlalchemy.dialects.postgresql import CITEXT
+from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from sijil_core.db.base import Base, utcnow
+from sijil_core.inbound import new_token
 
 
 class OrgType(StrEnum):
@@ -81,6 +87,33 @@ class JobStatus(StrEnum):
     failed = "failed"
 
 
+class DocumentState(StrEnum):
+    received = "received"
+    needs_review = "needs_review"
+    filed = "filed"
+    sealed = "sealed"
+    removed = "removed"
+
+
+class IngestState(StrEnum):
+    queued = "queued"
+    sending = "sending"
+    consumed = "consumed"
+    failed = "failed"
+    unsupported = "unsupported"
+
+
+class DocumentSource(StrEnum):
+    upload = "upload"
+    email = "email"
+
+
+class ActorType(StrEnum):
+    user = "user"
+    system = "system"
+    email = "email"
+
+
 def _enum(cls: type[StrEnum]) -> Enum:
     # Stored as text holding the member value, validated in Python.
     return Enum(
@@ -136,6 +169,8 @@ class Workspace(Base):
     db_name: Mapped[str] = mapped_column(String, unique=True)
     index_db_name: Mapped[str] = mapped_column(String, unique=True)
     kms_key_id: Mapped[str] = mapped_column(String)
+    # The secret part of the workspace's inbound email address (see sijil_core.inbound).
+    inbound_token: Mapped[str] = mapped_column(String(10), unique=True, default=new_token)
 
 
 class User(Base):
@@ -228,3 +263,76 @@ class Job(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class DocumentLedger(Base):
+    """One row per archived original. Holds no content: no filename, subject or sender.
+
+    Immutable columns, retention monotonicity and the ban on DELETE are enforced by the
+    document_ledger_immutable trigger (retention layer 3).
+    """
+
+    __tablename__ = "document_ledger"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "sha256", name="uq_document_ledger_workspace_sha256"),
+        Index("ix_document_ledger_workspace_ingested", "workspace_id", text("ingested_at DESC")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    sha256: Mapped[str] = mapped_column(String(64))
+    md5: Mapped[str] = mapped_column(String(32))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    content_kind: Mapped[str] = mapped_column(String(32))
+    source: Mapped[DocumentSource] = mapped_column(_enum(DocumentSource))
+    source_email_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("document_ledger.id"))
+    uploaded_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user_account.id"))
+    object_key: Mapped[str] = mapped_column(String)
+    object_version_id: Mapped[str] = mapped_column(String)
+    state: Mapped[DocumentState] = mapped_column(
+        _enum(DocumentState), default=DocumentState.received
+    )
+    ingest_state: Mapped[IngestState] = mapped_column(
+        _enum(IngestState), default=IngestState.queued
+    )
+    ingest_error_code: Mapped[str | None] = mapped_column(String)
+    paperless_task_id: Mapped[str | None] = mapped_column(String)
+    paperless_doc_id: Mapped[int | None] = mapped_column(Integer)
+    retention_until: Mapped[date] = mapped_column(Date)
+    ingested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    fields_sha256: Mapped[str | None] = mapped_column(String(64))
+    sealed_at: Mapped[datetime | None] = _tstz()
+    sealed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user_account.id"))
+
+
+class AuditEvent(Base):
+    """Append-only, hash-chained per workspace. The app role has no UPDATE/DELETE grant."""
+
+    __tablename__ = "audit_event"
+    __table_args__ = (UniqueConstraint("workspace_id", "seq", name="uq_audit_event_workspace_seq"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    seq: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    actor_type: Mapped[ActorType] = mapped_column(_enum(ActorType))
+    actor_id: Mapped[str | None] = mapped_column(String)
+    action: Mapped[str] = mapped_column(String)
+    target_type: Mapped[str | None] = mapped_column(String)
+    target_id: Mapped[str | None] = mapped_column(String)
+    ip: Mapped[str | None] = mapped_column(String)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class IntegrityAlert(Base):
+    __tablename__ = "integrity_alert"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"), index=True)
+    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("document_ledger.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(64))
+    detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    resolved_at: Mapped[datetime | None] = _tstz()

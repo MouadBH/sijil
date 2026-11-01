@@ -136,6 +136,7 @@ def migrated_db() -> Iterator[TestDb]:
                 "SIJIL_MIGRATION_DATABASE_URL": owner_url,
                 "SIJIL_REGION": "ma-cas",
                 "SIJIL_ENVIRONMENT": "test",
+                "SIJIL_APP_DB_ROLE": APP_ROLE,
             },
             check=True,
         )
