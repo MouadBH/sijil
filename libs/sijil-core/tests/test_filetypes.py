@@ -2,12 +2,16 @@
 
 import io
 import shutil
+import struct
+import time
+import tracemalloc
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from sijil_core.filetypes import FileKind, sniff
+from sijil_core.filetypes import FileKind, _zip_directory_bounded, sniff
 
 FORMATS = Path(__file__).resolve().parents[3] / "fixtures" / "formats"
 EXPECTED = {
@@ -110,3 +114,90 @@ def test_sniff_truncated_zip_is_refused(tmp_path: Path) -> None:
 def test_sniff_eml_needs_a_header_block(tmp_path: Path) -> None:
     not_mail = _write(tmp_path, b"Dear sir,\r\nplease find attached.\r\n")
     assert sniff(not_mail, allow_eml=True) is None
+
+
+def _timed_peak(fn: Callable[[], object]) -> tuple[object, float, int]:
+    tracemalloc.start()
+    started = time.monotonic()
+    try:
+        result = fn()
+        elapsed = time.monotonic() - started
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return result, elapsed, peak
+
+
+def test_sniff_refuses_zip_with_too_many_entries_cheaply(tmp_path: Path) -> None:
+    # A crafted central directory must not make the sniffer build one object per entry.
+    path = tmp_path / "many.docx"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+        archive.writestr("[Content_Types].xml", "<x/>")
+        archive.writestr("word/document.xml", "<x/>")
+        for n in range(20_000):
+            archive.writestr(f"e{n}", b"")
+    result, elapsed, peak = _timed_peak(lambda: sniff(path))
+    assert result is None
+    assert elapsed < 0.5
+    assert peak < 2 * 1024 * 1024
+
+
+def _eocd(entries: int, cd_size: int, cd_offset: int, comment: bytes = b"") -> bytes:
+    return (
+        b"PK\x05\x06"
+        + struct.pack("<HHHHIIH", 0, 0, entries, entries, cd_size, cd_offset, len(comment))
+        + comment
+    )
+
+
+def test_sniff_refuses_oversized_central_directory(tmp_path: Path) -> None:
+    data = b"PK\x03\x04" + b"\0" * 100 + _eocd(1, 17 * 1024 * 1024, 0)
+    assert sniff(_write(tmp_path, data)) is None
+
+
+def test_sniff_refuses_zip64_with_too_many_entries(tmp_path: Path) -> None:
+    body = b"PK\x03\x04" + b"\0" * 100
+    zip64_eocd_at = len(body)
+    zip64_eocd = b"PK\x06\x06" + struct.pack(
+        "<QHHIIQQQQ", 44, 45, 45, 0, 0, 1_000_000, 1_000_000, 1024, 0
+    )
+    locator = b"PK\x06\x07" + struct.pack("<IQI", 0, zip64_eocd_at, 1)
+    data = body + zip64_eocd + locator + _eocd(0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+    assert sniff(_write(tmp_path, data)) is None
+
+
+def test_sniff_zip_without_eocd_is_refused(tmp_path: Path) -> None:
+    assert sniff(_write(tmp_path, b"PK\x03\x04" + b"\0" * 200)) is None
+
+
+def test_sniff_docx_with_archive_comment(tmp_path: Path) -> None:
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<x/>")
+        archive.writestr("word/document.xml", "<x/>")
+        archive.comment = b"SAMPLE " * 100
+    assert sniff(_write(tmp_path, out.getvalue())) is FileKind.docx
+
+
+def _zip64(entries: int) -> bytes:
+    body = b"PK\x03\x04" + b"\0" * 100
+    record = b"PK\x06\x06" + struct.pack("<QHHIIQQQQ", 44, 45, 45, 0, 0, entries, entries, 1024, 0)
+    locator = b"PK\x06\x07" + struct.pack("<IQI", 0, len(body), 1)
+    return body + record + locator + _eocd(0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+
+
+@pytest.mark.parametrize(
+    ("data", "bounded"),
+    [
+        (_zip64(5), True),
+        (_zip64(1_000_000), False),
+        (b"PK\x03\x04" + b"\0" * 100 + _eocd(1, 17 * 1024 * 1024, 0), False),
+        (b"PK\x03\x04" + b"\0" * 100 + _eocd(10_001, 1024, 0), False),
+        (b"PK\x03\x04" + b"\0" * 100 + _eocd(0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF), False),
+        (b"PK\x03\x04" + b"\0" * 100 + _eocd(10_000, 1024, 0), True),
+    ],
+)
+def test_zip_directory_bound_reads_eocd_and_zip64(
+    tmp_path: Path, data: bytes, bounded: bool
+) -> None:
+    assert _zip_directory_bounded(_write(tmp_path, data)) is bounded

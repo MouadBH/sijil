@@ -6,6 +6,7 @@ email path additionally accepts a raw RFC 5322 message.
 """
 
 import re
+import struct
 import zipfile
 from enum import StrEnum
 from pathlib import Path
@@ -20,6 +21,21 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 # RFC 5322 field name: printable ASCII except the colon.
 _HEADER_FIELD = re.compile(rb"^[\x21-\x39\x3b-\x7e]+:")
 _MAIL_FIELDS = {b"date", b"message-id", b"received", b"mime-version", b"to", b"subject"}
+
+
+# Real DOCX/XLSX files have tens to hundreds of parts. Past these bounds the central directory
+# is refused before zipfile builds one ZipInfo per entry (a crafted 100 MB directory would cost
+# about 850 MiB and 35 s otherwise).
+MAX_ZIP_ENTRIES = 10_000
+MAX_ZIP_DIRECTORY_BYTES = 16 * 1024 * 1024
+
+_EOCD = struct.Struct("<4sHHHHIIH")  # end of central directory, 22 bytes
+_ZIP64_LOCATOR = struct.Struct("<4sIQI")  # 20 bytes, right before the EOCD
+_ZIP64_EOCD = struct.Struct("<4sQHHIIQQQQ")  # 56 bytes
+_EOCD_SIG = b"PK\x05\x06"
+_ZIP64_LOCATOR_SIG = b"PK\x06\x07"
+_ZIP64_EOCD_SIG = b"PK\x06\x06"
+_MAX_COMMENT = 0xFFFF
 
 
 class FileKind(StrEnum):
@@ -48,8 +64,42 @@ def _magic(head: bytes) -> FileKind | None:
     return None
 
 
+def _zip_directory_bounded(path: Path) -> bool:
+    """Read the (ZIP64) end-of-central-directory record and check entry count and size.
+
+    False for anything unexpected: no record, a truncated ZIP64 record, or bounds exceeded.
+    """
+    with path.open("rb") as source:
+        size = source.seek(0, 2)
+        tail_len = min(size, _ZIP64_LOCATOR.size + _EOCD.size + _MAX_COMMENT)
+        source.seek(size - tail_len)
+        tail = source.read(tail_len)
+        at = tail.rfind(_EOCD_SIG)
+        if at < 0 or at + _EOCD.size > len(tail):
+            return False
+        fields = _EOCD.unpack_from(tail, at)
+        entries, directory_bytes = int(fields[4]), int(fields[5])
+        locator_at = at - _ZIP64_LOCATOR.size
+        if locator_at >= 0 and tail[locator_at : locator_at + 4] == _ZIP64_LOCATOR_SIG:
+            _, _, zip64_offset, _ = _ZIP64_LOCATOR.unpack_from(tail, locator_at)
+            if zip64_offset + _ZIP64_EOCD.size > size:
+                return False
+            source.seek(zip64_offset)
+            record = source.read(_ZIP64_EOCD.size)
+            if len(record) < _ZIP64_EOCD.size or record[:4] != _ZIP64_EOCD_SIG:
+                return False
+            fields = _ZIP64_EOCD.unpack(record)
+            entries, directory_bytes = int(fields[7]), int(fields[8])
+        elif entries == 0xFFFF or directory_bytes == 0xFFFFFFFF:
+            return False  # ZIP64 markers without a ZIP64 record
+    return entries <= MAX_ZIP_ENTRIES and directory_bytes <= MAX_ZIP_DIRECTORY_BYTES
+
+
 def _ooxml(path: Path) -> FileKind | None:
-    # Reads only the central directory: nothing is decompressed, so a zip bomb costs nothing.
+    # Bounded first, then only the central directory is read: nothing is decompressed, so
+    # neither a zip bomb nor a huge directory costs much.
+    if not _zip_directory_bounded(path):
+        return None
     try:
         with zipfile.ZipFile(path) as archive:
             names = set(archive.namelist())

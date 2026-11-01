@@ -6,7 +6,7 @@ import tempfile
 import time
 import tracemalloc
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -32,7 +32,7 @@ from sijil_core.db.models import (
     Workspace,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES
-from sijil_core.retention import provisional_retain_until
+from sijil_core.retention import provisional_retain_until, region_local_date
 from sijil_core.storage import ObjectRef
 from sijil_core.tenancy import tenant_ref
 from tests.support.memory_store import MemoryObjectStore
@@ -126,7 +126,7 @@ async def test_upload_stores_original_and_ledger_row(
     assert row.source_email_id is None
     assert row.state is DocumentState.received
     assert row.ingest_state is IngestState.queued
-    retain_until = provisional_retain_until(clock.now.date(), "MA")
+    retain_until = provisional_retain_until(region_local_date(clock.now, "ma-cas"), "MA")
     assert row.retention_until == retain_until
     assert row.ingested_at == clock.now
 
@@ -139,6 +139,24 @@ async def test_upload_stores_original_and_ledger_row(
     assert memory_store.objects[ref].mode == "GOVERNANCE"
 
     assert enqueuer.ingests == [(document_id, workspace.id)]
+
+
+async def test_retention_uses_region_local_arrival_date(
+    uploader: Actor,
+    workspace: Workspace,
+    db: AsyncSession,
+    memory_store: MemoryObjectStore,
+    clock: Clock,
+) -> None:
+    # 23:30 UTC on 31 December 2025 was 00:30 on 1 January 2026 in Casablanca (UTC+1 then):
+    # a 2026 arrival, kept until the end of 2036, in the lock and in the ledger.
+    clock.now = datetime(2025, 12, 31, 23, 30, tzinfo=UTC)
+    r = await _upload(uploader, workspace, PDF)
+    assert r.status_code == 202, r.text
+    [row] = await _ledger(db, workspace)
+    assert row.retention_until == date(2036, 12, 31)
+    [put] = memory_store.puts
+    assert put.retain_until == date(2036, 12, 31)
 
 
 async def test_upload_same_file_twice_returns_409_with_existing_id(
@@ -262,6 +280,47 @@ async def test_upload_rejects_over_100mb_without_storing(
     assert peak < 32 * MiB, f"peak {peak / MiB:.1f} MiB"
     # Refused as the stream passed the limit, not after reading the remaining 50 MB.
     assert MAX_UPLOAD_BYTES < sent[0] <= MAX_UPLOAD_BYTES + 2 * MiB
+    assert memory_store.puts == []
+    assert await _ledger(db, workspace) == []
+    assert enqueuer.ingests == []
+
+
+async def test_upload_body_bounded_outside_the_file_part(
+    uploader: Actor,
+    workspace: Workspace,
+    db: AsyncSession,
+    memory_store: MemoryObjectStore,
+    enqueuer: RecordingEnqueuer,
+) -> None:
+    # A small `file` part followed by a huge extra part: the whole body is bounded, not just
+    # the file, so the reader stops once the body passes the limit plus 1 MiB of slack.
+    boundary = "sijil-test-boundary"
+    sent = [0]
+    block = b"\0" * MiB
+
+    async def body() -> AsyncIterator[bytes]:
+        yield (
+            (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="a.pdf"\r\n\r\n'
+            ).encode()
+            + PDF
+            + f"\r\n--{boundary}\r\n".encode()
+        )
+        yield b'Content-Disposition: form-data; name="padding"\r\n\r\n'
+        for _ in range(150):
+            sent[0] += len(block)
+            yield block
+        yield f"\r\n--{boundary}--\r\n".encode()
+
+    r = await uploader.client.post(
+        _url(workspace),
+        content=body(),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert r.status_code == 413
+    assert r.json() == {"error": {"code": "upload.too_large"}}
+    assert sent[0] <= MAX_UPLOAD_BYTES + 2 * MiB
     assert memory_store.puts == []
     assert await _ledger(db, workspace) == []
     assert enqueuer.ingests == []
@@ -442,6 +501,7 @@ async def test_accept_file_cleans_up_spool_files(
             enqueue=enqueue,
             workspace=workspace,
             country=org.country,
+            region=org.region,
             chunks=_chunks(*parts),
             source=DocumentSource.upload,
             actor_type=ActorType.system,
@@ -500,6 +560,7 @@ async def test_accept_file_enqueues_only_after_commit(
         enqueue=enqueue,
         workspace=workspace,
         country=org.country,
+        region=org.region,
         chunks=_chunks(PDF),
         source=DocumentSource.upload,
         actor_type=ActorType.system,
@@ -530,6 +591,7 @@ async def test_accept_file_email_source_audits_email_received(
             enqueue=enqueue,
             workspace=workspace,
             country=org.country,
+            region=org.region,
             chunks=_chunks(eml),
             source=DocumentSource.email,
             actor_type=ActorType.email,
@@ -543,6 +605,7 @@ async def test_accept_file_email_source_audits_email_received(
         enqueue=enqueue,
         workspace=workspace,
         country=org.country,
+        region=org.region,
         chunks=_chunks(eml),
         source=DocumentSource.email,
         actor_type=ActorType.email,

@@ -45,6 +45,9 @@ Now = Annotated[datetime, Depends(get_now)]
 Uploading = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_upload))]
 
 FILE_FIELD = b"file"
+# The whole body, not only the file part, is bounded: other parts and multipart framing get
+# 1 MiB of slack on top of the file limit.
+MAX_BODY_BYTES = ingest.MAX_UPLOAD_BYTES + 1024 * 1024
 
 
 class UploadOut(BaseModel):
@@ -121,7 +124,11 @@ async def _file_part(request: Request, boundary: bytes) -> AsyncIterator[bytes]:
         "on_part_end": on_part_end,
     }
     parser = MultipartParser(boundary, callbacks)
+    total = 0
     async for chunk in request.stream():
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            raise ingest.TooLarge
         parser.write(chunk)
         if data:
             out = b"".join(data)
@@ -142,7 +149,7 @@ async def upload_document(
     org = await db.get(Organisation, workspace.org_id)
     if org is None:  # authorize already checked; keeps the type narrow
         raise ApiError("not_found", 404)
-    country = org.country
+    country, region = org.country, org.region
     user_id = str(user.id)
     # Hand the connection back before the (possibly long) body arrives; accept_file opens its
     # own short transactions. Loaded attributes stay readable on the detached objects.
@@ -160,6 +167,7 @@ async def upload_document(
             enqueue=enqueue,
             workspace=workspace,
             country=country,
+            region=region,
             chunks=_file_part(request, _boundary(request)),
             source=DocumentSource.upload,
             actor_type=ActorType.user,
