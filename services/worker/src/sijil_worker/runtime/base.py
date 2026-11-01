@@ -13,7 +13,8 @@ TenantStatus = Literal["absent", "starting", "running", "stopped"]
 @dataclass(frozen=True)
 class TenantSpec:
     workspace_id: UUID
-    slug: str
+    # Opaque short id (`sijil_core.tenancy.tenant_ref`) naming every runtime resource.
+    ref: str
     db_name: str
     index_db_name: str
     db_password: str
@@ -22,7 +23,7 @@ class TenantSpec:
     admin_password: str
 
     def __repr__(self) -> str:
-        return f"TenantSpec(workspace_id={self.workspace_id}, slug={self.slug!r})"
+        return f"TenantSpec(workspace_id={self.workspace_id}, ref={self.ref!r})"
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,6 @@ class TenantRuntime(Protocol):
 
     async def ensure_running(self, spec: TenantSpec) -> TenantHandle: ...
 
-    async def status(self, slug: str) -> TenantStatus: ...
+    async def status(self, ref: str) -> TenantStatus: ...
 
-    async def destroy(self, slug: str) -> None: ...
+    async def destroy(self, ref: str) -> None: ...

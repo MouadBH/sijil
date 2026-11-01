@@ -133,8 +133,8 @@ class Workspace(Base):
         _enum(WorkspaceState), default=WorkspaceState.provisioning
     )
     paperless_url: Mapped[str | None] = mapped_column(String)
-    db_name: Mapped[str] = mapped_column(String)
-    index_db_name: Mapped[str] = mapped_column(String)
+    db_name: Mapped[str] = mapped_column(String, unique=True)
+    index_db_name: Mapped[str] = mapped_column(String, unique=True)
     kms_key_id: Mapped[str] = mapped_column(String)
 
 

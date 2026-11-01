@@ -24,6 +24,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.paperless import SERVICE_PERMISSIONS, SUPPORT_PERMISSIONS, PaperlessClient
+from sijil_core.tenancy import tenant_ref
 from sijil_worker.runtime.base import ADMIN_USERNAME, TenantRuntime, TenantSpec
 
 log = logging.getLogger(__name__)
@@ -152,7 +153,7 @@ async def provision_workspace(
         values = await _load_or_create_secrets(sessions, keys, workspace)
         spec = TenantSpec(
             workspace_id=workspace.id,
-            slug=workspace.slug,
+            ref=tenant_ref(workspace.id),
             db_name=workspace.db_name,
             index_db_name=workspace.index_db_name,
             db_password=values[CredentialKind.paperless_db_password],

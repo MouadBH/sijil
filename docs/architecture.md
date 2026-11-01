@@ -159,18 +159,18 @@ destroy              → only after closure rules allow it (design §5.4)
 
 `DockerRuntime` drives the Docker Engine API in development. A Kubernetes implementation of the same interface comes with the production milestone.
 
-What `DockerRuntime` creates for a workspace with slug `<slug>` (compose project `<project>`, default `sijil`):
+What `DockerRuntime` creates for a workspace with tenant ref `<ref>` (compose project `<project>`, default `sijil`). The ref is `t` + 16 lower-case base32 characters of SHA-256 over the workspace id (`sijil_core.tenancy.tenant_ref`): short, opaque and fixed for the workspace's life. The name-derived slug is for display and URLs only, so no resource name grows with, or reveals, the organisation's name; container names (their hostnames) are checked to be one DNS label of at most 63 characters before anything is created:
 
 | Resource | Name | Notes |
 | --- | --- | --- |
-| Network | `<project>_tenant_<slug>` | `internal: true`. A pre-existing network that isn't internal is refused |
-| Redis | `<project>-paperless-redis-<slug>` | On the tenant network only |
-| Paperless-ngx | `<project>-paperless-<slug>` | The official image, the same base env as `infra/compose/paperless/tenant.env` (a unit test keeps them equal), no published port. URL `http://<project>-paperless-<slug>:8000` |
-| Volumes | `<project>_<slug>_data`, `<project>_<slug>_media` | Per tenant |
+| Network | `<project>_tenant_<ref>` | `internal: true`. A pre-existing network that isn't internal is refused |
+| Redis | `<project>-paperless-redis-<ref>` | On the tenant network only |
+| Paperless-ngx | `<project>-paperless-<ref>` | The official image, the same base env as `infra/compose/paperless/tenant.env` (a unit test keeps them equal), no published port. URL `http://<project>-paperless-<ref>:8000` |
+| Volumes | `<project>_<ref>_data`, `<project>_<ref>_media` | Per tenant |
 | Tessdata | `<project>_tessdata`, mounted read-only | Filled once by the one-shot `tessdata-init` service: the image's languages plus `infra/compose/tessdata/ara.traineddata`. The sample tenants mount it too |
-| Databases | `paperless_<slug_>` and `index_<slug_>` (`-` → `_`), each owned by a role of the same name | `REVOKE ALL … FROM PUBLIC`; the index DB is cloned from `template_index` (pgvector) |
+| Databases | `paperless_<ref>` and `index_<ref>` (unique in `workspace`), each owned by a role of the same name | `REVOKE ALL … FROM PUBLIC`; the index DB is cloned from `template_index` (pgvector) |
 
-- **Labels.** Every container, network and volume carries `sijil.tenant=<slug>`, `sijil.workspace=<id>` and `sijil.role` (`paperless`, `redis`, `network`, `data`, `media`). `destroy` and `make smoke` find tenants by these labels. Labels never carry secrets; secrets go only into the container environment, as for the compose tenants.
+- **Labels.** Every container, network and volume carries `sijil.tenant=<ref>`, `sijil.workspace=<id>` and `sijil.role` (`paperless`, `redis`, `network`, `data`, `media`). `destroy` and `make smoke` find tenants by these labels. Labels never carry secrets; secrets go only into the container environment, as for the compose tenants.
 - **Attached services.** The compose `control-plane`, `worker`, `postgres`, `tika`, `gotenberg` and `ollama` containers (found by their compose labels) are connected to the tenant network with their service name as alias, so the tenant resolves `postgres`, `tika`, … and nothing else. Recreating one of these containers drops the attachment; the next `ensure_running` restores it.
 - **Provisioner role.** The worker creates tenant roles and databases as `sijil_provisioner` (`LOGIN CREATEDB CREATEROLE`, not superuser, created by `infra/compose/postgres/init.sh`). On PG 16+ it administers only the roles it created, and `createrole_self_grant = 'set'` lets it `SET ROLE` to them (to give them their databases and drop them) without inheriting their rights. Identifiers are checked against `^[a-z0-9_]{1,63}$` and quoted by Postgres's `format('%I')`.
 - **Docker socket.** The worker mounts `/var/run/docker.sock` in development only. That is root on the host, which is one reason production uses another runtime.

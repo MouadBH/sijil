@@ -1,11 +1,13 @@
 """`TenantRuntime` on the Docker Engine API, for development and CI.
 
-One tenant = one internal network `{project}_tenant_{slug}` holding that tenant's Redis and
+One tenant = one internal network `{project}_tenant_{ref}` holding that tenant's Redis and
 Paperless-ngx (the official image, configured by environment only, no published port). The
 compose services the tenant needs, or that need the tenant, are attached to that network; they
 are the only other members, so a tenant never reaches another tenant or the internet.
 
-Every resource carries the labels `sijil.tenant={slug}` (plus `sijil.workspace={id}` and
+Resources are named from the tenant ref (`sijil_core.tenancy.tenant_ref`, short and opaque),
+never from the organisation's name, so container hostnames stay within DNS's 63-character label.
+Every resource carries the labels `sijil.tenant={ref}` (plus `sijil.workspace={id}` and
 `sijil.role`); `destroy` and the smoke test find tenants by them. Labels never carry secrets.
 The Docker SDK is synchronous, so each public method runs in a worker thread.
 """
@@ -60,14 +62,22 @@ _HEALTHCHECK: Final[dict[str, Any]] = {
     "retries": 20,
     "start_period": 60 * _SECOND_NS,
 }
-_SLUG: Final = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+_REF: Final = re.compile(r"^t[a-z2-7]{16}$")
+# A container name is its hostname on the tenant network: one DNS label.
+_HOSTNAME: Final = re.compile(r"^(?=.{1,63}$)[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 TENANT_LABEL: Final = "sijil.tenant"
 
 
-def validate_slug(slug: str) -> str:
-    if not _SLUG.fullmatch(slug):
-        raise ValueError("invalid tenant slug")
-    return slug
+def validate_ref(ref: str) -> str:
+    if not _REF.fullmatch(ref):
+        raise ValueError("invalid tenant ref")
+    return ref
+
+
+def validate_hostname(name: str) -> str:
+    if not _HOSTNAME.fullmatch(name):
+        raise ValueError("invalid hostname (one DNS label, at most 63 characters)")
+    return name
 
 
 def _already(exc: APIError) -> bool:
@@ -82,25 +92,25 @@ class DockerRuntime:
 
     # Names ---------------------------------------------------------------------------------
 
-    def network_name(self, slug: str) -> str:
-        return f"{self._project}_tenant_{validate_slug(slug)}"
+    def network_name(self, ref: str) -> str:
+        return f"{self._project}_tenant_{validate_ref(ref)}"
 
-    def paperless_name(self, slug: str) -> str:
-        return f"{self._project}-paperless-{validate_slug(slug)}"
+    def paperless_name(self, ref: str) -> str:
+        return validate_hostname(f"{self._project}-paperless-{validate_ref(ref)}")
 
-    def redis_name(self, slug: str) -> str:
-        return f"{self._project}-paperless-redis-{validate_slug(slug)}"
+    def redis_name(self, ref: str) -> str:
+        return validate_hostname(f"{self._project}-paperless-redis-{validate_ref(ref)}")
 
-    def volume_name(self, slug: str, kind: str) -> str:
-        return f"{self._project}_{validate_slug(slug)}_{kind}"
+    def volume_name(self, ref: str, kind: str) -> str:
+        return f"{self._project}_{validate_ref(ref)}_{kind}"
 
-    def url(self, slug: str) -> str:
-        return f"http://{self.paperless_name(slug)}:8000"
+    def url(self, ref: str) -> str:
+        return f"http://{self.paperless_name(ref)}:8000"
 
     @staticmethod
     def _labels(spec: TenantSpec, role: str) -> dict[str, str]:
         return {
-            TENANT_LABEL: spec.slug,
+            TENANT_LABEL: spec.ref,
             "sijil.workspace": str(spec.workspace_id),
             "sijil.role": role,
         }
@@ -113,18 +123,21 @@ class DockerRuntime:
     async def ensure_running(self, spec: TenantSpec) -> TenantHandle:
         return await asyncio.to_thread(self._ensure_running, spec)
 
-    async def status(self, slug: str) -> TenantStatus:
-        return await asyncio.to_thread(self._status, slug)
+    async def status(self, ref: str) -> TenantStatus:
+        return await asyncio.to_thread(self._status, ref)
 
-    async def destroy(self, slug: str) -> None:
-        await asyncio.to_thread(self._destroy_docker, slug)
-        db_name, index_db_name = tenant_db_names(slug)
+    async def destroy(self, ref: str) -> None:
+        await asyncio.to_thread(self._destroy_docker, ref)
+        db_name, index_db_name = tenant_db_names(ref)
         await drop_tenant_databases(self._settings.provisioner_database_url, db_name, index_db_name)
 
     # Implementation (sync, run in a thread) ------------------------------------------------
 
     def _ensure_running(self, spec: TenantSpec) -> TenantHandle:
-        slug = validate_slug(spec.slug)
+        ref = spec.ref
+        # Every name is built (and so validated) before anything is created.
+        redis_name, paperless_name = self.redis_name(ref), self.paperless_name(ref)
+        url = self.url(ref)
         try:
             self._client.volumes.get(self._settings.tessdata_volume)
         except NotFound:
@@ -136,21 +149,20 @@ class DockerRuntime:
             ("data", "/usr/src/paperless/data"),
             ("media", "/usr/src/paperless/media"),
         ):
-            name = self.volume_name(slug, kind)
+            name = self.volume_name(ref, kind)
             self._client.volumes.create(name=name, labels=self._labels(spec, kind))  # idempotent
             volumes[name] = {"bind": path, "mode": "rw"}
         volumes[self._settings.tessdata_volume] = {"bind": TESSDATA_PATH, "mode": "ro"}
 
         self._ensure_container(
-            self.redis_name(slug),
+            redis_name,
             image=REDIS_IMAGE,
             network=network.name,
             labels=self._labels(spec, "redis"),
             restart_policy={"Name": "unless-stopped"},
         )
-        url = self.url(slug)
         self._ensure_container(
-            self.paperless_name(slug),
+            paperless_name,
             image=self._settings.tenant_image,
             network=network.name,
             labels=self._labels(spec, "paperless"),
@@ -160,7 +172,7 @@ class DockerRuntime:
                 "PAPERLESS_DBNAME": spec.db_name,
                 "PAPERLESS_DBUSER": spec.db_name,
                 "PAPERLESS_DBPASS": spec.db_password,
-                "PAPERLESS_REDIS": f"redis://{self.redis_name(slug)}:6379",
+                "PAPERLESS_REDIS": f"redis://{redis_name}:6379",
                 "PAPERLESS_SECRET_KEY": spec.secret_key,
                 "PAPERLESS_ADMIN_USER": ADMIN_USERNAME,
                 "PAPERLESS_ADMIN_PASSWORD": spec.admin_password,
@@ -172,7 +184,7 @@ class DockerRuntime:
         return TenantHandle(url=url)
 
     def _ensure_network(self, spec: TenantSpec) -> Network:
-        name = self.network_name(spec.slug)
+        name = self.network_name(spec.ref)
         try:
             network = self._client.networks.get(name)
         except NotFound:
@@ -235,9 +247,9 @@ class DockerRuntime:
                 return self._client.containers.get(name)  # created concurrently
         raise AssertionError("unreachable")  # pragma: no cover
 
-    def _status(self, slug: str) -> TenantStatus:
+    def _status(self, ref: str) -> TenantStatus:
         try:
-            container = self._client.containers.get(self.paperless_name(slug))
+            container = self._client.containers.get(self.paperless_name(ref))
         except NotFound:
             return "absent"
         state = container.attrs["State"]
@@ -246,15 +258,15 @@ class DockerRuntime:
         health = (state.get("Health") or {}).get("Status")
         return "running" if health in (None, "healthy") else "starting"
 
-    def _destroy_docker(self, slug: str) -> None:
-        validate_slug(slug)
-        flt: dict[str, str | list[str] | bool] = {"label": f"{TENANT_LABEL}={slug}"}
+    def _destroy_docker(self, ref: str) -> None:
+        validate_ref(ref)
+        flt: dict[str, str | list[str] | bool] = {"label": f"{TENANT_LABEL}={ref}"}
         for container in self._client.containers.list(all=True, filters=flt):
             with contextlib.suppress(NotFound):
                 container.remove(force=True)
         networks = {n.id: n for n in self._client.networks.list(filters=flt)}
         with contextlib.suppress(NotFound):
-            named = self._client.networks.get(self.network_name(slug))
+            named = self._client.networks.get(self.network_name(ref))
             networks[named.id] = named
         for network in networks.values():
             with contextlib.suppress(NotFound):

@@ -71,3 +71,19 @@ def test_role_rank() -> None:
 async def test_app_role_cannot_alter_schema(db: AsyncSession) -> None:
     with pytest.raises(DBAPIError):
         await db.execute(text("ALTER TABLE organisation DROP COLUMN region"))
+
+
+async def test_tenant_db_names_are_unique(
+    db: AsyncSession, org: Organisation, workspace: Workspace
+) -> None:
+    """Two workspaces can never share tenant databases (and so roles), whatever their ids."""
+    taken = {"db_name": workspace.db_name, "index_db_name": workspace.index_db_name}
+    org_id = org.id
+    for column in ("db_name", "index_db_name"):
+        values = {"db_name": "other_db", "index_db_name": "other_index", column: taken[column]}
+        db.add(
+            Workspace(org_id=org_id, name="Twin", slug=f"twin-{column}", kms_key_id="k", **values)
+        )
+        with pytest.raises(IntegrityError):
+            await db.commit()
+        await db.rollback()

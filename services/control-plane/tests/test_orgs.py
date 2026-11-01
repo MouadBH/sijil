@@ -1,3 +1,4 @@
+import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import UUID
@@ -18,6 +19,7 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
+from sijil_core.tenancy import tenant_db_names, tenant_ref
 from sijil_cp.api import orgs
 from sijil_cp.enqueue import CeleryEnqueuer
 
@@ -55,9 +57,8 @@ async def test_create_business_org_creates_workspace_and_job(
     assert row is not None
     assert row.slug.startswith("atlas-sarl-")
     assert len(row.slug.rsplit("-", 1)[1]) == 6
-    slug_ = row.slug.replace("-", "_")
-    assert row.db_name == f"paperless_{slug_}"
-    assert row.index_db_name == f"index_{slug_}"
+    # Runtime names come from an opaque id, never from the (org-name-derived) slug.
+    assert (row.db_name, row.index_db_name) == tenant_db_names(tenant_ref(row.id))
     assert row.kms_key_id == f"ws-{row.id}"
     assert row.paperless_url is None
 
@@ -270,3 +271,17 @@ async def test_job_visible_only_to_members(make_actor: MakeActor) -> None:
     r = await mallory.client.get(f"/v1/jobs/{data['job_id']}")
     assert r.status_code == 404
     assert error(r) == "not_found"
+
+
+async def test_long_org_name_gets_short_tenant_names(
+    make_actor: MakeActor, enqueuer: Any, db: AsyncSession
+) -> None:
+    alice = await make_actor("alice@example.com")
+    name = "Société Marocaine de Distribution et de Commerce SARL " + "x" * 140
+    data = await create_org(alice, name=name)
+    row = await db.scalar(select(Workspace).where(Workspace.id == UUID(data["workspace"]["id"])))
+    assert row is not None
+    assert row.slug.startswith("societe-marocaine-de-distribution")
+    for identifier in (row.db_name, row.index_db_name):
+        assert re.fullmatch(r"[a-z0-9_]{1,63}", identifier)
+        assert "societe" not in identifier

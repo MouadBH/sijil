@@ -20,6 +20,7 @@ from sijil_core.crypto import Envelope, LocalKeyService, open_envelope
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.db.models import CredentialKind, TenantCredential, Workspace
 from sijil_core.paperless import PaperlessClient, PaperlessForbidden
+from sijil_core.tenancy import tenant_ref
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
 
@@ -30,6 +31,8 @@ pytestmark = pytest.mark.integration
 CP_URL = os.environ.get("SIJIL_IT_CP_URL", "http://control-plane:8000")
 PROVISION_BUDGET_S = 180
 PASSWORD = "it-acceptance-Passw0rd"
+# Long enough that a name-derived hostname would break DNS's 63-character label.
+ORG_NAME = "Société Marocaine de Distribution et de Commerce SARL"
 
 
 async def _post(http: httpx.AsyncClient, path: str, body: dict[str, object]) -> httpx.Response:
@@ -80,19 +83,19 @@ async def _service_token(settings: WorkerSettings, workspace_id: uuid.UUID) -> t
 async def test_m1_acceptance(
     docker_runtime: DockerRuntime, worker_settings: WorkerSettings, attach_runner: AttachRunner
 ) -> None:
-    slug: str | None = None
+    ref: str | None = None
     try:
         async with httpx.AsyncClient(base_url=CP_URL, timeout=30) as http:
             await _sign_up_with_totp(http)
 
             started = time.monotonic()
             r = await _post(
-                http, "/v1/orgs", {"name": "Atlas IT", "type": "business", "country": "MA"}
+                http, "/v1/orgs", {"name": ORG_NAME, "type": "business", "country": "MA"}
             )
             assert r.status_code == 202, r.text
             created = r.json()
-            slug = created["workspace"]["slug"]
             workspace_id = uuid.UUID(created["workspace"]["id"])
+            ref = tenant_ref(workspace_id)
 
             job: dict[str, object] = {}
             while time.monotonic() - started < PROVISION_BUDGET_S:
@@ -112,12 +115,12 @@ async def test_m1_acceptance(
             assert r.json()["state"] == "active"
 
         url, token = await _service_token(worker_settings, workspace_id)
-        assert url == f"http://{docker_runtime.paperless_name(slug)}:8000"
-        with attach_runner(docker_runtime.network_name(slug)):
+        assert url == f"http://{docker_runtime.paperless_name(ref)}:8000"
+        with attach_runner(docker_runtime.network_name(ref)):
             async with PaperlessClient(url, token=token) as service:
                 assert await service.api_version() >= 1
                 with pytest.raises(PaperlessForbidden):
                     await service.delete_document(1)
     finally:
-        if slug is not None:
-            await docker_runtime.destroy(slug)
+        if ref is not None:
+            await docker_runtime.destroy(ref)

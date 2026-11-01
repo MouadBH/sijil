@@ -95,8 +95,8 @@ psycopg.connect(host='postgres', dbname=sys.argv[1] or os.environ['PAPERLESS_DBN
   }
   db_login "" && pass "$name's db role logs into its own database" \
     || fail "$name's db role cannot log into its own database"
-  slug_=${name#"${project:-sijil}-paperless-"}
-  for other in paperless_t1 "index_${slug_//-/_}"; do
+  ref=${name#"${project:-sijil}-paperless-"}
+  for other in paperless_t1 "index_${ref}"; do
     db_login "$other" \
       && fail "$name's db role can log into $other" || pass "$name's db role cannot log into $other"
   done
