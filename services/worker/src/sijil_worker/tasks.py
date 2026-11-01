@@ -12,6 +12,7 @@ from docker.errors import APIError
 from sqlalchemy.exc import OperationalError
 
 from sijil_core.crypto import LocalKeyService
+from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.paperless import (
     PaperlessClient,
@@ -19,6 +20,7 @@ from sijil_core.paperless import (
     PaperlessUnavailable,
 )
 from sijil_core.storage import S3ObjectStore, StorageSettings
+from sijil_worker.drift import drift_check, enqueue_drift_checks
 from sijil_worker.ingest import (
     ConsumeFailed,
     WorkspaceNotActive,
@@ -212,3 +214,70 @@ async def _requeue() -> int:
 def requeue_stuck_ingest_task() -> int:
     """Re-send ingest for rows still `queued` after 10 minutes (lost message, failed enqueue)."""
     return asyncio.run(_requeue())
+
+
+DRIFT_MAX_RETRIES = 5
+DRIFT_BACKOFF_FACTOR_S = 300
+DRIFT_BACKOFF_MAX_S = 3600
+
+
+def is_drift_transient(exc: BaseException) -> bool:
+    """Paperless or the object store unreachable: retry later, flag nothing."""
+    if isinstance(exc, PaperlessError):
+        return isinstance(exc, PaperlessUnavailable)
+    if isinstance(exc, ClientError | BotoCoreError):
+        return True
+    return is_transient(exc)
+
+
+async def _drift(workspace_id: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await drift_check(
+            UUID(workspace_id),
+            sessions=make_sessionmaker(engine),
+            keys=LocalKeyService(settings.master_key_bytes()),
+            store=S3ObjectStore(StorageSettings()),
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.drift_check", max_retries=DRIFT_MAX_RETRIES)
+def drift_check_task(self: "Task[Any, Any]", workspace_id: str) -> None:
+    """Integrity drift check of one workspace; retried later when a dependency is down."""
+    try:
+        asyncio.run(_drift(workspace_id))
+    except Exception as exc:
+        if not (is_drift_transient(exc) and int(self.request.retries or 0) < DRIFT_MAX_RETRIES):
+            raise
+        countdown = get_exponential_backoff_interval(
+            factor=DRIFT_BACKOFF_FACTOR_S,
+            retries=int(self.request.retries or 0),
+            maximum=DRIFT_BACKOFF_MAX_S,
+            full_jitter=True,
+        )
+        raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+async def _drift_all() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+
+    async def enqueue(workspace_id: UUID) -> None:
+        current_app.send_task("sijil.drift_check", kwargs={"workspace_id": str(workspace_id)})
+
+    try:
+        return await enqueue_drift_checks(make_sessionmaker(engine), settings, enqueue)
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.drift_check_all")
+def drift_check_all_task() -> int:
+    """Nightly: fan out one drift check per active workspace of this region."""
+    return asyncio.run(_drift_all())

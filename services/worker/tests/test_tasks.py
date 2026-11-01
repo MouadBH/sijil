@@ -205,3 +205,17 @@ def test_beat_requeues_stuck_ingest_every_five_minutes() -> None:
     entry = make_celery(_settings()).conf.beat_schedule["requeue-stuck-ingest"]
     assert entry == {"task": "sijil.requeue_stuck_ingest", "schedule": 300}
     assert tasks.requeue_stuck_ingest_task.name == "sijil.requeue_stuck_ingest"
+
+
+def test_beat_runs_drift_check_nightly_at_0230_casablanca() -> None:
+    from celery.schedules import crontab
+
+    app = make_celery(_settings())
+    entry = app.conf.beat_schedule["drift-check-nightly"]
+    assert entry["task"] == "sijil.drift_check_all"
+    assert entry["schedule"] == crontab(hour=2, minute=30)
+    assert str(app.conf.timezone) == "Africa/Casablanca"
+    # The interval entries are plain seconds: the timezone does not move them.
+    assert app.conf.beat_schedule["reconcile-tenants"]["schedule"] == 300
+    assert tasks.drift_check_all_task.name == "sijil.drift_check_all"
+    assert tasks.drift_check_task.name == "sijil.drift_check"

@@ -1,6 +1,7 @@
 from typing import Any
 
 from celery import Celery
+from celery.schedules import crontab
 from celery.signals import worker_ready
 from kombu import Queue
 
@@ -22,6 +23,8 @@ def make_celery(settings: WorkerSettings) -> Celery:
         task_reject_on_worker_lost=True,
         worker_prefetch_multiplier=1,
         sijil_region=settings.region,
+        # Only crontab entries follow it; the interval entries are plain seconds.
+        timezone="Africa/Casablanca",
         beat_schedule={
             "reconcile-tenants": {
                 "task": "sijil.reconcile_tenants",
@@ -30,6 +33,10 @@ def make_celery(settings: WorkerSettings) -> Celery:
             "requeue-stuck-ingest": {
                 "task": "sijil.requeue_stuck_ingest",
                 "schedule": REQUEUE_INGEST_INTERVAL_S,
+            },
+            "drift-check-nightly": {
+                "task": "sijil.drift_check_all",
+                "schedule": crontab(hour=2, minute=30),
             },
         },
     )

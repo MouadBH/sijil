@@ -308,6 +308,20 @@ class PaperlessClient:
         response = await self._request("GET", f"/api/documents/{doc_id}/")
         return dict(response.json())
 
+    async def document_metadata(self, doc_id: int) -> dict[str, Any] | None:
+        """`/api/documents/{id}/metadata/`, or None when Paperless has no such document (404,
+        which includes one in the trash). Transport errors and 5xx raise PaperlessUnavailable."""
+        try:
+            response = await self._request("GET", f"/api/documents/{doc_id}/metadata/")
+        except PaperlessError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        body = response.json()
+        if not isinstance(body, dict):
+            raise PaperlessError("GET /api/documents/{id}/metadata/: unexpected body")
+        return dict(body)
+
     async def documents_by_ids(self, ids: Sequence[int]) -> dict[int, PaperlessDoc]:
         """Titles and names of the given documents in one request (ids missing in Paperless
         are simply absent). A malformed answer surfaces as PaperlessError."""
