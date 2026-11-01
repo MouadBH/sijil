@@ -30,8 +30,14 @@ x-sijil-env: &sijil-env
   SIJIL_ENVIRONMENT: dev
   SIJIL_REDIS_URL: redis://redis:6379/0
 
+x-objectstore-env: &objectstore-env
+  SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
+  SIJIL_OBJECTSTORE_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY:?}
+  SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
+
 x-worker-env: &worker-env
-  <<: *sijil-env
+  <<: [*sijil-env, *objectstore-env]
   SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
   SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
   SIJIL_PROVISIONER_DATABASE_URL: postgresql+asyncpg://sijil_provisioner:${SIJIL_PROVISIONER_DB_PASSWORD:?}@postgres:5432/postgres
@@ -178,15 +184,17 @@ services:
     build:
       context: ../..
       dockerfile: services/control-plane/Dockerfile
-    command: ["alembic", "upgrade", "head"]
+    command: ["sh", "-c", "alembic upgrade head && sijil-cp bootstrap-storage"]
     restart: "no"
     environment:
+      <<: *objectstore-env
       SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
       SIJIL_ENVIRONMENT: dev
       SIJIL_MIGRATION_DATABASE_URL: postgresql+asyncpg://sijil_cp_owner:${SIJIL_CP_OWNER_DB_PASSWORD:?}@postgres:5432/sijil_cp
     networks: [core]
     depends_on:
       postgres: { condition: service_healthy }
+      objectstore: { condition: service_started }
 
   control-plane:
     build:
@@ -194,7 +202,7 @@ services:
       dockerfile: services/control-plane/Dockerfile
     restart: unless-stopped
     environment:
-      <<: *sijil-env
+      <<: [*sijil-env, *objectstore-env]
       SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
       SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
       SIJIL_COOKIE_SECURE: "false" # dev runs over http on localhost

@@ -10,6 +10,7 @@ dependencies = [
   "asyncpg>=0.30",
   "cryptography>=44",
   "httpx>=0.28",
+  "boto3>=1.35",
 ]
 
 [build-system]

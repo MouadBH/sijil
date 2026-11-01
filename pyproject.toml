@@ -19,6 +19,7 @@ dev = [
   "ruff>=0.8",
   "celery-types>=0.22",
   "types-docker>=7.1",
+  "boto3-stubs[s3]>=1.35",
   # fixtures/ generator and its tests
   "reportlab>=4.2",
   "arabic-reshaper>=3.0",

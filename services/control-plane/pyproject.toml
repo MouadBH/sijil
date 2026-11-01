@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sijil-cp = "sijil_cp.main:run"
+sijil-cp = "sijil_cp.cli:main"
 
 [tool.uv.sources]
 sijil-core = { workspace = true }
