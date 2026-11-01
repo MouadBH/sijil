@@ -97,12 +97,22 @@ async def user_in_totp_org(db: AsyncSession, user_id: UUID) -> bool:
 
 
 async def require_totp_compliance(
+    session: Annotated[UserSession, Depends(current_session())],
     user: Annotated[User, Depends(current_user)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
-    """403 `auth.totp_enrolment_required` while an organisation requires TOTP the user lacks."""
-    if not user.totp_enabled and await user_in_totp_org(db, user.id):
-        raise ApiError("auth.totp_enrolment_required", 403)
+    """Enforces an organisation's `require_totp`, judged by this session, not only the user.
+
+    403 `auth.totp_enrolment_required` while the user has no TOTP, and 403
+    `auth.step_up_required` while this session never verified a code (e.g. it predates
+    enrolment): the client verifies once, then the session complies for its lifetime.
+    """
+    if user.totp_enabled and session.totp_verified_at is not None:
+        return user
+    if await user_in_totp_org(db, user.id):
+        if not user.totp_enabled:
+            raise ApiError("auth.totp_enrolment_required", 403)
+        raise ApiError("auth.step_up_required", 403)
     return user
 
 

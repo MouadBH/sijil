@@ -454,11 +454,13 @@ async def test_owner_enforcement_blocks_users_without_totp(
     r = await c.get("/v1/_probe/compliance")
     assert r.status_code == 403
     assert error(r) == "auth.totp_enrolment_required"
-    # Enrolling is still possible, and once enabled the user gets through.
+    # Enrolling is still possible, and once enabled and verified the user gets through.
     secret = await enrol(c)
     assert (
         await c.post("/v1/auth/totp/confirm", json={"code": code_at(secret, clock.now)})
     ).status_code == 200
+    clock.advance(STEP)
+    assert (await verify(c, code=code_at(secret, clock.now))).status_code == 200
     assert (await c.get("/v1/_probe/compliance")).status_code == 200
 
 
@@ -598,3 +600,23 @@ async def test_disable_revokes_other_sessions(
         assert (await c.post("/v1/auth/totp/disable")).status_code == 204
         assert (await other.get("/v1/me")).status_code == 401
     assert (await c.get("/v1/me")).status_code == 200
+
+
+async def test_enforcement_needs_a_verified_session(
+    c: httpx.AsyncClient, clock: Clock, db: AsyncSession
+) -> None:
+    """A session from before enrolment never proved the second factor: it must verify first."""
+    await signup(c)
+    secret = await enrol(c)
+    r = await c.post("/v1/auth/totp/confirm", json={"code": code_at(secret, clock.now)})
+    assert r.status_code == 200
+    clock.advance(STEP)
+    assert (await c.get("/v1/_probe/compliance")).status_code == 200
+    await _require_totp_org(db)
+    r = await c.get("/v1/_probe/compliance")
+    assert r.status_code == 403
+    assert error(r) == "auth.step_up_required"
+    assert (await verify(c, code=code_at(secret, clock.now))).status_code == 200
+    # Verified once is enough: enforcement is not a 10-minute step-up window.
+    clock.advance(timedelta(minutes=30))
+    assert (await c.get("/v1/_probe/compliance")).status_code == 200
