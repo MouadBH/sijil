@@ -220,6 +220,9 @@ class SijilSmtpHandler:
             region=target.region,
             chunks=_chunks(data),
             source=DocumentSource.email,
+            # The message itself is the received email; each attachment (a forwarded `.eml`
+            # too) is a document it brought.
+            audit_action="email.received" if eml_id is None else "document.uploaded",
             actor_type=ActorType.email,
             actor_id=None,
             ip=ip,

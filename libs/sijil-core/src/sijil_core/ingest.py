@@ -35,7 +35,7 @@ from sijil_core.db.models import (
     IngestState,
     Workspace,
 )
-from sijil_core.filetypes import MAX_UPLOAD_BYTES, FileKind, sniff
+from sijil_core.filetypes import MAX_UPLOAD_BYTES, sniff
 from sijil_core.retention import provisional_retain_until, region_local_date
 from sijil_core.storage import ObjectStore
 from sijil_core.tenancy import tenant_ref
@@ -179,6 +179,7 @@ async def accept_file(
     region: str,
     chunks: AsyncIterator[bytes],
     source: DocumentSource,
+    audit_action: str,
     actor_type: ActorType,
     actor_id: str | None,
     ip: str | None,
@@ -186,7 +187,12 @@ async def accept_file(
     now: datetime,
     allow_eml: bool = False,
 ) -> Accepted | Duplicate:
-    """Archive one file. Raises TooLarge, Unsupported or Empty; nothing is stored then."""
+    """Archive one file. Raises TooLarge, Unsupported or Empty; nothing is stored then.
+
+    `audit_action` is the caller's to say (`document.uploaded`, or `email.received` for the raw
+    message of an inbound email): the content kind cannot tell a received email from a
+    forwarded `.eml` attachment.
+    """
     workspace_id = workspace.id
     who = _Actor(actor_type, actor_id, ip, source, now)
     spooled = await _spool(chunks)
@@ -249,7 +255,7 @@ async def accept_file(
         await audit.append(
             db,
             workspace_id=workspace_id,
-            action="email.received" if kind is FileKind.eml else "document.uploaded",
+            action=audit_action,
             actor_type=actor_type,
             actor_id=actor_id,
             target_type="document",

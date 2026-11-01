@@ -187,6 +187,7 @@ async def upload_document(
             region=region,
             chunks=_file_part(request, _boundary(request)),
             source=DocumentSource.upload,
+            audit_action="document.uploaded",
             actor_type=ActorType.user,
             actor_id=user_id,
             ip=request.client.host if request.client else None,

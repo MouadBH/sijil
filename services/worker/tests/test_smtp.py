@@ -130,6 +130,14 @@ async def test_email_attachments_ingested(
     }
     assert all(r.source is DocumentSource.email for r in found)
     assert len(enqueued.calls) == 3
+    audited = {
+        e.target_id: (e.action, e.actor_type.value)
+        for e in await db.scalars(select(AuditEvent).where(AuditEvent.workspace_id == workspace.id))
+    }
+    assert audited == {
+        str(eml.id): ("email.received", "email"),
+        **{str(r.id): ("document.uploaded", "email") for r in attachments},
+    }
 
 
 async def test_unknown_recipient_rejected(handler: SijilSmtpHandler, workspace: Workspace) -> None:
@@ -302,9 +310,19 @@ async def test_attached_email_is_archived_and_linked(
     emls = [r for r in found if r.content_kind == "eml"]
     assert len(emls) == 2
     outer_row = next(r for r in emls if r.source_email_id is None)
+    inner_row = next(r for r in emls if r.source_email_id == outer_row.id)
     assert [r.source_email_id for r in emls].count(outer_row.id) == 1
     events = await db.scalars(select(AuditEvent).where(AuditEvent.action == "email.rejected"))
     assert list(events) == []
+    # One email arrived; the forwarded message is an attachment of it, not a second email.
+    audited = {
+        e.target_id: (e.action, e.actor_type.value)
+        for e in await db.scalars(select(AuditEvent).where(AuditEvent.workspace_id == workspace.id))
+    }
+    assert audited == {
+        str(outer_row.id): ("email.received", "email"),
+        str(inner_row.id): ("document.uploaded", "email"),
+    }
 
 
 async def test_failures_are_logged_without_tracebacks_or_addresses(
