@@ -45,7 +45,8 @@ class PaperlessForbidden(PaperlessError):  # noqa: N818
 
 
 class PaperlessUnavailable(PaperlessError):  # noqa: N818
-    """Paperless could not be reached, or kept answering 502/503/504."""
+    """Paperless could not be reached, timed out or dropped the connection, or kept answering
+    502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
 
 
 @dataclass(frozen=True)
@@ -107,8 +108,13 @@ class PaperlessClient:
             try:
                 response = await self._http.request(method, path, **kwargs)
             except (httpx.ConnectError, httpx.ConnectTimeout):
+                # Nothing was sent, so any method may be tried again.
                 if last:
                     raise PaperlessUnavailable(f"{where}: connection failed") from None
+            except httpx.TransportError as exc:
+                # Timeouts and broken connections after sending: the request may have been
+                # applied, so no retry here; callers (e.g. the provisioning task) may retry.
+                raise PaperlessUnavailable(f"{where}: {type(exc).__name__}") from None
             except httpx.HTTPError as exc:
                 raise PaperlessError(f"{where}: {type(exc).__name__}") from None
             else:

@@ -14,11 +14,15 @@ from sijil_core.db.models import (
     Job,
     JobKind,
     JobStatus,
+    Organisation,
+    OrgType,
     TenantCredential,
     Workspace,
     WorkspaceState,
 )
 from sijil_core.paperless import PaperlessClient, PaperlessUnavailable
+from sijil_core.region import RegionMismatch
+from sijil_core.settings import CoreSettings
 from sijil_worker.provisioning import provision_workspace
 from sijil_worker.runtime.base import ADMIN_USERNAME, TenantHandle, TenantSpec
 
@@ -26,6 +30,7 @@ pytestmark = pytest.mark.db
 
 URL = "http://paperless-ws:8000"
 TOKEN = "tok-" + "a" * 36
+SETTINGS = CoreSettings.model_construct(region="ma-cas", environment="test")
 
 
 class FakeRuntime:
@@ -88,9 +93,18 @@ async def run(
     runtime: FakeRuntime,
     workspace: Workspace,
     job: Job,
+    *,
+    will_retry: bool = False,
 ) -> None:
     await provision_workspace(
-        workspace.id, job.id, sessions=sessions, keys=keys, runtime=runtime, paperless=paperless
+        workspace.id,
+        job.id,
+        sessions=sessions,
+        keys=keys,
+        runtime=runtime,
+        paperless=paperless,
+        settings=SETTINGS,
+        will_retry=lambda _exc: will_retry,
     )
 
 
@@ -250,21 +264,148 @@ async def test_failure_marks_workspace_error(
     assert jb.error_code == "provision.ensure_users"
 
 
-async def test_unavailable_is_reraised_for_celery_retry(
+async def test_failure_with_a_retry_pending_is_not_final(
     db: AsyncSession,
     sessions: async_sessionmaker[AsyncSession],
     keys: LocalKeyService,
     workspace: Workspace,
     job: Job,
 ) -> None:
+    """While Celery will retry, clients must not see a final-looking `failed`."""
+
     class Down(FakeRuntime):
         async def ensure_running(self, spec: TenantSpec) -> TenantHandle:
             raise PaperlessUnavailable("down")
 
     with pytest.raises(PaperlessUnavailable):
-        await run(sessions, keys, Down(), workspace, job)
-    _, jb = await reload(db, workspace, job)
+        await run(sessions, keys, Down(), workspace, job, will_retry=True)
+    ws, jb = await reload(db, workspace, job)
+    assert jb.status == JobStatus.running
     assert jb.error_code == "provision.ensure_running"
+    assert ws.state == WorkspaceState.provisioning
+
+    # Retries exhausted: now it is final.
+    with pytest.raises(PaperlessUnavailable):
+        await run(sessions, keys, Down(), workspace, job, will_retry=False)
+    ws, jb = await reload(db, workspace, job)
+    assert jb.status == JobStatus.failed
+    assert jb.error_code == "provision.ensure_running"
+    assert ws.state == WorkspaceState.error
+
+
+async def test_region_mismatch_fails_at_once_and_touches_nothing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+) -> None:
+    org = Organisation(name="Paris", type=OrgType.business, country="FR", region="eu-fra")
+    db.add(org)
+    await db.flush()
+    workspace = Workspace(
+        org_id=org.id,
+        name="Paris",
+        slug="paris-abc123",
+        state=WorkspaceState.provisioning,
+        db_name="paperless_paris",
+        index_db_name="index_paris",
+        kms_key_id="ws-paris",
+    )
+    db.add(workspace)
+    await db.flush()
+    job = Job(kind=JobKind.provision_workspace, workspace_id=workspace.id)
+    db.add(job)
+    await db.commit()
+
+    runtime = FakeRuntime()
+    with pytest.raises(RegionMismatch):
+        # Even if the task would retry anything, a region mismatch is never retried.
+        await run(sessions, keys, runtime, workspace, job, will_retry=True)
+    ws, jb = await reload(db, workspace, job)
+    assert jb.status == JobStatus.failed
+    assert jb.error_code == "provision.region_mismatch"
+    assert ws.state == WorkspaceState.error
+    assert runtime.calls == []
+    assert await creds(db, workspace.id) == {}
+
+
+async def test_retry_reuses_existing_paperless_users(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    workspace: Workspace,
+    job: Job,
+) -> None:
+    """A retry after the users were created PATCHes them: Paperless never gets duplicates."""
+    users: dict[str, int] = {}
+
+    def list_users(request: httpx.Request) -> httpx.Response:
+        name = request.url.params.get("username__iexact", "")
+        rows = [{"id": i, "username": u} for u, i in users.items() if u == name]
+        return httpx.Response(200, json={"results": rows})
+
+    def create_user(request: httpx.Request) -> httpx.Response:
+        name = json.loads(request.content)["username"]
+        assert name not in users, f"duplicate Paperless user {name}"
+        users[name] = len(users) + 1
+        return httpx.Response(201, json={"id": users[name]})
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/").respond(200, headers={"X-Api-Version": "9"})
+        router.get(f"{URL}/api/users/").mock(side_effect=list_users)
+        router.post(f"{URL}/api/users/").mock(side_effect=create_user)
+        patch = router.patch(url__regex=rf"{URL}/api/users/\d+/").respond(200, json={})
+        token = router.post(f"{URL}/api/token/")
+        token.side_effect = [httpx.ReadTimeout("slow"), httpx.Response(200, json={"token": TOKEN})]
+
+        with pytest.raises(PaperlessUnavailable):
+            await run(sessions, keys, FakeRuntime(), workspace, job, will_retry=True)
+        _, jb = await reload(db, workspace, job)
+        assert jb.status == JobStatus.running
+        assert jb.error_code == "provision.obtain_token"
+        assert patch.call_count == 0
+
+        await run(sessions, keys, FakeRuntime(), workspace, job, will_retry=True)
+        posts = [
+            c
+            for c in router.calls
+            if c.request.method == "POST" and c.request.url.path == "/api/users/"
+        ]
+    ws, jb = await reload(db, workspace, job)
+    assert jb.status == JobStatus.succeeded
+    assert jb.error_code is None
+    assert ws.state == WorkspaceState.active
+    assert set(users) == {"sijil-service", "sijil-support"}
+    assert len(posts) == 2
+    assert patch.call_count == 2
+
+
+async def test_failure_never_touches_a_job_that_succeeded_meanwhile(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    workspace: Workspace,
+    job: Job,
+) -> None:
+    """A late failure from a duplicate run must not flip a finished job or active tenant."""
+
+    class RacedRuntime(FakeRuntime):
+        async def ensure_running(self, spec: TenantSpec) -> TenantHandle:
+            async with sessions() as session:
+                row = await session.get(Job, job.id)
+                ws_row = await session.get(Workspace, workspace.id)
+                assert row is not None
+                assert ws_row is not None
+                row.status = JobStatus.succeeded
+                ws_row.state = WorkspaceState.active
+                await session.commit()
+            raise RuntimeError("late failure")
+
+    with pytest.raises(RuntimeError):
+        await run(sessions, keys, RacedRuntime(), workspace, job)
+    ws, jb = await reload(db, workspace, job)
+    assert jb.status == JobStatus.succeeded
+    assert jb.error_code is None
+    assert ws.state == WorkspaceState.active
 
 
 async def test_already_succeeded_job_is_a_no_op(

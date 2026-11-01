@@ -172,3 +172,25 @@ async def test_ensure_user_create_has_no_extra_grants() -> None:
     assert body["groups"] == []
     assert body["is_superuser"] is False
     assert body["is_staff"] is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.WriteTimeout("slow"),
+        httpx.RemoteProtocolError("hung up"),
+        httpx.ReadError("reset"),
+    ],
+)
+@respx.mock
+async def test_transport_errors_are_unavailable_and_post_is_sent_once(
+    error: httpx.TransportError,
+) -> None:
+    """The request may have reached Paperless: no in-client retry, but retryable upstream."""
+    route = respx.post(f"{BASE}/api/token/").mock(side_effect=error)
+    async with PaperlessClient(BASE) as client:
+        with pytest.raises(PaperlessUnavailable) as exc:
+            await client.obtain_token("svc", "pw-secret")
+    assert route.call_count == 1
+    assert "pw-secret" not in str(exc.value)

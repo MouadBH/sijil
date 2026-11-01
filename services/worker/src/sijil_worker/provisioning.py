@@ -3,6 +3,10 @@
 Each step uses its own short database session, so no transaction is held open while waiting
 on Docker or Paperless. Secrets are created once, sealed, and reused on every retry. Errors
 record only the step name: never a secret, never a response body.
+
+A failure is final (job `failed`, workspace `error`) only when the caller will not retry it;
+while a retry is pending the job keeps its status and records the step in `error_code`. A job
+that has `succeeded` and an `active` workspace are never changed by a failure.
 """
 
 import logging
@@ -19,11 +23,14 @@ from sijil_core.db.models import (
     CredentialKind,
     Job,
     JobStatus,
+    Organisation,
     TenantCredential,
     Workspace,
     WorkspaceState,
 )
 from sijil_core.paperless import SERVICE_PERMISSIONS, SUPPORT_PERMISSIONS, PaperlessClient
+from sijil_core.region import RegionMismatch, assert_region
+from sijil_core.settings import CoreSettings
 from sijil_core.tenancy import tenant_ref
 from sijil_worker.runtime.base import ADMIN_USERNAME, TenantRuntime, TenantSpec
 
@@ -108,19 +115,32 @@ async def _store_token(
         await session.commit()
 
 
-async def _fail(
-    sessions: async_sessionmaker[AsyncSession], workspace_id: UUID, job_id: UUID, step: str
+async def record_failure(
+    sessions: async_sessionmaker[AsyncSession],
+    workspace_id: UUID,
+    job_id: UUID,
+    step: str,
+    *,
+    final: bool,
 ) -> None:
+    """Record `provision.<step>`; only a final failure marks the job failed."""
     async with sessions() as session:
-        job = await session.get(Job, job_id)
-        workspace = await session.get(Workspace, workspace_id)
-        if job is not None:
+        job = await session.get(Job, job_id, with_for_update=True)
+        if job is None or job.status is JobStatus.succeeded:
+            # A duplicate run finished it meanwhile: a late failure changes nothing.
+            return
+        job.error_code = f"provision.{step}"
+        if final:
             job.status = JobStatus.failed
-            job.error_code = f"provision.{step}"
-        # A failed re-run never takes a working tenant down: only `provisioning` becomes `error`.
-        if workspace is not None and workspace.state is WorkspaceState.provisioning:
-            workspace.state = WorkspaceState.error
+            workspace = await session.get(Workspace, workspace_id)
+            # Never takes a working tenant down: only `provisioning` becomes `error`.
+            if workspace is not None and workspace.state is WorkspaceState.provisioning:
+                workspace.state = WorkspaceState.error
         await session.commit()
+
+
+def _never_retried(_exc: Exception) -> bool:
+    return False
 
 
 async def provision_workspace(
@@ -131,7 +151,10 @@ async def provision_workspace(
     keys: KeyService,
     runtime: TenantRuntime,
     paperless: Callable[..., PaperlessClient],
+    settings: CoreSettings,
+    will_retry: Callable[[Exception], bool] = _never_retried,
 ) -> None:
+    """`will_retry(exc)` says whether the caller will run this again after `exc`."""
     step = "start"
     try:
         step = "start_job"
@@ -143,6 +166,13 @@ async def provision_workspace(
             if job.status is JobStatus.succeeded:
                 # Redelivered (acks_late) or duplicated: the work is done, touch nothing.
                 return
+            org = await session.get(Organisation, workspace.org_id)
+            if org is None:
+                raise LookupError("organisation not found")
+            step = "region_mismatch"
+            # Before anything is created: this worker only builds tenants of its own region.
+            assert_region(org.region, settings)
+            step = "start_job"
             job.status = JobStatus.running
             job.error_code = None
             if workspace.state is WorkspaceState.error:
@@ -195,8 +225,9 @@ async def provision_workspace(
             row.state = WorkspaceState.active
             job.status = JobStatus.succeeded
             await session.commit()
-    except Exception:
+    except Exception as exc:
         # Only the step name is recorded; the exception itself carries no secrets by contract.
         log.error("provisioning failed at step %s for workspace %s", step, workspace_id)
-        await _fail(sessions, workspace_id, job_id, step)
+        final = isinstance(exc, RegionMismatch) or not will_retry(exc)
+        await record_failure(sessions, workspace_id, job_id, step, final=final)
         raise
