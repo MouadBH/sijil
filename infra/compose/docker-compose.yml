@@ -243,7 +243,10 @@ services:
       dockerfile: services/worker/Dockerfile
     restart: unless-stopped
     command: ["sijil-smtp"]
-    environment: *worker-env
+    # Public edge: only what SmtpSettings reads. No master key, no provisioner credentials.
+    environment:
+      <<: [*sijil-env, *objectstore-env]
+      SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
     ports: ["127.0.0.1:2525:2525"]
     networks: [core]
     depends_on:

@@ -105,7 +105,7 @@ def attachments_of(content: bytes) -> list[bytes]:
     for part in parts:
         data: bytes | None = None
         try:
-            if part.is_multipart():
+            if part.is_multipart() and part.get_content_type() != "message/rfc822":
                 continue
             disposition = part.get_content_disposition()
             wanted = disposition == "attachment" or (
@@ -168,8 +168,8 @@ class SijilSmtpHandler:
     ) -> str:
         try:
             target = await self._resolve(address)
-        except Exception:
-            log.exception("recipient lookup failed")
+        except Exception as exc:
+            log.error("recipient lookup failed: %s", type(exc).__name__)
             return TEMPORARY
         if target is None:
             return REJECT_RECIPIENT
@@ -194,9 +194,10 @@ class SijilSmtpHandler:
                 refusal = await self._archive(target, content, attachments, ip)
                 if refusal is not None:
                     return refusal
-        except Exception:
-            # Types only: messages could carry addresses or paths.
-            log.exception("inbound email not archived")
+        except Exception as exc:
+            # Type name only: messages and tracebacks can carry bound SQL parameters (the
+            # recipient token), addresses or paths.
+            log.error("inbound email not archived: %s", type(exc).__name__)
             return TEMPORARY
         log.info("inbound email archived for %d workspace(s)", len(targets))
         return OK
@@ -224,7 +225,7 @@ class SijilSmtpHandler:
             ip=ip,
             source_email_id=eml_id,
             now=now,
-            allow_eml=eml_id is None,
+            allow_eml=True,  # forwarded message/rfc822 attachments too
         )
 
     async def _archive(
@@ -290,8 +291,14 @@ def make_enqueue(app: Celery) -> ingest.Enqueue:
     return enqueue
 
 
-def main() -> None:
+def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO)
+    # aiosmtpd logs `sender:` / `recip:` at INFO; the recipient holds the inbound token.
+    logging.getLogger("mail.log").setLevel(logging.WARNING)
+
+
+def main() -> None:
+    configure_logging()
     settings = SmtpSettings()
     engine = make_engine(settings.database_url)
     handler = SijilSmtpHandler(

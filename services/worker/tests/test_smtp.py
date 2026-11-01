@@ -1,12 +1,17 @@
 """Inbound email: the SMTP handler driven stage by stage (real Postgres, in-memory store)."""
 
 import hashlib
+import logging
+import smtplib
+import socket
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import pytest
+from aiosmtpd.controller import Controller
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -21,7 +26,7 @@ from sijil_core.db.models import (
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES
 from sijil_core.settings import CoreSettings
-from sijil_worker.smtp import SijilSmtpHandler
+from sijil_worker.smtp import SijilSmtpHandler, configure_logging
 from tests.support.memory_store import MemoryObjectStore
 
 pytestmark = pytest.mark.db
@@ -273,3 +278,83 @@ async def test_no_subject_or_sender_in_shared_db(
     assert dump
     for secret in (SUBJECT, SENDER, "example.org", FILENAME, "setup", "dest@"):
         assert secret.lower() not in blob
+
+
+async def test_attached_email_is_archived_and_linked(
+    handler: SijilSmtpHandler, db: AsyncSession, workspace: Workspace
+) -> None:
+    forwarded = EmailMessage()
+    forwarded["From"] = SENDER
+    forwarded["To"] = "dest@example.org"
+    forwarded["Subject"] = "Original"
+    forwarded.set_content("message transfere")
+    outer = EmailMessage()
+    outer["From"] = SENDER
+    outer["To"] = "dest@example.org"
+    outer["Subject"] = "Fwd"
+    outer.set_content("voir ci-joint")
+    outer.add_attachment(forwarded)
+    assert (
+        await handler.handle_DATA(None, SESSION, envelope(outer.as_bytes(), address(workspace)))
+        == OK
+    )
+    found = await rows(db)
+    emls = [r for r in found if r.content_kind == "eml"]
+    assert len(emls) == 2
+    outer_row = next(r for r in emls if r.source_email_id is None)
+    assert [r.source_email_id for r in emls].count(outer_row.id) == 1
+    events = await db.scalars(select(AuditEvent).where(AuditEvent.action == "email.rejected"))
+    assert list(events) == []
+
+
+async def test_failures_are_logged_without_tracebacks_or_addresses(
+    handler: SijilSmtpHandler,
+    workspace: Workspace,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    addr = address(workspace)
+    token = workspace.inbound_token
+
+    async def boom(_: str) -> None:
+        raise RuntimeError(f"bound token={token} rcpt={addr} from={SENDER}")
+
+    monkeypatch.setattr(handler, "_resolve", boom)
+    with caplog.at_level(logging.DEBUG):
+        env = envelope(mail(), addr)
+        assert (await handler.handle_RCPT(None, SESSION, env, addr, [])).startswith("451")
+        assert (await handler.handle_DATA(None, SESSION, env)).startswith("451")
+    assert "RuntimeError" in caplog.text
+    for secret in (token, addr, SENDER):
+        assert secret not in caplog.text
+    assert all(r.exc_info is None for r in caplog.records)
+
+
+def test_wire_logs_carry_no_sender_recipient_or_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real aiosmtpd session with the receiver's logging setup: aiosmtpd logs at INFO."""
+
+    class Accepting:
+        async def handle_RCPT(self, server: Any, session: Any, env: Any, addr: str, o: Any) -> str:
+            env.rcpt_tos.append(addr)
+            return OK
+
+        async def handle_DATA(self, server: Any, session: Any, env: Any) -> str:
+            return OK
+
+    recipient = "ws-abc.abcdefghij@in.sijil.local"
+    with caplog.at_level(logging.INFO):
+        configure_logging()
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = probe.getsockname()[1]
+        controller = Controller(Accepting(), hostname="127.0.0.1", port=free_port)
+        controller.start()
+        try:
+            with smtplib.SMTP(controller.hostname, controller.port, timeout=10) as client:
+                client.sendmail(SENDER, [recipient], mail())
+        finally:
+            controller.stop()
+    for secret in (SENDER, recipient, "abcdefghij"):
+        assert secret not in caplog.text
