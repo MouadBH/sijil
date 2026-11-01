@@ -13,7 +13,7 @@ import hashlib
 import os
 import smtplib
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -116,7 +116,10 @@ async def seed(
     email: str = SAMPLE_EMAIL,
     org_name: str = SAMPLE_ORG,
     consume_budget_s: int = CONSUME_BUDGET_S,
+    on_workspace: Callable[[UUID], None] | None = None,
 ) -> Seeded:
+    """`on_workspace` is called with the workspace id as soon as it exists, before anything can
+    fail, so a caller can always clean up the tenant a failed seed leaves behind."""
     files = invoices()
     engine = make_engine(os.environ["SIJIL_DATABASE_URL"])
     sessions = make_sessionmaker(engine)
@@ -152,6 +155,8 @@ async def seed(
                 workspace_id = UUID(r.json()["workspace"]["id"])
             else:
                 workspace_id = found
+            if on_workspace is not None:
+                on_workspace(workspace_id)
 
             deadline = time.monotonic() + PROVISION_BUDGET_S
             while True:

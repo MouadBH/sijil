@@ -119,6 +119,7 @@ States: `received → needs_review | filed → sealed`. A document can also beco
 - **Inbound SMTP.** The `smtp` service (published on `127.0.0.1:2525` in development, no Docker socket, no tenant network) accepts mail for `{slug}.{inbound_token}@{SIJIL_INBOUND_DOMAIN}`. An unknown recipient is refused at RCPT (`550 5.1.1`), over 100 MB with `552 5.3.4`. The raw `.eml` is archived as a document (`source = email`), and each attachment is archived as its own document linked by `source_email_id`. All of it goes through the same `accept_file`.
 - **Drift check.** `sijil.drift_check` runs nightly per active workspace (beat, 02:30). For every `consumed` row it checks that Paperless still has the document with `original_checksum` equal to the ledger `sha256`, and that the object still exists with the recorded size. A problem creates one open `IntegrityAlert` per document and kind plus an `integrity.drift` event; a clean run writes `integrity.check_ok`. Paperless being unreachable is retried, never flagged.
 - **Reconcile and the subnet pool.** Tenant networks get a `/28` from `SIJIL_TENANT_SUBNET_POOL` (see below), and `reconcile_tenants` re-attaches the shared services after any of them is recreated, so capture keeps reaching tenants.
+- **Dev leftovers.** Acceptance runs leave their organisation, user and ledger rows and their GOVERNANCE-locked objects behind on the dev stack (expected: locked objects cannot be deleted before `retain_until`). `make down ARGS=-v` wipes them with the volumes. `make down` also removes the worker-provisioned tenants of the compose project (`infra/scripts/clean-tenants.sh`: containers and networks labelled `sijil.tenant` on a network labelled `sijil.project=<project>`, plus their volumes with `-v`), which `docker compose down` does not know about.
 - **Try it.** `make seed` signs in as a SAMPLE user, provisions the SAMPLE workspace if needed, uploads `fixtures/invoices/sample-01..06`, emails `sample-07..12` to the workspace address and waits until all are consumed. `test_m2_acceptance` (`make itest`) runs the same flow in a throw-away organisation and checks hashes, consumption within 120 s, the 409 on re-upload, `sijil-cp audit verify`, the immutable `sha256`, and a drift alert after an admin deletes a document in Paperless.
 
 ## Retention lock: four layers
@@ -128,7 +129,7 @@ States: `received → needs_review | filed → sealed`. A document can also beco
 | 1 | Control-plane API refuses with `409 retention.locked` | Every UI and API path we build |
 | 2 | Paperless service user has no delete permission | Anyone holding the per-tenant token |
 | 3 | Database trigger on `document_ledger` rejects changes to sealed rows and all row deletes | Bugs in our own code, direct SQL as the app role |
-| 4 | Object lock (compliance mode) on the original | Anything touching storage. A nightly drift check catches changes made inside Paperless-ngx |
+| 4 | Object lock on the original: GOVERNANCE while unsealed (provisional retention), COMPLIANCE once sealed | Anything touching storage. A nightly drift check catches changes made inside Paperless-ngx |
 
 Every one of these has its own test in `tests/retention/` (M4). A new code path that can change or delete a document must add itself to that suite.
 

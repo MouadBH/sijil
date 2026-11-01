@@ -20,6 +20,8 @@ from sijil_core.crypto import Envelope, LocalKeyService, open_envelope
 from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.db.models import (
+    ActorType,
+    AuditEvent,
     CredentialKind,
     DocumentLedger,
     IngestState,
@@ -47,17 +49,19 @@ async def test_m2_acceptance(
     docker_runtime: DockerRuntime, worker_settings: WorkerSettings, attach_runner: AttachRunner
 ) -> None:
     run = uuid.uuid4().hex[:8]
-    seeded = await seed.seed(
-        email=f"m2-{run}@sijil.local",
-        org_name=f"SAMPLE M2 Acceptance {run}",
-        consume_budget_s=CONSUME_BUDGET_S,
-    )
-    workspace_id = seeded.workspace_id
-    ref = tenant_ref(workspace_id)
+    created: list[uuid.UUID] = []  # filled the moment the workspace exists, before seeding can fail
     engine = make_engine(worker_settings.database_url)
     sessions = make_sessionmaker(engine)
     keys = LocalKeyService(worker_settings.master_key_bytes())
     try:
+        seeded = await seed.seed(
+            email=f"m2-{run}@sijil.local",
+            org_name=f"SAMPLE M2 Acceptance {run}",
+            consume_budget_s=CONSUME_BUDGET_S,
+            on_workspace=created.append,
+        )
+        workspace_id = seeded.workspace_id
+        ref = tenant_ref(workspace_id)
         # 1-3. Twelve invoices, six of them by email (+ their six .eml); sha256 equals the file's
         # own; everything consumed (seed waits up to CONSUME_BUDGET_S).
         assert len(seeded.fixtures) == 12
@@ -81,6 +85,7 @@ async def test_m2_acceptance(
             r = await seed.upload(http, workspace_id, first)
             assert r.status_code == 409, r.text
             body = r.json()
+            assert body["error"]["code"] == "document.duplicate"
             assert body["document_id"] == str(
                 by_sha[hashlib.sha256(first.read_bytes()).hexdigest()].id
             )
@@ -152,6 +157,22 @@ async def test_m2_acceptance(
                 )
             )
         assert [(a.ledger_id, a.kind) for a in alerts] == [(victim.id, "paperless_missing")]
+        async with sessions() as db:
+            [event] = list(
+                await db.scalars(
+                    select(AuditEvent).where(
+                        AuditEvent.workspace_id == workspace_id,
+                        AuditEvent.action == "integrity.drift",
+                    )
+                )
+            )
+        assert event.actor_type is ActorType.system
+        assert event.target_id == str(victim.id)
+        assert event.data == {"kind": "paperless_missing"}
     finally:
-        await engine.dispose()
-        await docker_runtime.destroy(ref)
+        # Each step on its own, so one failing never skips the rest; the tenant always goes.
+        try:
+            await engine.dispose()
+        finally:
+            for created_id in created:
+                await docker_runtime.destroy(tenant_ref(created_id))

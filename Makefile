@@ -36,6 +36,7 @@ up:
 	$(COMPOSE) up -d --build
 
 down:
+	infra/scripts/clean-tenants.sh $(if $(findstring -v,$(ARGS)),--volumes)
 	$(COMPOSE) down $(ARGS)
 
 smoke:
