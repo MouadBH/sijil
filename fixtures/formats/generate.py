@@ -44,7 +44,7 @@ def _pdf() -> bytes:
 
 def _image(fmt: str) -> bytes:
     out = io.BytesIO()
-    Image.new("RGB", (16, 16), (200, 30, 30)).save(out, format=fmt)
+    Image.new("RGB", (16, 16), (200, 30, 30)).save(out, format=fmt, dpi=(300, 300))
     return out.getvalue()
 
 

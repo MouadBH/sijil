@@ -7,6 +7,7 @@ from kombu import Queue
 from sijil_worker.settings import WorkerSettings
 
 RECONCILE_INTERVAL_S = 300
+REQUEUE_INGEST_INTERVAL_S = 300
 QUEUES = ("default", "provisioning", "ingest", "extraction")
 
 
@@ -25,7 +26,11 @@ def make_celery(settings: WorkerSettings) -> Celery:
             "reconcile-tenants": {
                 "task": "sijil.reconcile_tenants",
                 "schedule": RECONCILE_INTERVAL_S,
-            }
+            },
+            "requeue-stuck-ingest": {
+                "task": "sijil.requeue_stuck_ingest",
+                "schedule": REQUEUE_INGEST_INTERVAL_S,
+            },
         },
     )
 
