@@ -84,6 +84,22 @@ for name in $provisioned; do
     && fail "$name can reach the internet by IP" || pass "$name has no route out (raw IP)"
   docker exec "$name" curl -s --max-time 5 -o /dev/null http://paperless-t1:8000/ \
     && fail "$name reaches paperless-t1" || pass "$name cannot reach paperless-t1"
+  # Its own role opens its own database (the control) and nothing else: not a sample
+  # tenant's, not its own index.
+  db_login() {
+    docker exec "$name" python3 -c "
+import os, sys, psycopg
+psycopg.connect(host='postgres', dbname=sys.argv[1] or os.environ['PAPERLESS_DBNAME'],
+                user=os.environ['PAPERLESS_DBUSER'], password=os.environ['PAPERLESS_DBPASS'],
+                connect_timeout=5)" "$1" 2>/dev/null
+  }
+  db_login "" && pass "$name's db role logs into its own database" \
+    || fail "$name's db role cannot log into its own database"
+  slug_=${name#"${project:-sijil}-paperless-"}
+  for other in paperless_t1 "index_${slug_//-/_}"; do
+    db_login "$other" \
+      && fail "$name's db role can log into $other" || pass "$name's db role cannot log into $other"
+  done
 done
 [ -n "$provisioned" ] || echo "  (no provisioned tenants running)"
 

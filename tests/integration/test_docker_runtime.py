@@ -12,12 +12,16 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 
+import asyncpg
 import docker
 import pytest
+from sqlalchemy.engine import make_url
 
 from sijil_core.paperless import PaperlessClient
 from sijil_worker.runtime.base import ADMIN_USERNAME, TenantHandle, TenantSpec
 from sijil_worker.runtime.docker import DockerRuntime
+from sijil_worker.runtime.postgres import drop_tenant_databases
+from sijil_worker.settings import WorkerSettings
 
 AttachRunner = Callable[[str], AbstractContextManager[None]]
 
@@ -118,3 +122,53 @@ async def test_provision_is_idempotent_against_docker(
     handle = await docker_runtime.ensure_running(tenant.spec)
     assert handle == tenant.handle
     assert tenant_resources(docker_client, tenant.spec.slug) == before
+
+
+async def _connect_as(settings: WorkerSettings, user: str, password: str, database: str) -> None:
+    url = make_url(settings.provisioner_database_url)
+    conn = await asyncpg.connect(
+        host=url.host, port=url.port, user=user, password=password, database=database
+    )
+    await conn.close()
+
+
+async def test_provisioned_databases_are_closed_to_other_tenants(
+    docker_runtime: DockerRuntime, worker_settings: WorkerSettings
+) -> None:
+    """PUBLIC holds nothing on a provisioned database, so no other role can even connect."""
+    a = make_spec(f"it-{uuid.uuid4().hex[:8]}")
+    b = make_spec(f"it-{uuid.uuid4().hex[:8]}")
+    try:
+        await docker_runtime.ensure_databases(a)
+        await docker_runtime.ensure_databases(b)
+        url = make_url(worker_settings.provisioner_database_url)
+        conn = await asyncpg.connect(
+            host=url.host,
+            port=url.port,
+            user=url.username,
+            password=url.password,
+            database=url.database,
+        )
+        try:
+            for spec in (a, b):
+                for db in (spec.db_name, spec.index_db_name):
+                    for privilege in ("CONNECT", "TEMPORARY"):
+                        granted = await conn.fetchval(
+                            "SELECT has_database_privilege('public', $1, $2)", db, privilege
+                        )
+                        assert granted is False, f"PUBLIC has {privilege} on {db}"
+        finally:
+            await conn.close()
+
+        # Each role reaches its own database...
+        await _connect_as(worker_settings, a.db_name, a.db_password, a.db_name)
+        await _connect_as(worker_settings, a.index_db_name, a.index_db_password, a.index_db_name)
+        # ...and nothing else: not the other tenant's, not its own index, not a sample tenant's.
+        for database in (b.db_name, b.index_db_name, a.index_db_name, "paperless_t1"):
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await _connect_as(worker_settings, a.db_name, a.db_password, database)
+    finally:
+        for spec in (a, b):
+            await drop_tenant_databases(
+                worker_settings.provisioner_database_url, spec.db_name, spec.index_db_name
+            )

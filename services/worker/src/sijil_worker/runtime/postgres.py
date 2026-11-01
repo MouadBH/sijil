@@ -64,7 +64,20 @@ async def _ensure_database(
                 await _run(conn, "CREATE DATABASE %I OWNER %I TEMPLATE %I", db, owner, template)
         except asyncpg.DuplicateDatabaseError:
             pass
-    await _run(conn, "REVOKE ALL ON DATABASE %I FROM PUBLIC", db)
+    # Only the owner can revoke PUBLIC's default CONNECT/TEMP: as the provisioner (no grant
+    # option) the REVOKE would be a silent no-op, leaving the database open to every tenant role.
+    await _run(conn, "SET ROLE %I", owner)
+    try:
+        await _run(conn, "REVOKE ALL ON DATABASE %I FROM PUBLIC", db)
+    finally:
+        await conn.execute("RESET ROLE")
+    still_open = await conn.fetchval(
+        "SELECT has_database_privilege('public', $1, 'CONNECT')"
+        " OR has_database_privilege('public', $1, 'TEMPORARY')",
+        db,
+    )
+    if still_open:
+        raise RuntimeError("PUBLIC still holds privileges on a tenant database")
 
 
 async def ensure_tenant_databases(provisioner_url: str, spec: TenantSpec) -> None:
