@@ -8,6 +8,7 @@ dependencies = [
   "celery[redis]>=5.4",
   "docker>=7.1",
   "asyncpg>=0.30",
+  "aiosmtpd>=1.4",
 ]
 
 [tool.uv.sources]
@@ -19,3 +20,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sijil_worker"]
+
+[project.scripts]
+sijil-smtp = "sijil_worker.smtp:main"

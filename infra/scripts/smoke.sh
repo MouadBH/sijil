@@ -148,4 +148,23 @@ ping_out=$(compose exec -T worker celery -A sijil_worker.main inspect ping --tim
 grep -q pong <<<"$ping_out" \
   && pass "worker answers celery ping" || fail "worker ping"
 
+# Inbound email: the SMTP receiver greets on its localhost-published port.
+banner=$(python3 - <<'PY' 2>/dev/null
+import socket
+try:
+    with socket.create_connection(("127.0.0.1", 2525), timeout=10) as s:
+        print(s.recv(256).decode().strip())
+except OSError:
+    print("")
+PY
+)
+case "$banner" in
+  220*) pass "smtp receiver greets on 127.0.0.1:2525" ;;
+  *) fail "smtp receiver banner (got '$banner')" ;;
+esac
+case "$(compose port smtp 2525 2>/dev/null)" in
+  127.0.0.1:*) pass "smtp published on localhost only" ;;
+  *) fail "smtp published beyond localhost" ;;
+esac
+
 if [ "$failures" -eq 0 ]; then echo "smoke: all checks passed"; else echo "smoke: $failures check(s) failed"; exit 1; fi

@@ -235,6 +235,22 @@ services:
       postgres: { condition: service_healthy }
       tessdata-init: { condition: service_completed_successfully }
 
+  smtp:
+    # Inbound email capture (CAP-1): archives mail per workspace address. No Docker socket and
+    # no tenant networks: it needs only the database, the object store and the broker.
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["sijil-smtp"]
+    environment: *worker-env
+    ports: ["127.0.0.1:2525:2525"]
+    networks: [core]
+    depends_on:
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
   beat:
     # Schedules the periodic tasks (re-attaching compose services to tenant networks).
     build:
