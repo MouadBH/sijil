@@ -3,9 +3,13 @@
 The ledger row is the state machine: `queued -> sending -> consumed | unsupported | failed`.
 Each step uses its own short database session, so no transaction is held open while waiting on
 the object store or Paperless. A transient failure puts the row back to `queued` with an error
-code and re-raises, so the caller can retry; once the caller will not retry, the row becomes
-`failed` and the failure is audited. `consumed` and `unsupported` are final: a redelivery of
-the task is a no-op.
+code and re-raises, so the caller can retry. When the caller's retries run out:
+- a transient cause (Paperless or the workspace unavailable, a consume task that does not finish
+  in time, the store or the database unreachable) is never final: the row goes back to `queued`
+  with a long delay (1 h, doubling per exhausted cycle up to 24 h), audited once per cycle as
+  `document.ingest_delayed`, and the requeue sweep sends it again when the delay is over;
+- any other cause makes the row `failed`, audited as `document.ingest_failed`.
+`consumed`, `unsupported` and `failed` are final: a redelivery of the task is a no-op.
 
 Paperless 3.4.1 does not refuse duplicates (it only flags them), so before uploading, ingest
 looks the file's SHA-256 up in Paperless and adopts the existing document. That makes a retry
@@ -21,11 +25,13 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import asyncpg
 from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import audit
@@ -62,6 +68,12 @@ POLL_TIMEOUT_S = 300.0
 POLL_INTERVAL_S = 2.0
 REQUEUE_AFTER = timedelta(minutes=10)
 REQUEUE_BATCH = 500
+# Celery retries a run this many times (the first run plus these make one cycle of attempts).
+INGEST_MAX_RETRIES = 8
+ATTEMPTS_PER_CYCLE = INGEST_MAX_RETRIES + 1
+# After a cycle runs out on a transient cause, the row waits this long, doubling per cycle.
+DELAY_FIRST = timedelta(hours=1)
+DELAY_MAX = timedelta(hours=24)
 # A claim older than this is abandoned (the worker died or hung): another run may take over.
 CLAIM_LEASE = timedelta(seconds=POLL_TIMEOUT_S) + timedelta(minutes=5)
 
@@ -104,6 +116,30 @@ class _Unsupported(Exception):  # noqa: N818
 
 def _never_retried(_exc: Exception) -> bool:
     return False
+
+
+def is_transient_cause(exc: BaseException) -> bool:
+    """A cause that goes away by itself: ingest never gives up on the document for it."""
+    if isinstance(exc, FileNotFoundError):
+        return False  # the original is gone from the store: waiting cannot bring it back
+    return isinstance(
+        exc,
+        PaperlessUnavailable  # down, 5xx, or a consume task not finished in time
+        | WorkspaceNotActive
+        | ClientError  # the object store (an absent object is FileNotFoundError, above)
+        | BotoCoreError
+        | OSError  # connection refused/reset, timeouts
+        | asyncpg.PostgresConnectionError
+        | asyncpg.CannotConnectNowError
+        | OperationalError,
+    )
+
+
+def delay_after(attempts: int, per_cycle: int = ATTEMPTS_PER_CYCLE) -> timedelta:
+    """The wait after the cycle that `attempts` (as counted on the row) ran out in."""
+    cycle = max(1, -(-attempts // per_cycle))
+    factor: int = 2 ** min(cycle - 1, 16)
+    return min(DELAY_FIRST * factor, DELAY_MAX)
 
 
 def error_code(exc: BaseException) -> str:
@@ -371,6 +407,7 @@ async def _settle(
     unsupported: bool = False,
     code: str | None = None,
     final: bool = True,
+    delayed: bool = False,
     retry_after_s: float = 0.0,
 ) -> None:
     """Record the outcome (and audit it) in one transaction.
@@ -402,6 +439,17 @@ async def _settle(
             ledger.ingest_error_code = UNSUPPORTED
             ledger.ingest_next_attempt_at = None
             action, data = "document.ingest_failed", {"code": UNSUPPORTED, "sha256": claim.sha256}
+        elif delayed:
+            # Retries ran out on a transient cause: keep the document in the pipeline.
+            next_at = now + delay_after(ledger.ingest_attempts)
+            ledger.ingest_state = IngestState.queued
+            ledger.ingest_error_code = code
+            ledger.ingest_next_attempt_at = next_at
+            action = "document.ingest_delayed"
+            data = {
+                "code": code,
+                "next_attempt_at": next_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            }
         elif final:
             ledger.ingest_state = IngestState.failed
             ledger.ingest_error_code = code
@@ -462,9 +510,15 @@ async def ingest_document(
         # Only a machine code is recorded; the exception carries no secrets by contract.
         code = error_code(exc)
         log.error("ingest of document %s failed: %s", ledger_id, code)
-        final = isinstance(exc, RegionMismatch) or not will_retry(exc)
+        retrying = not isinstance(exc, RegionMismatch) and will_retry(exc)
         await _settle(
-            sessions, ledger_id, claim, code=code, final=final, retry_after_s=retry_after_s
+            sessions,
+            ledger_id,
+            claim,
+            code=code,
+            final=not retrying,
+            delayed=not retrying and is_transient_cause(exc),
+            retry_after_s=retry_after_s,
         )
         raise
 
@@ -479,10 +533,12 @@ async def requeue_stuck_ingest(
 ) -> int:
     """Send `ingest_document` again for rows that nothing is working on.
 
-    Those are: `queued` for over `older_than` with no retry still pending (a lost broker
-    message, a failed enqueue, or a retry that never came), and `sending` whose lease expired
-    (a dead worker). Rows waiting on a Celery countdown are skipped. Safe to repeat: the claim
-    admits one run per row. Returns how many were sent.
+    Those are: `queued` for over `older_than` with no next attempt recorded (a lost broker
+    message or a failed enqueue); `queued` whose next attempt is over `older_than` past (a
+    Celery retry that never came, or the long delay after exhausted retries being over); and
+    `sending` whose lease expired (a dead worker). Rows waiting on a Celery countdown or a
+    delay are skipped. Safe to repeat: the claim admits one run per row. Returns how many were
+    sent.
     """
     at = now or utcnow()
     cutoff = at - older_than
@@ -494,9 +550,11 @@ async def requeue_stuck_ingest(
                     or_(
                         and_(
                             DocumentLedger.ingest_state == IngestState.queued,
-                            DocumentLedger.ingested_at < cutoff,
                             or_(
-                                DocumentLedger.ingest_next_attempt_at.is_(None),
+                                and_(
+                                    DocumentLedger.ingest_next_attempt_at.is_(None),
+                                    DocumentLedger.ingested_at < cutoff,
+                                ),
                                 DocumentLedger.ingest_next_attempt_at < cutoff,
                             ),
                         ),

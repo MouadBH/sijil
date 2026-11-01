@@ -22,9 +22,10 @@ from sijil_core.paperless import (
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_worker.drift import drift_check, enqueue_drift_checks
 from sijil_worker.ingest import (
+    INGEST_MAX_RETRIES,
     ConsumeFailed,
-    WorkspaceNotActive,
     ingest_document,
+    is_transient_cause,
     requeue_stuck_ingest,
 )
 from sijil_worker.provisioning import provision_workspace, record_failure
@@ -35,8 +36,8 @@ from sijil_worker.settings import WorkerSettings
 PROVISION_MAX_RETRIES = 3
 RETRY_BACKOFF_MAX_S = 600
 # Ingest outlasts a Paperless that is down for a while: 30 s, 1 min, 2 min ... capped at 15 min
-# (full jitter), eight times. After that the document is `failed` and audited.
-INGEST_MAX_RETRIES = 8
+# (full jitter), INGEST_MAX_RETRIES times. After that a transient cause waits hours and is sent
+# again by the requeue sweep (see sijil_worker.ingest); any other cause is `failed`.
 INGEST_BACKOFF_FACTOR_S = 30
 INGEST_BACKOFF_MAX_S = 900
 
@@ -58,14 +59,12 @@ def is_transient(exc: BaseException) -> bool:
 
 
 def is_ingest_transient(exc: BaseException) -> bool:
-    """Failures worth running ingest again for. Everything else settles the document."""
-    if isinstance(exc, FileNotFoundError):
-        return False  # the original is gone: retrying cannot bring it back
-    if isinstance(exc, PaperlessError):
-        return isinstance(exc, PaperlessUnavailable)  # 400/401/403/404 are final
-    if isinstance(exc, WorkspaceNotActive | ConsumeFailed | ClientError | BotoCoreError):
-        return True
-    return is_transient(exc)
+    """Failures worth a Celery retry. Paperless 400/401/403/404 and a missing original are not.
+
+    A consume failure is retried within the cycle (the next run resumes or re-uploads), but it
+    is not a transient cause: once the retries are spent, the document is `failed`.
+    """
+    return isinstance(exc, ConsumeFailed) or is_transient_cause(exc)
 
 
 @shared_task(name="sijil.ping")
@@ -212,7 +211,7 @@ async def _requeue() -> int:
 
 @shared_task(name="sijil.requeue_stuck_ingest")
 def requeue_stuck_ingest_task() -> int:
-    """Re-send ingest for rows still `queued` after 10 minutes (lost message, failed enqueue)."""
+    """Re-send ingest for rows nothing is working on (lost message, delay over, dead worker)."""
     return asyncio.run(_requeue())
 
 

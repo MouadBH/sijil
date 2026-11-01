@@ -37,6 +37,7 @@ from sijil_core.db.models import (
     TenantCredential,
     User,
     Workspace,
+    WorkspaceState,
 )
 from sijil_core.paperless import PaperlessClient, PaperlessDoc, PaperlessError
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
@@ -59,6 +60,8 @@ FILE_FIELD = b"file"
 # The whole body, not only the file part, is bounded: other parts and multipart framing get
 # 1 MiB of slack on top of the file limit.
 MAX_BODY_BYTES = ingest.MAX_UPLOAD_BYTES + 1024 * 1024
+# A provisioning workspace will be active soon (ingest waits for it); any other is refused.
+_ACCEPTS_UPLOADS = frozenset({WorkspaceState.provisioning, WorkspaceState.active})
 
 
 class UploadOut(BaseModel):
@@ -160,6 +163,9 @@ async def upload_document(
     org = await db.get(Organisation, workspace.org_id)
     if org is None:  # authorize already checked; keeps the type narrow
         raise ApiError("not_found", 404)
+    if workspace.state not in _ACCEPTS_UPLOADS:
+        # Nothing would ever ingest it: refuse before a byte is stored or locked.
+        raise ApiError("workspace.not_ready", 409)
     country, region = org.country, org.region
     user_id = str(user.id)
     # Hand the connection back before the (possibly long) body arrives; accept_file opens its

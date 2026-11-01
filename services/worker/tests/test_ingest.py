@@ -5,7 +5,7 @@ import hashlib
 import logging
 import uuid
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import UTC, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -311,7 +311,7 @@ async def test_ingest_retries_until_paperless_returns(
     assert row.paperless_doc_id == 7
 
 
-async def test_ingest_fails_when_retries_are_exhausted(
+async def test_exhausted_transient_retries_delay_instead_of_failing(
     db: AsyncSession,
     sessions: async_sessionmaker[AsyncSession],
     keys: LocalKeyService,
@@ -321,6 +321,7 @@ async def test_ingest_fails_when_retries_are_exhausted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    before = utcnow()
     with (
         caplog.at_level(logging.DEBUG),
         respx.mock(assert_all_called=False) as router,
@@ -329,12 +330,106 @@ async def test_ingest_fails_when_retries_are_exhausted(
         with pytest.raises(PaperlessUnavailable):
             await run(ledger, sessions, keys, memory_store, will_retry=False)
     row = await reload(db, ledger)
-    assert row.ingest_state is IngestState.failed
+    assert row.ingest_state is IngestState.queued  # never `failed` for a transient cause
     assert row.ingest_error_code == "ingest.paperless_unavailable"
+    assert row.ingest_claimed_at is None
+    assert row.ingest_next_attempt_at is not None
+    assert before + timedelta(minutes=59) < row.ingest_next_attempt_at
+    assert row.ingest_next_attempt_at < utcnow() + timedelta(minutes=61)
     (event,) = await events(db, ready)
-    assert event.action == "document.ingest_failed"
-    assert event.data == {"code": "ingest.paperless_unavailable", "sha256": PDF_SHA}
+    assert event.action == "document.ingest_delayed"
+    assert event.actor_type.value == "system"
+    assert event.target_id == str(ledger.id)
+    assert event.data == {
+        "code": "ingest.paperless_unavailable",
+        "next_attempt_at": row.ingest_next_attempt_at.astimezone(UTC)
+        .isoformat()
+        .replace("+00:00", "Z"),
+    }
     assert TOKEN not in caplog.text
+    assert (await audit.verify(db, ready.id)).ok
+
+
+@pytest.mark.parametrize(
+    ("attempts_before", "hours"),
+    [(0, 1), (9, 2), (18, 4), (27, 8), (36, 16), (45, 24), (900, 24)],
+)
+async def test_delay_doubles_per_exhausted_cycle_up_to_a_day(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    attempts_before: int,
+    hours: int,
+) -> None:
+    # One cycle is the first run plus INGEST_MAX_RETRIES Celery retries: 9 attempts.
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    ledger.ingest_attempts = attempts_before
+    await db.commit()
+    before = utcnow()
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/").respond(503)
+        with pytest.raises(PaperlessUnavailable):
+            await run(ledger, sessions, keys, memory_store, will_retry=False)
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.queued
+    assert row.ingest_next_attempt_at is not None
+    delay = timedelta(hours=hours)
+    assert before + delay - timedelta(minutes=1) < row.ingest_next_attempt_at
+    assert row.ingest_next_attempt_at < utcnow() + delay + timedelta(minutes=1)
+
+
+async def test_exhausted_inactive_workspace_is_delayed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    ready.state = WorkspaceState.hibernated
+    await db.commit()
+    with respx.mock(assert_all_called=False), pytest.raises(WorkspaceNotActive):
+        await run(ledger, sessions, keys, memory_store, will_retry=False)
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.queued
+    assert row.ingest_error_code == "ingest.workspace_not_active"
+    (event,) = await events(db, ready)
+    assert event.action == "document.ingest_delayed"
+
+
+async def test_exhausted_poll_timeout_is_delayed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    # Slow OCR: the document may already be in Paperless, so it must stay in the pipeline.
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/").respond(200, json={"results": []})
+        router.post(f"{URL}/api/documents/post_document/").respond(200, json=TASK_ID)
+        router.get(f"{URL}/api/tasks/").respond(200, json=task_row("started"))
+        with pytest.raises(PaperlessUnavailable):
+            await ingest_document(
+                ledger.id,
+                sessions=sessions,
+                keys=keys,
+                store=memory_store,
+                paperless=paperless,
+                poll_timeout_s=0.05,
+                poll_interval_s=0.01,
+                settings=SETTINGS,
+            )
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.queued
+    assert row.paperless_task_id == TASK_ID
+    assert [e.action for e in await events(db, ready)] == ["document.ingest_delayed"]
 
 
 async def test_ingest_redelivery_is_noop(
@@ -475,6 +570,7 @@ async def test_other_consume_failure_is_retried_then_failed(
         row = await reload(db, ledger)
         assert row.ingest_state is state
         assert row.ingest_error_code == "ingest.consume_failed"
+    assert [e.action for e in await events(db, ready)] == ["document.ingest_failed"]
 
 
 async def test_inactive_workspace_is_transient(
@@ -539,6 +635,9 @@ async def test_missing_original_is_final(
     row = await reload(db, ledger)
     assert row.ingest_state is IngestState.failed
     assert row.ingest_error_code == "ingest.original_missing"
+    (event,) = await events(db, ready)
+    assert event.action == "document.ingest_failed"
+    assert event.data == {"code": "ingest.original_missing", "sha256": PDF_SHA}
 
 
 @pytest.fixture
@@ -644,6 +743,26 @@ async def test_requeue_sweep_skips_rows_with_a_pending_retry(
     await db.commit()
     assert await requeue_stuck_ingest(sessions, enqueue) == 1
     assert enqueued == [(overdue.id, ready.id)]
+
+
+async def test_requeue_sweep_picks_a_delayed_row_once_it_is_due(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    enqueued: list[tuple[uuid.UUID, uuid.UUID]],
+    enqueue: Callable[[uuid.UUID, uuid.UUID], Any],
+) -> None:
+    now = utcnow()
+    due = await make_ledger(db, memory_store, ready, tmp_path, data=PDF + b"d", age=timedelta(0))
+    later = await make_ledger(db, memory_store, ready, tmp_path, data=PDF + b"l", age=timedelta(0))
+    due.ingest_next_attempt_at = now - timedelta(minutes=11)
+    later.ingest_next_attempt_at = now + timedelta(hours=1)
+    await db.commit()
+    # `due` arrived just now: its next-attempt time alone decides, not its arrival time.
+    assert await requeue_stuck_ingest(sessions, enqueue, now=now) == 1
+    assert enqueued == [(due.id, ready.id)]
 
 
 async def test_requeue_sweep_recovers_an_expired_sending_lease(

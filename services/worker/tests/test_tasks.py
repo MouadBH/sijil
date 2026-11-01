@@ -16,7 +16,7 @@ from sijil_core.paperless import PaperlessError, PaperlessForbidden, PaperlessUn
 from sijil_core.region import RegionMismatch
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
-from sijil_worker.ingest import ConsumeFailed, WorkspaceNotActive
+from sijil_worker.ingest import INGEST_MAX_RETRIES, ConsumeFailed, WorkspaceNotActive
 from sijil_worker.settings import WorkerSettings
 
 ARGS = ("00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002")
@@ -181,7 +181,7 @@ def test_ingest_is_retried_with_backoff_until_exhausted(
     )
     result = tasks.ingest_document_task.apply(kwargs=INGEST_KWARGS)
     assert isinstance(result.result, PaperlessUnavailable)
-    assert decisions == [True] * tasks.INGEST_MAX_RETRIES + [False]
+    assert decisions == [True] * INGEST_MAX_RETRIES + [False]
 
 
 def test_ingest_final_error_is_not_retried(

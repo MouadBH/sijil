@@ -30,6 +30,7 @@ from sijil_core.db.models import (
     Organisation,
     Role,
     Workspace,
+    WorkspaceState,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES
 from sijil_core.retention import provisional_retain_until, region_local_date
@@ -400,6 +401,37 @@ async def test_upload_accepted_when_tenant_unreachable(
     assert outbound.call_count == 0
     assert len(memory_store.puts) == 1
     assert len(enqueuer.ingests) == 1
+
+
+@pytest.mark.parametrize(
+    "state",
+    [WorkspaceState.error, WorkspaceState.hibernated, WorkspaceState.closing],
+)
+async def test_upload_into_unusable_workspace_is_refused(
+    uploader: Actor,
+    workspace: Workspace,
+    db: AsyncSession,
+    memory_store: MemoryObjectStore,
+    enqueuer: RecordingEnqueuer,
+    state: WorkspaceState,
+) -> None:
+    workspace.state = state
+    await db.commit()
+    r = await _upload(uploader, workspace, PDF)
+    assert r.status_code == 409
+    assert r.json() == {"error": {"code": "workspace.not_ready"}}
+    assert memory_store.puts == []
+    assert await _ledger(db, workspace) == []
+    assert enqueuer.ingests == []
+
+
+async def test_upload_into_provisioning_workspace_is_accepted(
+    uploader: Actor, workspace: Workspace, db: AsyncSession
+) -> None:
+    workspace.state = WorkspaceState.provisioning
+    await db.commit()
+    r = await _upload(uploader, workspace, PDF)
+    assert r.status_code == 202, r.text
 
 
 async def test_readonly_cannot_upload(
