@@ -93,3 +93,42 @@ def test_running_services_hold_the_app_key_not_the_root_key(
     root_secret = os.environ["SIJIL_OBJECTSTORE_SECRET_KEY"]  # this runner holds the root key
     assert env["SIJIL_OBJECTSTORE_ACCESS_KEY"] == os.environ["SIJIL_OBJECTSTORE_APP_ACCESS_KEY"]
     assert root_secret not in env.values()
+    # The sealing key is the control plane's alone.
+    seal_secret = os.environ["SIJIL_OBJECTSTORE_SEAL_SECRET_KEY"]
+    assert (seal_secret in env.values()) is (service == "control-plane")
+
+
+@pytest.fixture
+def sealer() -> S3ObjectStore:
+    settings = StorageSettings()  # type: ignore[call-arg]
+    settings.objectstore_access_key = SecretStr(os.environ["SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY"])
+    settings.objectstore_secret_key = SecretStr(os.environ["SIJIL_OBJECTSTORE_SEAL_SECRET_KEY"])
+    return S3ObjectStore(settings)
+
+
+async def test_seal_credential_seals_but_never_reads_writes_or_destroys(
+    app: S3ObjectStore, sealer: S3ObjectStore, root: S3ObjectStore, tmp_path: Path
+) -> None:
+    """The control plane's sealing key switches an original to COMPLIANCE (the app key cannot,
+    see above), and can do nothing else to it: no bytes in or out, no delete even with the
+    bypass flag, no legal hold."""
+    path = tmp_path / "original"
+    path.write_bytes(b"sealing " + uuid.uuid4().bytes)
+    ref = await app.put_original(
+        f"it-{uuid.uuid4().hex}/{uuid.uuid4().hex}", path, date.today() + timedelta(days=1)
+    )
+    target = {"Bucket": sealer.bucket, "Key": ref.key, "VersionId": ref.version_id}
+    _denied(lambda: sealer.client.get_object(**target))
+    _denied(lambda: sealer.client.put_object(Bucket=sealer.bucket, Key=ref.key, Body=b"x"))
+    _denied(lambda: sealer.client.delete_object(**target, BypassGovernanceRetention=True))
+    _denied(lambda: sealer.client.put_object_legal_hold(**target, LegalHold={"Status": "ON"}))
+
+    final = date.today() + timedelta(days=2)
+    await sealer.seal(ref, final)
+    retention = root.client.get_object_retention(**target)["Retention"]
+    assert retention["Mode"] == "COMPLIANCE"
+    assert retention["RetainUntilDate"].date() == final
+    await sealer.seal(ref, final)  # idempotent: a retried seal changes nothing
+    _denied(lambda: sealer.client.delete_object(**target, BypassGovernanceRetention=True))
+    _denied(lambda: root.client.delete_object(**target, BypassGovernanceRetention=True))
+    assert await root.head(ref) == path.stat().st_size

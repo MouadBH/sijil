@@ -45,6 +45,7 @@ from sijil_worker.ingest import (
     is_transient_cause,
     requeue_stuck_ingest,
 )
+from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
 from sijil_worker.reconcile import reconcile_tenants
@@ -521,3 +522,56 @@ async def _drift_all() -> int:
 def drift_check_all_task() -> int:
     """Nightly: fan out one drift check per active workspace of this region."""
     return asyncio.run(_drift_all())
+
+
+# Mirror of a sealed document's fields into its Paperless: 30 s, 1 min ... capped at 15 min,
+# MIRROR_MAX_RETRIES times. Paperless keeps a copy only; the sealed record is ours already.
+MIRROR_MAX_RETRIES = 8
+MIRROR_BACKOFF_FACTOR_S = 30
+MIRROR_BACKOFF_MAX_S = 900
+
+
+def is_mirror_transient(exc: BaseException) -> bool:
+    """Paperless or a database down or slow, or the workspace paused."""
+    return isinstance(exc, WorkspaceNotActive) or is_transient(exc)
+
+
+async def _mirror(ledger_id: str, workspace_id: str) -> None:
+    # The main worker: its settings carry the index database's host and the master key.
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        await mirror_fields(
+            UUID(ledger_id),
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.mirror_fields", queue="default", max_retries=MIRROR_MAX_RETRIES)
+def mirror_fields_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A sealed document's fields as custom fields in its Paperless (see sijil_worker.mirror)."""
+    try:
+        asyncio.run(_mirror(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if not is_mirror_transient(exc) or retries >= MIRROR_MAX_RETRIES:
+            raise
+        countdown = get_exponential_backoff_interval(
+            factor=MIRROR_BACKOFF_FACTOR_S,
+            retries=retries,
+            maximum=MIRROR_BACKOFF_MAX_S,
+            full_jitter=True,
+        )
+        raise self.retry(exc=exc, countdown=countdown) from exc

@@ -5,7 +5,7 @@ Errors never carry credentials or response bodies: only the method, path and sta
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -441,6 +441,70 @@ class PaperlessClient:
             return int(created.json()["id"])
         except (ValueError, KeyError, TypeError):
             raise PaperlessBadResponse("POST /api/document_types/: unexpected body") from None
+
+    async def _custom_field_id(self, name: str) -> int | None:
+        response = await self._request(
+            "GET", "/api/custom_fields/", params={"name__iexact": name, "page_size": 100}
+        )
+        try:
+            ids = [
+                int(r["id"])
+                for r in response.json()["results"]
+                if str(r["name"]).casefold() == name.casefold()
+            ]
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("GET /api/custom_fields/: unexpected body") from None
+        return min(ids) if ids else None
+
+    async def ensure_custom_field(self, name: str, data_type: str) -> int:
+        """The id of the custom field called `name` (case-insensitive), created with `data_type`
+        (`string`, `date`, `monetary`, `boolean` ...) if missing. An existing field is reused
+        as it is. Race-safe like `ensure_document_type`."""
+        existing = await self._custom_field_id(name)
+        if existing is not None:
+            return existing
+        try:
+            created = await self._request(
+                "POST", "/api/custom_fields/", json={"name": name, "data_type": data_type}
+            )
+        except PaperlessError as exc:
+            if isinstance(exc, PaperlessUnavailable):
+                raise
+            winner = await self._custom_field_id(name)
+            if winner is None:
+                raise
+            return winner
+        try:
+            return int(created.json()["id"])
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("POST /api/custom_fields/: unexpected body") from None
+
+    async def set_custom_fields(
+        self,
+        doc_id: int,
+        values: Mapping[int, str | bool | None],
+        *,
+        document_type: int | None = None,
+    ) -> None:
+        """Sets these custom field values (`{field id: value}`) on the document, and its type if
+        given. A PATCH of `custom_fields` replaces the document's whole list, so the document's
+        other custom fields are read first and sent back unchanged."""
+        response = await self._request(
+            "GET", f"/api/documents/{doc_id}/", params={"fields": "id,custom_fields"}
+        )
+        try:
+            current = {
+                int(f["field"]): f.get("value") for f in response.json().get("custom_fields") or []
+            }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise PaperlessBadResponse("GET /api/documents/{id}/: unexpected body") from None
+        merged = {**current, **values}
+        body: dict[str, Any] = {
+            "custom_fields": [{"field": field, "value": value} for field, value in merged.items()]
+        }
+        if document_type is not None:
+            body["document_type"] = document_type
+        await self._request("PATCH", f"/api/documents/{doc_id}/", json=body)
 
     async def set_title_and_type(self, doc_id: int, title: str, document_type_id: int) -> None:
         await self._request(

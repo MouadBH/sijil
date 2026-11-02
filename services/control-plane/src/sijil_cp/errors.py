@@ -21,10 +21,14 @@ _HTTP_CODES = {
 
 
 class ApiError(Exception):
-    def __init__(self, code: str, status: int) -> None:
+    """A machine code and its status. `body` keys sit next to `error` in the response, like
+    `document_id` of `document.duplicate` (e.g. `{"error": {...}, "field": "total_ttc"}`)."""
+
+    def __init__(self, code: str, status: int, body: dict[str, object] | None = None) -> None:
         super().__init__(code)
         self.code = code
         self.status = status
+        self.body = body or {}
 
 
 def error_response(code: str, status: int, **extra: object) -> JSONResponse:
@@ -33,6 +37,8 @@ def error_response(code: str, status: int, **extra: object) -> JSONResponse:
 
 async def _api_error(_: Request, exc: Exception) -> JSONResponse:
     exc = cast(ApiError, exc)
+    if exc.body:
+        return JSONResponse({"error": {"code": exc.code}, **exc.body}, status_code=exc.status)
     return error_response(exc.code, exc.status)
 
 

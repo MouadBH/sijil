@@ -1,12 +1,15 @@
+import hashlib
 from datetime import date
 from decimal import Decimal
 
 import pytest
 
+from sijil_core.audit import canonical_json
 from sijil_core.fields import (
     DOCUMENT_TYPES,
     FIELD_NAMES,
     REQUIRED_BY_TYPE,
+    fields_digest,
     normalise_ice,
     parse_amount,
     parse_currency,
@@ -126,3 +129,20 @@ def test_parse_field_canonical_strings() -> None:
     assert parse_field("number", None) is None
     with pytest.raises(KeyError):
         parse_field("nope", "x")
+
+
+def test_fields_digest_is_canonical_json_of_every_field_and_the_type() -> None:
+    values = {"number": "F-1", "total_ttc": "1500.00", "unknown": "ignored"}
+    expected = hashlib.sha256(
+        canonical_json(
+            {
+                "fields": {name: values.get(name) for name in FIELD_NAMES},
+                "document_type": "invoice",
+            }
+        )
+    ).hexdigest()
+    assert fields_digest(values, document_type="invoice") == expected
+    # A missing name is a null: absent and explicit null hash the same.
+    assert fields_digest({**values, "vat": None}, document_type="invoice") == expected
+    assert fields_digest(values, document_type="receipt") != expected
+    assert fields_digest({**values, "number": "F-2"}, document_type="invoice") != expected

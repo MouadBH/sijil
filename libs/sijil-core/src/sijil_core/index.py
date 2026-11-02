@@ -251,7 +251,8 @@ async def update_fields(
     updated_by: UUID | None,
     now: datetime,
 ) -> FieldsRow:
-    """Merges only the given names. A user edit pins its confidence at 1.0."""
+    """Merges only the given names. A user edit pins its confidence at 1.0. A `document_type`
+    among them also moves the `document_type` column, so the two never disagree."""
     names = list(values)
     confidence = dict.fromkeys(names, 1.0) if source == "user" else {}
     try:
@@ -259,6 +260,10 @@ async def update_fields(
             text(
                 f"""
                 UPDATE document_fields SET
+                    document_type = CASE
+                        WHEN CAST(:values AS jsonb) -> 'document_type' IS NOT NULL
+                        THEN CAST(:values AS jsonb) ->> 'document_type'
+                        ELSE document_type END,
                     "values" = "values" || CAST(:values AS jsonb),
                     source = source || CAST(:source AS jsonb),
                     confidence = confidence || CAST(:confidence AS jsonb),

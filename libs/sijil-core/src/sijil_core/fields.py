@@ -1,11 +1,13 @@
 """Parsers that turn model-copied field values into canonical strings. Pure functions."""
 
+import hashlib
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date
 from decimal import Decimal, InvalidOperation
 
+from sijil_core.audit import canonical_json
 from sijil_core.text import normalise
 
 DOCUMENT_TYPES: tuple[str, ...] = (
@@ -303,3 +305,17 @@ _PARSERS: dict[str, Callable[[str | None], str | None]] = {
 def parse_field(name: str, raw: str | None) -> str | None:
     """Canonical string for storage, or None. Raises KeyError for an unknown field name."""
     return _PARSERS[name](raw)
+
+
+# --- the sealed hash ----------------------------------------------------------------------
+
+
+def fields_digest(values: Mapping[str, str | None], *, document_type: str | None) -> str:
+    """`fields_sha256`: SHA-256 of the canonical JSON of every field (a missing one is null) and
+    the document type. Sealing stores it on the ledger; exports recompute it to prove the
+    values are the sealed ones. Names outside FIELD_NAMES are ignored."""
+    payload = {
+        "fields": {name: values.get(name) for name in FIELD_NAMES},
+        "document_type": document_type,
+    }
+    return hashlib.sha256(canonical_json(payload)).hexdigest()

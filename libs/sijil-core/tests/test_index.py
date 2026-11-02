@@ -282,6 +282,24 @@ async def test_update_fields_merges_and_marks_user(conn: AsyncConnection) -> Non
     assert await index.read_fields(conn, fields.ledger_id) == updated
 
 
+async def test_update_fields_document_type_moves_the_column_too(conn: AsyncConnection) -> None:
+    fields = row(document_type="invoice", number="F-1")
+    await index.write_extraction(conn, fields)
+    updated = await index.update_fields(
+        conn, fields.ledger_id, {"document_type": "receipt"}, source="user", updated_by=None,
+        now=NOW,
+    )  # fmt: skip
+    assert (updated.document_type, updated.values["document_type"]) == ("receipt", "receipt")
+    kept = await index.update_fields(
+        conn, fields.ledger_id, {"number": "F-2"}, source="user", updated_by=None, now=NOW
+    )
+    assert kept.document_type == "receipt"
+    cleared = await index.update_fields(
+        conn, fields.ledger_id, {"document_type": None}, source="user", updated_by=None, now=NOW
+    )
+    assert cleared.document_type is None
+
+
 async def test_update_fields_extraction_source_keeps_confidence(conn: AsyncConnection) -> None:
     fields = row(number="F-1")
     await index.write_extraction(conn, fields)
@@ -346,7 +364,8 @@ async def test_find_possible_duplicates_matches_number_ice_ttc(conn: AsyncConnec
     me, twin = row(**base), row(**base)
     other_number = row(**{**base, "number": "F-78"})
     other_total = row(**{**base, "total_ttc": "121.00"})
-    other_ice = row(**{**base, "supplier_ice": "0" + ice[1:]})
+    # Another first digit (a bare "0" + ice[1:] is the same ICE one time in ten).
+    other_ice = row(**{**base, "supplier_ice": ("1" if ice[0] == "0" else "0") + ice[1:]})
     for r in (me, twin, other_number, other_total, other_ice):
         await index.write_extraction(conn, r)
     found = await index.find_possible_duplicates(conn, me.ledger_id, "F-77", ice, "120.00")

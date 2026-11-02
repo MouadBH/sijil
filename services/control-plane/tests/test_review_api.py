@@ -1,0 +1,672 @@
+"""Review queue, field edits and sealing (REC-4, design §5.4).
+
+The index is a throw-away database reached through a real `IndexEngines`; the object store is
+the in-memory double with the bucket's lock semantics.
+"""
+
+import asyncio
+import json
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import UTC, date, datetime
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import pytest
+from fastapi import FastAPI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
+
+from sijil_core import index
+from sijil_core.db.models import (
+    AuditEvent,
+    DocumentLedger,
+    DocumentState,
+    Membership,
+    Role,
+    Workspace,
+)
+from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest
+from sijil_cp.api import review
+from tests.support.index_db import throwaway_index_db
+from tests.support.memory_store import MemoryObjectStore
+from tests.support.sealing import (
+    ARRIVAL,
+    INVOICE,
+    PROVISIONAL,
+    add_document,
+    add_index_credential,
+    engines_on,
+    stored,
+)
+
+Actor = Any
+MakeActor = Callable[[str], Awaitable[Actor]]
+
+pytestmark = pytest.mark.db
+
+
+@pytest.fixture(scope="module")
+def index_db_url() -> Iterator[str]:
+    # Shared by the module: rows cannot be deleted, so every test uses fresh ledger ids.
+    yield from throwaway_index_db()
+
+
+@pytest.fixture
+async def index_conn(index_db_url: str) -> AsyncIterator[AsyncConnection]:
+    engine = create_async_engine(index_db_url, isolation_level="AUTOCOMMIT")
+    async with engine.connect() as conn:
+        await index.ensure_schema(conn)
+        yield conn
+    await engine.dispose()
+
+
+@pytest.fixture
+async def ws(
+    db: AsyncSession, workspace: Workspace, cp_app: FastAPI, index_db_url: str
+) -> AsyncIterator[Workspace]:
+    await add_index_credential(db, cp_app, workspace)
+    engines = engines_on(cp_app, index_db_url)
+    cp_app.state.index = engines
+    yield workspace
+    await engines.aclose()
+
+
+async def _member(make_actor: MakeActor, db: AsyncSession, ws: Workspace, role: Role) -> Actor:
+    actor = await make_actor(f"{role.value}-{uuid.uuid4().hex[:6]}@example.com")
+    db.add(Membership(user_id=actor.user_id, workspace_id=ws.id, role=role))
+    await db.commit()
+    return actor
+
+
+@pytest.fixture
+async def member(make_actor: MakeActor, db: AsyncSession, ws: Workspace) -> Actor:
+    return await _member(make_actor, db, ws, Role.member)
+
+
+@pytest.fixture
+async def reader(make_actor: MakeActor, db: AsyncSession, ws: Workspace) -> Actor:
+    return await _member(make_actor, db, ws, Role.readonly)
+
+
+def _url(ws: Workspace, suffix: str) -> str:
+    return f"/v1/workspaces/{ws.id}{suffix}"
+
+
+async def _events(db: AsyncSession, ws: Workspace, action: str | None = None) -> list[AuditEvent]:
+    query = select(AuditEvent).where(AuditEvent.workspace_id == ws.id)
+    if action is not None:
+        query = query.where(AuditEvent.action == action)
+    rows = await db.scalars(
+        query.order_by(AuditEvent.seq).execution_options(populate_existing=True)
+    )
+    return list(rows)
+
+
+async def _ledger(db: AsyncSession, row: DocumentLedger) -> DocumentLedger:
+    found = await db.scalar(
+        select(DocumentLedger)
+        .where(DocumentLedger.id == row.id)
+        .execution_options(populate_existing=True)
+    )
+    assert found is not None
+    return found
+
+
+def _code(r: Any) -> str:
+    return str(r.json()["error"]["code"])
+
+
+# Review queue --------------------------------------------------------------------------------
+
+
+async def test_review_lists_needs_review_only(
+    member: Actor,
+    ws: Workspace,
+    db: AsyncSession,
+    memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:
+    later = datetime(2026, 10, 3, tzinfo=UTC)
+    second = await add_document(
+        db, memory_store, index_conn, ws, state=DocumentState.needs_review, ingested_at=later,
+        values={**INVOICE, "total_ttc": None}, flags=("low_confidence",),
+    )  # fmt: skip
+    first = await add_document(
+        db, memory_store, index_conn, ws, state=DocumentState.needs_review, ingested_at=ARRIVAL
+    )
+    await add_document(db, memory_store, index_conn, ws, state=DocumentState.filed)
+    await add_document(db, memory_store, index_conn, ws, state=DocumentState.received)
+
+    r = await member.client.get(_url(ws, "/review"), params={"limit": 1})
+    assert r.status_code == 200, r.text
+    page = r.json()
+    assert [i["id"] for i in page["items"]] == [str(first.id)]  # oldest first
+    assert page["next_cursor"]
+    r = await member.client.get(_url(ws, "/review"), params={"cursor": page["next_cursor"]})
+    rest = r.json()
+    assert [i["id"] for i in rest["items"]] == [str(second.id)]
+    assert rest["next_cursor"] is None
+
+    item = rest["items"][0]
+    assert set(item) == {"id", "state", "document_type", "fields", "flags", "required"}
+    assert item["state"] == "needs_review"
+    assert item["document_type"] == "invoice"
+    assert item["flags"] == ["low_confidence"]
+    assert item["required"] == sorted(REQUIRED_BY_TYPE["invoice"])
+    assert set(item["fields"]) == set(FIELD_NAMES)
+    assert item["fields"]["total_ht"] == {
+        "value": "1250.00",
+        "confidence": 0.95,
+        "source": "extraction",
+    }
+    assert item["fields"]["total_ttc"]["value"] is None
+
+    listed = await _events(db, ws, "review.listed")
+    assert [e.data for e in listed] == [{"count": 1}, {"count": 1}]
+    assert listed[0].actor_id == str(member.user_id)
+
+
+async def test_review_and_edits_need_the_review_permission(
+    reader: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    assert (await reader.client.get(_url(ws, "/review"))).status_code == 403
+    r = await reader.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"number": "X"}}
+    )
+    assert r.status_code == 403
+    # Reading the fields is a plain read.
+    r = await reader.client.get(_url(ws, f"/documents/{row.id}/fields"))
+    assert r.status_code == 200
+
+
+async def test_get_fields_has_seal_columns_and_is_audited(
+    reader: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await reader.client.get(_url(ws, f"/documents/{row.id}/fields"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["sealed_at"], body["fields_sha256"]) == (None, None)
+    assert body["fields"]["number"]["value"] == INVOICE["number"]
+    [viewed] = await _events(db, ws, "document.viewed")
+    assert (viewed.target_type, viewed.target_id) == ("document", str(row.id))
+    assert viewed.data == {}
+    r = await reader.client.get(_url(ws, f"/documents/{uuid.uuid4()}/fields"))
+    assert (r.status_code, _code(r)) == (404, "document.not_found")
+
+
+# Field edits ---------------------------------------------------------------------------------
+
+
+async def test_patch_audit_names_only(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"),
+        json={"fields": {"total_ttc": "1 600,00 DH", "number": "F-SAMPLE-9", "vat_rate": None}},
+    )
+    assert r.status_code == 200, r.text
+    fields = r.json()["fields"]
+    assert fields["total_ttc"] == {"value": "1600.00", "confidence": 1.0, "source": "user"}
+    assert fields["number"]["value"] == "F-SAMPLE-9"
+    assert fields["vat_rate"] == {"value": None, "confidence": 1.0, "source": "user"}
+    assert fields["total_ht"]["source"] == "extraction"
+    stored_row = await index.read_fields(index_conn, row.id)
+    assert stored_row is not None
+    assert stored_row.values["total_ttc"] == "1600.00"
+    assert stored_row.updated_by == member.user_id
+
+    [edited] = await _events(db, ws, "document.fields_edited")
+    assert edited.data == {"fields": "number,total_ttc,vat_rate"}
+    assert (edited.target_type, edited.target_id) == ("document", str(row.id))
+    dumped = json.dumps([e.data for e in await _events(db, ws)])
+    for value in ("1600", "1 600", "F-SAMPLE-9"):
+        assert value not in dumped
+
+
+async def test_patch_invalid_amount_422_field_invalid(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    url = _url(ws, f"/documents/{row.id}/fields")
+    r = await member.client.patch(url, json={"fields": {"number": "F-2", "total_ttc": "abc"}})
+    assert r.status_code == 422
+    assert r.json() == {"error": {"code": "field.invalid"}, "field": "total_ttc"}
+    r = await member.client.patch(url, json={"fields": {"colour": "red"}})
+    assert r.status_code == 422
+    assert r.json() == {"error": {"code": "field.unknown"}, "field": "colour"}
+    r = await member.client.patch(url, json={"fields": {"document_type": "poem"}})
+    assert r.json() == {"error": {"code": "field.invalid"}, "field": "document_type"}
+    # Nothing was written, nothing audited.
+    stored_row = await index.read_fields(index_conn, row.id)
+    assert stored_row is not None
+    assert stored_row.values["number"] == INVOICE["number"]
+    assert await _events(db, ws, "document.fields_edited") == []
+
+
+async def test_patch_document_type_changes_the_required_set(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"document_type": "contract"}}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["document_type"] == "contract"
+    assert r.json()["required"] == sorted(REQUIRED_BY_TYPE["contract"])
+
+
+async def test_patch_received_409_not_reviewable(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.received)
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"number": "F-2"}}
+    )
+    assert (r.status_code, _code(r)) == (409, "document.not_reviewable")
+
+
+async def test_patch_after_seal_409_retention_locked(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+    assert (await member.client.post(_url(ws, f"/documents/{row.id}/seal"))).status_code == 200
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"total_ttc": "1.00"}}
+    )
+    assert (r.status_code, _code(r)) == (409, "retention.locked")
+    stored_row = await index.read_fields(index_conn, row.id)
+    assert stored_row is not None
+    assert stored_row.values["total_ttc"] == INVOICE["total_ttc"]
+    assert await _events(db, ws, "document.fields_edited") == []
+
+
+async def test_patch_refused_by_the_index_trigger_is_409(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """The index row is frozen but the ledger not yet (a seal that failed half-way): the
+    trigger's refusal is answered as `retention.locked` too."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    await index.seal_fields(index_conn, row.id, fields_sha256="a" * 64, sealed_at=ARRIVAL)
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"number": "F-2"}}
+    )
+    assert (r.status_code, _code(r)) == (409, "retention.locked")
+
+
+# Sealing -------------------------------------------------------------------------------------
+
+
+async def test_seal_freezes_fields(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    digest = fields_digest(INVOICE, document_type="invoice")
+    assert body["state"] == "sealed"
+    assert body["fields_sha256"] == digest
+    assert body["sealed_at"] is not None
+
+    frozen = await index.read_fields(index_conn, row.id)
+    assert frozen is not None
+    assert frozen.fields_sha256 == digest
+    ledger = await _ledger(db, row)
+    assert ledger.state is DocumentState.sealed
+    assert ledger.fields_sha256 == digest
+    assert ledger.sealed_at == frozen.sealed_at
+    assert ledger.sealed_by == member.user_id
+    assert ledger.retention_until == PROVISIONAL
+    assert stored(memory_store, row).mode == "COMPLIANCE"
+    assert stored(memory_store, row).retain_until == PROVISIONAL
+
+    [sealed] = await _events(db, ws, "document.sealed")
+    assert sealed.data == {"fields_sha256": digest, "retention_until": "2036-12-31"}
+    assert (sealed.target_id, sealed.actor_id) == (str(row.id), str(member.user_id))
+    assert enqueuer.mirrors == [(row.id, ws.id)]
+
+    # No re-seal.
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert (r.status_code, _code(r)) == (409, "retention.locked")
+    assert len(await _events(db, ws, "document.sealed")) == 1
+
+
+async def test_seal_needs_review_document(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert (await _ledger(db, row)).state is DocumentState.sealed
+
+
+async def test_seal_received_409_not_reviewable(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.received)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert (r.status_code, _code(r)) == (409, "document.not_reviewable")
+    assert stored(memory_store, row).mode == "GOVERNANCE"
+
+
+async def test_readonly_cannot_seal(
+    reader: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await reader.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert (r.status_code, _code(r)) == (403, "forbidden")
+    r = await reader.client.post(_url(ws, "/seal-batch"), json={"month": "2026-10"})
+    assert r.status_code == 403
+    assert (await _ledger(db, row)).state is DocumentState.filed
+    assert stored(memory_store, row).mode == "GOVERNANCE"
+
+
+async def test_member_can_seal(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert (await _ledger(db, row)).sealed_by == member.user_id
+
+
+async def test_seal_requires_required_fields(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(
+        db, memory_store, index_conn, ws,
+        values={**INVOICE, "supplier_ice": None, "total_ttc": None, "vat_rate": None},
+    )  # fmt: skip
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 422
+    # vat_rate is optional: it never blocks.
+    assert r.json() == {
+        "error": {"code": "seal.fields_incomplete"},
+        "fields": ["supplier_ice", "total_ttc"],
+    }
+    untyped = await add_document(
+        db, memory_store, index_conn, ws, values={"date": "2026-09-30"}, document_type=None
+    )
+    r = await member.client.post(_url(ws, f"/documents/{untyped.id}/seal"))
+    assert r.status_code == 422
+    assert r.json()["fields"] == sorted(REQUIRED_BY_TYPE["invoice"] - {"date"})
+    # Nothing moved anywhere.
+    for doc in (row, untyped):
+        assert (await _ledger(db, doc)).state is DocumentState.filed
+        assert stored(memory_store, doc).mode == "GOVERNANCE"
+        fields = await index.read_fields(index_conn, doc.id)
+        assert fields is not None and fields.sealed_at is None
+    assert await _events(db, ws, "document.sealed") == []
+
+
+async def test_seal_other_type_needs_only_type_and_date(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await add_document(
+        db, memory_store, index_conn, ws,
+        values={"document_type": "contract", "date": "2026-09-30"}, document_type="contract",
+    )  # fmt: skip
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert r.json()["document_type"] == "contract"
+
+
+@pytest.mark.parametrize(
+    ("provisional", "doc_date", "final"),
+    [
+        # The document's fiscal year raises it.
+        (date(2035, 12, 31), "2026-09-30", date(2036, 12, 31)),
+        # An earlier fiscal year never lowers it (ruling P1).
+        (PROVISIONAL, "2024-03-15", PROVISIONAL),
+        # A longer existing retention stays.
+        (date(2040, 12, 31), "2026-09-30", date(2040, 12, 31)),
+    ],
+)
+async def test_seal_retention_is_max_of_provisional_and_doc_date(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, provisional: date, doc_date: str, final: date,
+) -> None:  # fmt: skip
+    row = await add_document(
+        db, memory_store, index_conn, ws, retention_until=provisional,
+        values={**INVOICE, "date": doc_date},
+    )  # fmt: skip
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert (await _ledger(db, row)).retention_until == final
+    assert stored(memory_store, row).retain_until == final
+    assert stored(memory_store, row).mode == "COMPLIANCE"
+    [sealed] = await _events(db, ws, "document.sealed")
+    assert sealed.data["retention_until"] == final.isoformat()
+
+
+async def test_seal_future_date_never_adds_years_of_lock(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, clock: Any,
+) -> None:  # fmt: skip
+    """A COMPLIANCE lock can never be shortened: a mistyped future year is capped at today."""
+    row = await add_document(
+        db, memory_store, index_conn, ws, values={**INVOICE, "date": "2099-01-01"}
+    )
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    today_year = clock.now.year
+    expected = max(PROVISIONAL, date(today_year + 10, 12, 31))
+    assert (await _ledger(db, row)).retention_until == expected
+
+
+async def test_seal_retry_after_partial_failure(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Review Focus 4: the object is locked and the index frozen, then the ledger commit fails.
+    Calling seal again completes it exactly once."""
+    row = await add_document(db, memory_store, index_conn, ws, retention_until=date(2035, 12, 31))
+    real_commit = AsyncSession.commit
+    failed: list[bool] = []
+
+    async def commit_failing_once(self: AsyncSession) -> None:
+        # The ledger row is flushed by then (the audit append autoflushes): look at what the
+        # session holds, not at what is still dirty.
+        sealing = any(
+            isinstance(o, DocumentLedger) and o.state is DocumentState.sealed
+            for o in self.identity_map.values()
+        )
+        if sealing and not failed:
+            failed.append(True)
+            raise ConnectionResetError("injected: the ledger commit fails")
+        await real_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_failing_once)
+    with pytest.raises(ConnectionResetError):
+        await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert failed == [True]
+    # Half-way: the object is locked and the index frozen, the ledger is not sealed.
+    assert stored(memory_store, row).mode == "COMPLIANCE"
+    frozen = await index.read_fields(index_conn, row.id)
+    assert frozen is not None and frozen.sealed_at is not None
+    assert (await _ledger(db, row)).state is DocumentState.filed
+    assert await _events(db, ws, "document.sealed") == []
+    assert enqueuer.mirrors == []
+
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    ledger = await _ledger(db, row)
+    assert ledger.state is DocumentState.sealed
+    assert ledger.sealed_at == frozen.sealed_at  # the index's stored value is reused
+    assert ledger.fields_sha256 == frozen.fields_sha256
+    assert ledger.retention_until == date(2036, 12, 31)
+    assert len(await _events(db, ws, "document.sealed")) == 1
+    assert enqueuer.mirrors == [(row.id, ws.id)]
+
+
+async def test_seal_enqueues_mirror_after_commit(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, migrated_db: Any,
+) -> None:  # fmt: skip
+    """When the mirror task is sent, the sealed ledger row is already committed (a separate
+    connection sees it)."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    loop = asyncio.get_running_loop()
+    observer = create_async_engine(migrated_db.app_url)
+    seen: list[str] = []
+
+    async def state_now() -> str:
+        async with observer.connect() as conn:
+            found = await conn.scalar(
+                select(DocumentLedger.state).where(DocumentLedger.id == row.id)
+            )
+            return str(found)
+
+    def send_mirror(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        # Runs in a thread (asyncio.to_thread): ask the event loop to look at the database.
+        seen.append(asyncio.run_coroutine_threadsafe(state_now(), loop).result(timeout=10))
+        enqueuer.mirrors.append((ledger_id, workspace_id))
+
+    enqueuer.send_mirror = send_mirror
+    try:
+        r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    finally:
+        await observer.dispose()
+    assert r.status_code == 200, r.text
+    assert seen == ["sealed"]
+    assert enqueuer.mirrors == [(row.id, ws.id)]
+
+
+async def test_seal_survives_a_failed_mirror_enqueue(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """The seal is committed: a broker that is down only delays Paperless's copy."""
+    row = await add_document(db, memory_store, index_conn, ws)
+
+    def broken(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        raise ConnectionRefusedError("broker down")
+
+    enqueuer.send_mirror = broken
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert (await _ledger(db, row)).state is DocumentState.sealed
+
+
+# Batch seal ----------------------------------------------------------------------------------
+
+
+async def test_batch_seal_one_audit_event_per_document(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    # The month is Casablanca's civil month, whatever its UTC offset then (tzdata decides).
+    local = ZoneInfo("Africa/Casablanca")
+    october = [
+        datetime(2026, 10, 1, 0, 30, tzinfo=local).astimezone(UTC),
+        datetime(2026, 10, 10, 9, 0, tzinfo=local).astimezone(UTC),
+        datetime(2026, 10, 31, 23, 30, tzinfo=local).astimezone(UTC),
+    ]
+    filed = [await add_document(db, memory_store, index_conn, ws, ingested_at=at) for at in october]
+    incomplete = await add_document(
+        db, memory_store, index_conn, ws, ingested_at=datetime(2026, 10, 12, tzinfo=UTC),
+        values={**INVOICE, "number": None},
+    )  # fmt: skip
+    review_row = await add_document(
+        db, memory_store, index_conn, ws, state=DocumentState.needs_review,
+        ingested_at=datetime(2026, 10, 11, tzinfo=UTC),
+    )  # fmt: skip
+    september = await add_document(
+        db, memory_store, index_conn, ws,
+        ingested_at=datetime(2026, 9, 30, 23, 30, tzinfo=local).astimezone(UTC),
+    )  # fmt: skip
+    await add_document(
+        db, memory_store, index_conn, ws,
+        ingested_at=datetime(2026, 11, 1, 0, 30, tzinfo=local).astimezone(UTC),
+    )  # fmt: skip
+
+    r = await member.client.post(_url(ws, "/seal-batch"), json={"month": "2026-10"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "sealed": 3,
+        "skipped": [{"id": str(incomplete.id), "code": "seal.fields_incomplete"}],
+        "remaining": 0,
+    }
+    sealed_events = await _events(db, ws, "document.sealed")
+    assert sorted(e.target_id or "" for e in sealed_events) == sorted(str(d.id) for d in filed)
+    assert [e.target_id for e in sealed_events] == [str(d.id) for d in filed]  # oldest first
+    for doc in filed:
+        assert (await _ledger(db, doc)).state is DocumentState.sealed
+        assert stored(memory_store, doc).mode == "COMPLIANCE"
+    for doc in (incomplete, review_row, september):
+        assert (await _ledger(db, doc)).state is not DocumentState.sealed
+        assert stored(memory_store, doc).mode == "GOVERNANCE"
+    assert sorted(enqueuer.mirrors) == sorted((d.id, ws.id) for d in filed)
+
+    # Again: nothing left to seal, nothing audited twice.
+    r = await member.client.post(_url(ws, "/seal-batch"), json={"month": "2026-10"})
+    assert r.json()["sealed"] == 0
+    assert len(await _events(db, ws, "document.sealed")) == 3
+
+
+async def test_batch_seal_caps_each_call(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    monkeypatch.setattr(review, "SEAL_BATCH_LIMIT", 2)
+    for day in (3, 4, 5):
+        await add_document(
+            db, memory_store, index_conn, ws, ingested_at=datetime(2026, 10, day, tzinfo=UTC)
+        )
+    url = _url(ws, "/seal-batch")
+    assert (await member.client.post(url, json={"month": "2026-10"})).json() == {
+        "sealed": 2,
+        "skipped": [],
+        "remaining": 1,
+    }
+    assert (await member.client.post(url, json={"month": "2026-10"})).json() == {
+        "sealed": 1,
+        "skipped": [],
+        "remaining": 0,
+    }
+
+
+@pytest.mark.parametrize("month", ["2026-13", "2026-1", "october", "2026-10-01"])
+async def test_batch_seal_rejects_a_bad_month(member: Actor, ws: Workspace, month: str) -> None:
+    r = await member.client.post(_url(ws, "/seal-batch"), json={"month": month})
+    assert (r.status_code, _code(r)) == (422, "validation")
+
+
+def test_mirror_is_sent_to_the_main_workers_default_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sijil_cp.enqueue import CeleryEnqueuer
+
+    sent: list[tuple[str, dict[str, str], str]] = []
+    celery = CeleryEnqueuer("redis://127.0.0.1:1/0")
+    monkeypatch.setattr(
+        celery._app,  # noqa: SLF001
+        "send_task",
+        lambda name, kwargs, queue: sent.append((name, kwargs, queue)),
+    )
+    ledger_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+    celery.send_mirror(ledger_id, workspace_id)
+    assert sent == [
+        (
+            "sijil.mirror_fields",
+            {"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            "default",
+        )
+    ]

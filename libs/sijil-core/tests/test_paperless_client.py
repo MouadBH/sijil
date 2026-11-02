@@ -425,3 +425,114 @@ async def test_download_archive_or_original() -> None:
         assert "original" not in route.calls.last.request.url.params
         await client.download(7, original=True)
         assert route.calls.last.request.url.params["original"] == "true"
+
+
+@respx.mock
+async def test_ensure_custom_field_creates_when_missing() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    post = respx.post(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(201, json={"id": 21})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_custom_field("sijil_total_ttc", "monetary") == 21
+    assert json.loads(post.calls.last.request.content) == {
+        "name": "sijil_total_ttc",
+        "data_type": "monetary",
+    }
+
+
+@respx.mock
+async def test_ensure_custom_field_reuses_by_exact_name() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": 3, "name": "sijil_ice_old", "data_type": "string"},
+                    {"id": 4, "name": "SIJIL_ICE", "data_type": "string"},
+                ]
+            },
+        )
+    )
+    post = respx.post(f"{BASE}/api/custom_fields/")
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_custom_field("sijil_ice", "string") == 4
+    assert not post.called
+
+
+@respx.mock
+async def test_ensure_custom_field_lost_create_race_returns_the_winner() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(
+        side_effect=[
+            httpx.Response(200, json={"results": []}),
+            httpx.Response(200, json={"results": [{"id": 8, "name": "sijil_sealed"}]}),
+        ]
+    )
+    respx.post(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(400, json={"name": ["already exists"]})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_custom_field("sijil_sealed", "boolean") == 8
+
+
+@respx.mock
+async def test_ensure_custom_field_create_unavailable_is_not_swallowed() -> None:
+    listing = respx.get(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/custom_fields/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.ensure_custom_field("sijil_date", "date")
+    assert listing.call_count == 1
+
+
+@respx.mock
+async def test_ensure_custom_field_bad_body_is_bad_response() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(return_value=httpx.Response(200, json=["x"]))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessBadResponse):
+            await client.ensure_custom_field("sijil_date", "date")
+
+
+@respx.mock
+async def test_set_custom_fields_merges_with_the_documents_other_fields() -> None:
+    """A PATCH of `custom_fields` replaces the document's whole list: others are kept."""
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 7,
+                "custom_fields": [{"field": 1, "value": "theirs"}, {"field": 21, "value": "old"}],
+            },
+        )
+    )
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_custom_fields(7, {21: "MAD1500.00", 22: True}, document_type=11)
+    sent = json.loads(patch.calls.last.request.content)
+    assert sent["document_type"] == 11
+    assert sorted(sent["custom_fields"], key=lambda f: f["field"]) == [
+        {"field": 1, "value": "theirs"},
+        {"field": 21, "value": "MAD1500.00"},
+        {"field": 22, "value": True},
+    ]
+
+
+@respx.mock
+async def test_set_custom_fields_without_type_sends_fields_only() -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "custom_fields": []})
+    )
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_custom_fields(7, {5: "2026-09-30"})
+    assert json.loads(patch.calls.last.request.content) == {
+        "custom_fields": [{"field": 5, "value": "2026-09-30"}]
+    }
