@@ -213,6 +213,25 @@ def test_task_clears_the_key_on_final_failure(
     assert eager.calls == [("clear", LID, None)]
 
 
+def test_task_leaves_the_key_to_expire_when_recording_the_failure_fails(
+    eager: FakePending, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that can neither be extracted nor recorded as failed (its index database gone,
+    say) stays `received`. Its key is left to its TTL, so the sweep skips it for an hour
+    instead of resending it every run and starving newer rows."""
+
+    async def boom(ledger_id: str, workspace_id: str | None) -> None:
+        raise LookupError("no index database credential")
+
+    async def unrecordable(ledger_id: str, workspace_id: str | None, code: str) -> None:
+        raise LookupError("no index database credential")
+
+    monkeypatch.setattr(tasks, "_extract", boom)
+    monkeypatch.setattr(tasks, "_extract_failed", unrecordable)
+    tasks.extract_document_task.apply(kwargs={"ledger_id": LID})
+    assert eager.calls == []
+
+
 def test_task_keeps_and_refreshes_the_key_on_retry(
     eager: FakePending, monkeypatch: pytest.MonkeyPatch
 ) -> None:

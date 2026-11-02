@@ -417,10 +417,11 @@ def extract_document_task(
             raise self.retry(exc=exc, countdown=countdown) from exc
         # Retries ran out, or a final error: the document must reach review, never wait for
         # ever in `received`.
-        try:
-            asyncio.run(_extract_failed(ledger_id, workspace_id, extraction_error_code(exc)))
-        finally:
-            _pending_quietly(clear)
+        # If recording the failure fails too (its index database gone, say), the row stays
+        # `received`: its key is left to expire, so the sweep skips it for the key's TTL
+        # instead of resending it every run ahead of newer rows.
+        asyncio.run(_extract_failed(ledger_id, workspace_id, extraction_error_code(exc)))
+        _pending_quietly(clear)
         raise
     _pending_quietly(clear)  # routed, or nothing to do
 
