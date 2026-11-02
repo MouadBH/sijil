@@ -113,11 +113,12 @@ async def test_missing_model_is_transient_other_4xx_final() -> None:
         assert not isinstance(final.value, OllamaUnavailable)
 
 
-async def test_one_request_may_take_180_seconds() -> None:
-    """One CPU-bound generation at a time (the extraction worker runs with concurrency 1)."""
+async def test_one_request_may_take_300_seconds() -> None:
+    """One CPU-bound generation at a time (the extraction worker runs with concurrency 1); one
+    run measured ~130 s on 4 CPUs under load, so 180 s was too close."""
     async with OllamaClient("http://ollama:11434", {"ollama"}) as ai:
         timeout = ai._http.timeout
-    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (180, 180, 180, 180)
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (300, 300, 300, 300)
 
 
 async def test_model_load_failure_is_recognised() -> None:

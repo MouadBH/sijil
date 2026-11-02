@@ -91,7 +91,7 @@ class OllamaClient:
         base_url: str,
         allowed_hosts: Collection[str],
         *,
-        timeout_s: float = 180,
+        timeout_s: float = 300,  # one CPU-bound run measured ~130 s under load
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         if not _host_allowed(base_url, allowed_hosts):

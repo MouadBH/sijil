@@ -29,10 +29,10 @@ def _queues(command: list[str]) -> set[str]:
 
 
 def test_ollama_is_capped_and_fails_fast_when_busy() -> None:
-    """Half the CPUs at most (tenants' OCR keeps headroom), one generation at a time, and a
-    short queue: excess requests get 503 (transient) instead of piling up."""
+    """Six CPUs at most (of the dev host's eight: tenants' OCR keeps headroom), one generation
+    at a time, and a short queue: excess requests get 503 (transient) instead of piling up."""
     block = _block("ollama")
-    assert _key(block, "cpus") == '"4"'
+    assert _key(block, "cpus") == '"6"'
     assert re.search(r'^      OLLAMA_NUM_PARALLEL: "1"$', block, re.MULTILINE)
     assert re.search(r'^      OLLAMA_MAX_QUEUE: "8"$', block, re.MULTILINE)
 
