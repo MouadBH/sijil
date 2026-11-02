@@ -224,7 +224,11 @@ async def wait_routed(workspace_id: UUID, budget_s: float) -> dict[DocumentState
                 states = list(
                     await db.scalars(
                         select(DocumentLedger.state).where(
-                            DocumentLedger.workspace_id == workspace_id
+                            DocumentLedger.workspace_id == workspace_id,
+                            # Only rows that can be routed: a failed ingest stays received.
+                            DocumentLedger.ingest_state.in_(
+                                (IngestState.consumed, IngestState.unsupported)
+                            ),
                         )
                     )
                 )
