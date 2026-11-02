@@ -89,6 +89,13 @@ async def test_connect_error_and_timeout_are_unavailable() -> None:
                 await ai.chat_json("m", "s", "u", SCHEMA, seed=1)
 
 
+async def test_one_request_may_take_180_seconds() -> None:
+    """One CPU-bound generation at a time (the extraction worker runs with concurrency 1)."""
+    async with OllamaClient("http://ollama:11434", {"ollama"}) as ai:
+        timeout = ai._http.timeout
+    assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (180, 180, 180, 180)
+
+
 async def test_model_load_failure_is_recognised() -> None:
     def oom(_r: httpx.Request) -> httpx.Response:
         return httpx.Response(

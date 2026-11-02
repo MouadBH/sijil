@@ -55,7 +55,15 @@ REDIS_IMAGE: Final = "redis:7.4.12-alpine"
 # Compose services joined to every tenant network: the control plane and worker reach the
 # tenant; the tenant reaches the shared helpers. The alias keeps the compose service name
 # resolvable from inside the tenant network (e.g. PAPERLESS_DBHOST=postgres).
-ATTACHED_SERVICES: Final = ("control-plane", "worker", "postgres", "tika", "gotenberg", "ollama")
+ATTACHED_SERVICES: Final = (
+    "control-plane",
+    "worker",
+    "worker-extraction",
+    "postgres",
+    "tika",
+    "gotenberg",
+    "ollama",
+)
 REQUIRED_SERVICES: Final = frozenset({"postgres", "tika", "gotenberg"})
 TESSDATA_PATH: Final = "/usr/share/tesseract-ocr/5/tessdata"
 _SECOND_NS: Final = 1_000_000_000

@@ -147,6 +147,12 @@ esac
 ping_out=$(compose exec -T worker celery -A sijil_worker.main inspect ping --timeout 10 2>/dev/null)
 grep -q pong <<<"$ping_out" \
   && pass "worker answers celery ping" || fail "worker ping"
+ping_out=$(compose exec -T worker-extraction celery -A sijil_worker.main inspect ping \
+  --timeout 10 2>/dev/null)
+grep -A1 'extraction@' <<<"$ping_out" | grep -q pong \
+  && pass "extraction worker answers celery ping" || fail "extraction worker ping"
+compose exec -T worker-extraction test ! -S /var/run/docker.sock \
+  && pass "extraction worker has no Docker socket" || fail "extraction worker has the Docker socket"
 
 # Inbound email: the SMTP receiver greets on its localhost-published port.
 banner=$(python3 - <<'PY' 2>/dev/null

@@ -252,6 +252,21 @@ services:
       postgres: { condition: service_healthy }
       tessdata-init: { condition: service_completed_successfully }
 
+  worker-extraction:
+    # Extraction only (REC-2): the model is CPU-bound, so one request at a time, on its own
+    # pool, so ingest never waits behind it. It reads tenants' Paperless content (tenant
+    # networks) and talks to Ollama (`ai`). It provisions nothing: no Docker socket.
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "sijil_worker.main", "worker", "-Q", "extraction", "--concurrency", "1", "-n", "extraction@%h", "--loglevel", "INFO"]
+    environment: *worker-env
+    networks: [core, ai, tenant_t1, tenant_t2]
+    depends_on:
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+
   smtp:
     # Inbound email capture (CAP-1): archives mail per workspace address. No Docker socket and
     # no tenant networks: it needs only the database, the object store and the broker.
