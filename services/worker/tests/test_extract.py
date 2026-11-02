@@ -771,6 +771,33 @@ async def test_extract_noop_unless_received_and_consumed(
     assert await events(db, ready) == []
 
 
+@pytest.mark.parametrize("ws_state", [WorkspaceState.hibernated, WorkspaceState.closing])
+@pytest.mark.parametrize("ingest_state", [IngestState.consumed, IngestState.unsupported])
+async def test_extract_noop_unless_workspace_active(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    ws_state: WorkspaceState,
+    ingest_state: IngestState,
+) -> None:
+    """A hibernated or closing workspace does not extract: nothing is called, written or
+    audited, and nothing is raised (no retries piling up behind the model)."""
+    ledger = await make_ledger(db, ready, ingest_state=ingest_state)
+    ready.state = ws_state
+    await db.commit()
+    ollama = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, ollama)
+        assert not router.calls
+    assert ollama.requests == []
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await events(db, ready) == []
+    assert (await reload(db, ledger)).state is DocumentState.received
+
+
 async def test_already_extracted_is_noop(
     db: AsyncSession,
     sessions: async_sessionmaker[AsyncSession],
@@ -1549,6 +1576,42 @@ async def test_requeue_unextracted_sends_old_received_unrouted_rows_of_this_regi
     count = await requeue_unextracted(sessions, enqueue, region="ma-cas", now=NOW)
     assert count == 2
     assert sent == [(unsupported.id, ready.id), (due.id, ready.id)]
+
+
+@pytest.mark.parametrize("ws_state", [WorkspaceState.hibernated, WorkspaceState.closing])
+async def test_requeue_unextracted_only_sweeps_active_workspaces(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    ready: Workspace,
+    org: Organisation,
+    ws_state: WorkspaceState,
+) -> None:
+    old = timedelta(minutes=30)
+    due = await make_ledger(db, ready, age=old)
+    slug = f"idle-{uuid.uuid4().hex[:8]}"
+    idle = Workspace(
+        org_id=org.id,
+        name="Idle",
+        slug=slug,
+        state=WorkspaceState.active,
+        db_name=f"paperless_{slug}",
+        index_db_name=f"index_{slug}",
+        kms_key_id=f"kek-{slug}",
+    )
+    db.add(idle)
+    await db.commit()
+    # Older than `due`, so it would come first if the state were ignored.
+    await make_ledger(db, idle, age=old + timedelta(hours=1))
+    await make_ledger(db, idle, age=old + timedelta(hours=1), ingest_state=IngestState.unsupported)
+    idle.state = ws_state
+    await db.commit()
+    sent: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append((ledger_id, workspace_id))
+
+    assert await requeue_unextracted(sessions, enqueue, region="ma-cas", now=NOW, limit=1) == 1
+    assert sent == [(due.id, ready.id)]
 
 
 async def test_requeue_unextracted_survives_a_failed_enqueue(

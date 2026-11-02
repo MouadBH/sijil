@@ -2,8 +2,8 @@
 (REC-2, REC-3, design §5.3, §5.4).
 
 `extract_document` runs only for a ledger row that is `received` with `ingest_state =
-consumed` (or `unsupported`, which is only routed: see below), and only in this worker's
-region. It:
+consumed` (or `unsupported`, which is only routed: see below), only in an `active` workspace
+(a hibernated or closing one is a no-op), and only in this worker's region. It:
 1. reads the text Paperless extracted (never the PDF's own text layer, ruling P4), normalises
    it and keeps the first 12,000 characters; empty text is flagged `no_text`;
 2. asks Ollama twice (run A: PROMPT_A, seed 1; run B: PROMPT_B, seed 2) for the fields, as a
@@ -292,13 +292,18 @@ async def _load(
             return None
         if ledger.state is not DocumentState.received:
             return None
+        # Only an active workspace extracts: a hibernated or closing one is left alone (and
+        # the sweep skips it), so it never holds the one model in flight.
+        if workspace.state is not WorkspaceState.active:
+            log.info(
+                "extraction of document %s skipped: workspace is %s", ledger_id, workspace.state
+            )
+            return None
         if ledger.ingest_state is IngestState.unsupported:
-            if workspace.state is not WorkspaceState.active:
-                raise WorkspaceNotActive
             return _Job(ledger_id, workspace, region, None, None, None)
         if ledger.ingest_state is not IngestState.consumed or ledger.paperless_doc_id is None:
             return None
-        if workspace.state is not WorkspaceState.active or not workspace.paperless_url:
+        if not workspace.paperless_url:
             raise WorkspaceNotActive
         credential = await session.scalar(
             select(TenantCredential).where(
@@ -736,7 +741,8 @@ async def requeue_unextracted(
     scan: int = REQUEUE_SCAN,
 ) -> int:
     """Send `extract_document` again for this region's rows still `received` and `consumed` or
-    `unsupported` that arrived over `older_than` ago (a lost message, a failed enqueue, or a
+    `unsupported`, in an `active` workspace (hibernated and closing ones do not extract), that
+    arrived over `older_than` ago (a lost message, a failed enqueue, or a
     run that failed before routing), oldest first. Safe to repeat: an extracted document is
     not extracted again, and a routed one is no longer `received`.
 
@@ -754,6 +760,7 @@ async def requeue_unextracted(
                 .where(
                     and_(
                         Organisation.region == region,
+                        Workspace.state == WorkspaceState.active,
                         DocumentLedger.state == DocumentState.received,
                         DocumentLedger.ingest_state.in_(
                             (IngestState.consumed, IngestState.unsupported)
