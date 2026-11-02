@@ -407,6 +407,9 @@ def test_settings_defaults_and_hosts_from_env(monkeypatch: pytest.MonkeyPatch) -
     )
     monkeypatch.setenv("SIJIL_AI_ALLOWED_HOSTS", "ollama, ollama-2")
     assert WorkerSettings().ai_allowed_hosts == frozenset({"ollama", "ollama-2"})
+    assert s.ollama_num_thread is None
+    monkeypatch.setenv("SIJIL_OLLAMA_NUM_THREAD", "6")
+    assert WorkerSettings().ollama_num_thread == 6
 
 
 def test_extraction_worker_boots_without_provisioning_settings(

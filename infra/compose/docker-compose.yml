@@ -65,6 +65,9 @@ x-worker-env: &worker-env
   SIJIL_OLLAMA_URL: http://ollama:11434
   SIJIL_AI_ALLOWED_HOSTS: ollama
   SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+  # As many model threads as ollama's `cpus` (it would start one per host CPU, and eight
+  # threads under six CPUs were throttled to 0.4 tokens/s, measured).
+  SIJIL_OLLAMA_NUM_THREAD: "6"
 
 # The extraction worker's least privilege: extraction and routing only. No provisioner role and
 # no Docker or tenant-provisioning settings (`sijil_worker.settings.ExtractionSettings`).
@@ -75,6 +78,9 @@ x-extraction-env: &extraction-env
   SIJIL_OLLAMA_URL: http://ollama:11434
   SIJIL_AI_ALLOWED_HOSTS: ollama
   SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+  # As many model threads as ollama's `cpus` (it would start one per host CPU, and eight
+  # threads under six CPUs were throttled to 0.4 tokens/s, measured).
+  SIJIL_OLLAMA_NUM_THREAD: "6"
 
 # The seal worker (`sijil_worker.settings.SealSettings`): the database as the app role, the
 # broker, and the object store through the sealing key (retention only: no bytes, no delete),

@@ -346,7 +346,9 @@ async def _extract(ledger_id: str, workspace_id: str | None) -> None:
     sessions = make_sessionmaker(engine)
     engines = IndexEngines(settings, keys, sessions)
     try:
-        async with OllamaClient(settings.ollama_url, settings.ai_allowed_hosts) as ollama:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
             await extract_document(
                 UUID(ledger_id),
                 sessions=sessions,

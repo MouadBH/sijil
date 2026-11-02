@@ -69,6 +69,22 @@ async def test_chat_json_request_shape() -> None:
     }
 
 
+async def test_num_thread_is_sent_when_set() -> None:
+    """Ollama sizes its thread pool from the host's CPUs, not the container's quota."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": "{}"}})
+
+    transport = httpx.MockTransport(handler)
+    async with OllamaClient(
+        "http://ollama:11434", {"ollama"}, num_thread=6, transport=transport
+    ) as ai:
+        await ai.chat_json("m", "s", "u", {"type": "object"}, seed=1)
+    assert json.loads(seen[0].content)["options"]["num_thread"] == 6
+
+
 async def test_a_runaway_answer_is_cut_and_is_bad_output() -> None:
     """A run that never closes its JSON (seen live: one run generating for 5 min) is cut at
     `num_predict` tokens; the truncated answer is bad output (the other run is used), never a

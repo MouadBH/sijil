@@ -304,7 +304,9 @@ async def _run(
         workspace = await _workspace_of(sessions, settings, workspace_id)
         if workspace is None:
             return None
-        async with OllamaClient(settings.ollama_url, settings.ai_allowed_hosts) as ollama:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
             return await evaluate(
                 sessions=sessions,
                 keys=keys,

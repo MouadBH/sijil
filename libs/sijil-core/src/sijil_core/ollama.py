@@ -96,10 +96,14 @@ class OllamaClient:
         allowed_hosts: Collection[str],
         *,
         timeout_s: float = 300,  # one CPU-bound run measured ~130 s under load
+        num_thread: int | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        """`num_thread`: the model's threads. Ollama sizes its pool from the host's CPUs, not
+        the container's quota, and more threads than CPUs are throttled to a crawl."""
         if not _host_allowed(base_url, allowed_hosts):
             raise ValueError("ai.host_not_allowed")
+        self._num_thread = num_thread
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=timeout_s,
@@ -174,7 +178,8 @@ class OllamaClient:
                     "seed": seed,
                     "num_ctx": NUM_CTX,
                     "num_predict": NUM_PREDICT,
-                },
+                }
+                | ({} if self._num_thread is None else {"num_thread": self._num_thread}),
             },
         )
         try:

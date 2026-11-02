@@ -33,6 +33,12 @@ def test_ollama_is_capped_and_fails_fast_when_busy() -> None:
     at a time, and a short queue: excess requests get 503 (transient) instead of piling up."""
     block = _block("ollama")
     assert _key(block, "cpus") == '"6"'
+    # The model sizes its thread pool from the host's CPUs (eight), not the quota: eight threads
+    # under six CPUs were throttled to 0.4 tokens/s (measured), so every client asks for six.
+    text = COMPOSE
+    for anchor in ("x-worker-env", "x-extraction-env"):
+        env = text.split(f"{anchor}: &", 1)[1].split("\n\n", 1)[0]
+        assert re.search(r'^  SIJIL_OLLAMA_NUM_THREAD: "6"$', env, re.MULTILINE), anchor
     assert re.search(r'^      OLLAMA_NUM_PARALLEL: "1"$', block, re.MULTILINE)
     assert re.search(r'^      OLLAMA_MAX_QUEUE: "8"$', block, re.MULTILINE)
 

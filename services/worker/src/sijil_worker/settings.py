@@ -35,6 +35,9 @@ class ExtractionSettings(KeySettings, BrokerSettings):
     extraction_model: str = "qwen3:4b"
     ollama_url: str = "http://ollama:11434"
     ai_allowed_hosts: Annotated[frozenset[str], NoDecode] = frozenset({"ollama"})
+    # The model's threads (SIJIL_OLLAMA_NUM_THREAD): as many as Ollama's CPU quota, since it
+    # otherwise starts one per host CPU and gets throttled. None: Ollama's own choice.
+    ollama_num_thread: int | None = None
 
     @field_validator("ai_allowed_hosts", mode="before")
     @classmethod

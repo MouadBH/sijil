@@ -46,7 +46,9 @@ def index_url() -> Iterator[str]:
 async def test_extracts_sample_01_with_real_ollama(harness: Harness, index_url: str) -> None:
     settings = harness.settings
     model = settings.extraction_model
-    async with OllamaClient(settings.ollama_url, settings.ai_allowed_hosts) as probe:
+    async with OllamaClient(
+        settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+    ) as probe:
         try:
             pulled = await probe.has_model(model)
         except OllamaError as exc:
@@ -71,7 +73,9 @@ async def test_extracts_sample_01_with_real_ollama(harness: Harness, index_url: 
     engines = IndexEngines(settings, harness.keys, harness.sessions, engine_factory=factory)
     started = time.monotonic()
     try:
-        async with OllamaClient(settings.ollama_url, settings.ai_allowed_hosts) as ollama:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
             try:
                 await extract_document(
                     row.id,
