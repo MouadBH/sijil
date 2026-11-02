@@ -97,9 +97,13 @@ def test_weights_table_is_the_design_one() -> None:
     assert HARD["currency"] == {"present", "currency_valid"}
     assert set(WEIGHTS) == set(HARD) == set(FIELD_NAMES)
     assert THRESHOLD == 0.90
-    assert {"possible_duplicate", "no_text", "ingest.unsupported_format", "extraction_failed"} == (
-        BLOCKING_FLAGS
-    )
+    assert BLOCKING_FLAGS == {
+        "possible_duplicate",
+        "no_text",
+        "ingest.unsupported_format",
+        "extraction_failed",
+        "retention.extend_failed",
+    }
 
 
 def test_totals_mismatch_lowers_confidence_below_090() -> None:

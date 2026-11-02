@@ -1058,6 +1058,70 @@ async def test_concurrent_routes_write_one_event(
     assert (await reload(db, ledger)).state is DocumentState.filed
 
 
+async def test_permanent_store_failure_routes_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """The store refuses every extension: the task's final path (`record_extraction_failed`)
+    sends the document to review with a blocking flag instead of leaving it `received` for
+    ever. The retention stays what the ledger holds."""
+    from botocore.exceptions import ClientError
+
+    ledger = await make_ledger(db, ready, retention_until=date(2036, 6, 30))
+    store = FakeStore()
+    store.fail = ClientError({"Error": {"Code": "AccessDenied"}}, "PutObjectRetention")
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        with pytest.raises(ClientError):
+            await run(
+                ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}), store=store
+            )
+        assert not tasks.is_extract_transient(store.fail)  # so the task goes final at once
+
+        async def final() -> None:
+            await record_extraction_failed(
+                ledger.id, "extraction.error", sessions=sessions, index=engines, store=store,
+                settings=SETTINGS, now=NOW,
+            )  # fmt: skip
+
+        await final()
+        await final()  # once only
+    row = await reload(db, ledger)
+    assert (row.state, row.retention_until) == (DocumentState.needs_review, date(2036, 6, 30))
+    assert store.extended == []
+    fields = await fields_of(engines, ready, ledger.id)
+    assert fields.flags == ("retention.extend_failed",)
+    assert await actions(db, ready) == ["document.extracted", "document.needs_review"]
+    review = (await events(db, ready))[-1]
+    assert review.data == {"min_confidence_pct": 100, "flags": "retention.extend_failed"}
+
+
+async def test_date_one_day_ahead_never_adds_a_year_of_lock(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """On 31 December (local), a document dated 1 January next year is plausible (a time zone
+    apart) but its retention counts from today's year."""
+    eve = datetime(2026, 12, 31, 12, 0, tzinfo=UTC)
+    ledger = await make_ledger(db, ready, ingested_at=eve)
+    raw = {**RAW_01, "date": "2027-01-01"}
+    store = FakeStore()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(
+            ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}), store=store, now=eve
+        )
+    row = await reload(db, ledger)
+    assert (row.state, row.retention_until) == (DocumentState.filed, date(2036, 12, 31))
+    assert store.extended == []
+
+
 # Retries running out ----------------------------------------------------------------------
 
 
@@ -1346,12 +1410,35 @@ def test_final_failure_records_extraction_failed_at_once(
     assert failed == [(ARGS["ledger_id"], "extraction.paperless_error")]
 
 
-def test_object_store_errors_are_transient_for_extraction() -> None:
-    """Filing extends the object lock: a store that is down is retried, not given up on."""
-    from botocore.exceptions import ClientError, EndpointConnectionError
+@pytest.mark.parametrize(
+    ("code", "status", "transient"),
+    [
+        ("SlowDown", 503, True),
+        ("Throttling", 400, True),
+        ("ThrottlingException", 400, True),
+        ("RequestTimeout", 400, True),
+        ("InternalError", 500, True),
+        ("ServiceUnavailable", 503, True),
+        ("SomethingNew", 502, True),  # any 5xx
+        ("NoSuchKey", 404, False),
+        ("AccessDenied", 403, False),
+        ("InvalidRequest", 400, False),
+        ("InvalidArgument", 400, False),
+    ],
+)
+def test_object_store_error_classification(code: str, status: int, transient: bool) -> None:
+    """Filing extends the object lock: a store that is down or throttling is retried; a refusal
+    that retrying cannot change is final (the document then goes to review)."""
+    from botocore.exceptions import ClientError
 
-    denied = ClientError({"Error": {"Code": "SlowDown"}}, "PutObjectRetention")
-    assert tasks.is_extract_transient(denied)
+    response: Any = {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}}
+    error = ClientError(response, "PutObjectRetention")
+    assert tasks.is_extract_transient(error) is transient
+
+
+def test_store_connection_errors_are_transient_and_shortening_is_final() -> None:
+    from botocore.exceptions import EndpointConnectionError
+
     assert tasks.is_extract_transient(EndpointConnectionError(endpoint_url="http://s3"))
     assert not tasks.is_extract_transient(ValueError("retention can only be extended"))
 

@@ -266,9 +266,24 @@ def is_extract_transient(exc: BaseException) -> bool:
     store (extending the lock at filing) unreachable."""
     if isinstance(exc, OllamaError):
         return isinstance(exc, OllamaUnavailable)
-    if isinstance(exc, ClientError | BotoCoreError):
-        return True
+    if isinstance(exc, ClientError):
+        return _store_error_transient(exc)
+    if isinstance(exc, BotoCoreError):
+        return True  # connection, timeout, endpoint: the store is unreachable
     return isinstance(exc, WorkspaceNotActive) or is_transient(exc)
+
+
+_STORE_TRANSIENT_CODES = frozenset(
+    {"SlowDown", "RequestTimeout", "InternalError", "ServiceUnavailable"}
+)
+
+
+def _store_error_transient(exc: ClientError) -> bool:
+    """Throttling and server errors pass; a refusal (NoSuchKey, AccessDenied, InvalidRequest
+    ...) does not, so the document goes to review instead of retrying for ever."""
+    code = str(exc.response.get("Error", {}).get("Code", ""))
+    status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+    return code in _STORE_TRANSIENT_CODES or code.startswith("Throttling") or status >= 500
 
 
 def extraction_error_code(exc: BaseException) -> str:

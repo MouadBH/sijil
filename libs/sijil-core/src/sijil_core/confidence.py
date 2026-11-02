@@ -25,7 +25,13 @@ Decision = Literal["filed", "needs_review"]
 THRESHOLD: Final = 0.90
 HARD_CAP: Final = 0.5
 BLOCKING_FLAGS: Final = frozenset(
-    {"possible_duplicate", "no_text", "ingest.unsupported_format", "extraction_failed"}
+    {
+        "possible_duplicate",
+        "no_text",
+        "ingest.unsupported_format",
+        "extraction_failed",
+        "retention.extend_failed",  # the object lock could not be extended at filing
+    }
 )
 VAT_RATES: Final = (Decimal(20), Decimal(14), Decimal(10), Decimal(7))
 VAT_RATE_TOLERANCE: Final = Decimal("0.1")

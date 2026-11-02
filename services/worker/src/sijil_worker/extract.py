@@ -97,6 +97,7 @@ NO_TEXT: Final = "no_text"
 EXTRACTION_FAILED: Final = "extraction_failed"
 BAD_OUTPUT: Final = "extraction.ai_bad_output"
 POSSIBLE_DUPLICATE: Final = "possible_duplicate"
+RETENTION_EXTEND_FAILED: Final = "retention.extend_failed"
 _RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
 REQUEUE_AFTER: Final = timedelta(minutes=15)
 REQUEUE_BATCH: Final = 500
@@ -515,12 +516,17 @@ async def _route(
     workspace: Workspace,
     row: FieldsRow,
     now: datetime,
+    *,
+    final: bool = False,
 ) -> Decision | None:
     """Files the document or sends it to review, once: under the ledger row's lock (taken
     before the audit chain's), only a row still `received` moves. None when nothing moved.
 
     The object lock is extended before the ledger: if the ledger commit then fails, the lock
-    is only longer (safe, monotonic) and the retry computes the same date.
+    is only longer (safe, monotonic) and the retry computes the same date. If the extension
+    fails, the error propagates for a retry; on the `final` path (nothing will retry) the
+    document goes to review instead, flagged `retention.extend_failed`, its retention as the
+    ledger holds it.
     """
     async with sessions() as session:
         found = (
@@ -541,14 +547,32 @@ async def _route(
         decision = route(confidence, flags, row.document_type)
         # Only a plausible date may raise retention: an object lock is never shortened, so a
         # misread year must not lock the original for longer. The arrival date stands in.
-        dated = plausible_date(row.values.get("date"), region_local_date(now, region))
-        basis = dated or region_local_date(ledger.ingested_at, region)
+        # Plausibility is judged against this (routing) run's region-local today, and the date
+        # is capped at it: a date one day ahead (a time zone apart, on 31 December) never adds
+        # a year of lock.
+        today = region_local_date(now, region)
+        dated = plausible_date(row.values.get("date"), today)
+        basis = min(dated, today) if dated else region_local_date(ledger.ingested_at, region)
         target = max(ledger.retention_until, fiscal_retain_until(basis, country))
         if target > ledger.retention_until:
-            await store.extend_retention(
-                ObjectRef(ledger.object_key, ledger.object_version_id), target
-            )
-            ledger.retention_until = target
+            try:
+                await store.extend_retention(
+                    ObjectRef(ledger.object_key, ledger.object_version_id), target
+                )
+            except Exception as exc:
+                if not final:
+                    raise
+                log.warning(
+                    "retention extension of document %s failed: %s",
+                    row.ledger_id,
+                    type(exc).__name__,
+                )
+                flags = (*flags, RETENTION_EXTEND_FAILED)
+                decision = "needs_review"
+                async with (await index.engine(workspace)).begin() as conn:
+                    await index_db.set_scores(conn, row.ledger_id, confidence, flags)
+            else:
+                ledger.retention_until = target
         ledger.state = DocumentState(decision)
         await _append_event(
             session,
@@ -575,7 +599,8 @@ async def _name_in_paperless(
 ) -> None:
     """Best effort, after routing: the title and type in the tenant's own Paperless (the
     content stays in the workspace). A failure is logged by its class only and changes
-    nothing."""
+    nothing; it is never retried, so a crash between the routing commit and this PATCH leaves
+    the title unset."""
     title = _title(row.values)
     if job.doc_id is None or job.paperless_url is None or not title or not row.document_type:
         return
@@ -682,7 +707,7 @@ async def record_extraction_failed(
     async with (await index.engine(workspace)).begin() as conn:
         row = await _write_once(conn, failed, [])
     await _ensure_audited(sessions, workspace.id, ledger_id, row, now)
-    await _route(sessions, index, store, workspace, row, now)
+    await _route(sessions, index, store, workspace, row, now, final=True)
 
 
 async def requeue_unextracted(
