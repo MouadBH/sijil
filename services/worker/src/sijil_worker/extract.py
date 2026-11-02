@@ -15,13 +15,14 @@ consumed`, and only in this worker's region. It:
    enter the audit log, ruling P5).
 
 Transient failures (Ollama or Paperless down) raise for the caller to retry, with nothing
-recorded. Both runs answering garbage records the row with the flag `extraction_failed` and
-audits `document.extraction_failed`; so does `record_extraction_failed`, which the task calls
-when its retries run out.
+recorded. Both runs answering garbage records the row with the flags `extraction_failed` and
+the code, and audits `document.extraction_failed`; so does `record_extraction_failed`, which
+the task calls when its retries run out.
 
-A document that already has a `document_fields` row is not extracted again: a redelivered
-task or the requeue sweep changes nothing. Scoring and routing (`filed` / `needs_review`) come
-after this step (Task 5); until then the ledger row stays `received`.
+Each run first obtains the row (the stored one, or a fresh extraction: the model never runs
+twice for a document), then ensures its audit event exists, rebuilt from the row if an earlier
+run lost it, under a lock on the ledger row so it is written once. Scoring and routing
+(`filed` / `needs_review`) follow that (Task 5); until then the ledger row stays `received`.
 """
 
 import logging
@@ -41,6 +42,7 @@ from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
     ActorType,
+    AuditEvent,
     CredentialKind,
     DocumentLedger,
     DocumentState,
@@ -69,6 +71,7 @@ SEED_B: Final = 2
 NO_TEXT: Final = "no_text"
 EXTRACTION_FAILED: Final = "extraction_failed"
 BAD_OUTPUT: Final = "extraction.ai_bad_output"
+_RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
 REQUEUE_AFTER: Final = timedelta(minutes=15)
 REQUEUE_BATCH: Final = 500
 # Serialises the write of one document's row across concurrent runs (index database).
@@ -267,9 +270,11 @@ async def _load(
         )
 
 
-async def _has_row(index_engines: IndexEngines, workspace: Workspace, ledger_id: UUID) -> bool:
+async def _stored_row(
+    index_engines: IndexEngines, workspace: Workspace, ledger_id: UUID
+) -> FieldsRow | None:
     async with (await index_engines.engine(workspace)).connect() as conn:
-        return await index_db.read_fields(conn, ledger_id) is not None
+        return await index_db.read_fields(conn, ledger_id)
 
 
 def _signals(
@@ -301,60 +306,102 @@ RunName = Literal["a", "b"]
 
 async def _write_once(
     conn: AsyncConnection, row: FieldsRow, runs: list[tuple[RunName, _Run]]
-) -> bool:
-    """Writes the runs and the row unless the document already has one. True if written."""
+) -> FieldsRow:
+    """Writes the runs and the row unless the document already has one; returns the stored
+    row (ours, or the one a concurrent run wrote first)."""
     await conn.execute(text(_WRITE_LOCK_SQL), {"id": str(row.ledger_id)})
-    if await index_db.read_fields(conn, row.ledger_id) is not None:
-        return False
+    existing = await index_db.read_fields(conn, row.ledger_id)
+    if existing is not None:
+        return existing
     for name, run in runs:
         await index_db.append_run(
             conn, row.ledger_id, name, row.model, run.raw, row.extracted_at or row.updated_at
         )
     await index_db.write_extraction(conn, row)
-    return True
+    return row
 
 
-async def _audit(
-    sessions: async_sessionmaker[AsyncSession],
+async def _append_event(
+    session: AsyncSession,
+    *,
     workspace_id: UUID,
     ledger_id: UUID,
     action: str,
     data: dict[str, str | int | bool | None],
     now: datetime,
 ) -> None:
+    await audit.append(
+        session,
+        workspace_id=workspace_id,
+        action=action,
+        actor_type=ActorType.system,
+        actor_id=None,
+        target_type="document",
+        target_id=str(ledger_id),
+        data=data,
+        now=now,
+    )
+
+
+def _event_for(row: FieldsRow) -> tuple[str, dict[str, str | int | bool | None]]:
+    """The audit event a stored row stands for, rebuilt from the row alone (no values)."""
+    if EXTRACTION_FAILED in row.flags:
+        codes = [f for f in row.flags if f.startswith("extraction.")]
+        return "document.extraction_failed", {"code": codes[0] if codes else "extraction.error"}
+    agree = sum(1 for s in row.signals.values() if s.get("runs_agree") is True)
+    return "document.extracted", {"model": row.model, "runs_agree_count": agree}
+
+
+async def _ensure_audited(
+    sessions: async_sessionmaker[AsyncSession],
+    workspace_id: UUID,
+    ledger_id: UUID,
+    row: FieldsRow,
+    now: datetime,
+) -> None:
+    """Appends the row's `document.extracted` / `document.extraction_failed` event unless one
+    exists. The ledger row is locked FOR UPDATE, so concurrent runs write it once; a run that
+    lost its audit (the commit failed after the index write) gets it back on the next run."""
     async with sessions() as session:
-        await audit.append(
+        await session.execute(
+            select(DocumentLedger.id).where(DocumentLedger.id == ledger_id).with_for_update()
+        )
+        done = await session.scalar(
+            select(AuditEvent.id)
+            .where(
+                AuditEvent.workspace_id == workspace_id,
+                AuditEvent.target_type == "document",
+                AuditEvent.target_id == str(ledger_id),
+                AuditEvent.action.in_(_RESULT_ACTIONS),
+            )
+            .limit(1)
+        )
+        if done is not None:
+            return
+        action, data = _event_for(row)
+        if action == "document.extraction_failed":
+            log.warning("extraction of document %s failed: %s", ledger_id, data["code"])
+        await _append_event(
             session,
             workspace_id=workspace_id,
+            ledger_id=ledger_id,
             action=action,
-            actor_type=ActorType.system,
-            actor_id=None,
-            target_type="document",
-            target_id=str(ledger_id),
             data=data,
             now=now,
         )
         await session.commit()
 
 
-async def extract_document(
-    ledger_id: UUID,
+async def _extract(
+    job: _Job,
     *,
-    sessions: async_sessionmaker[AsyncSession],
-    keys: KeyService,
     index: IndexEngines,
     paperless: Callable[..., PaperlessClient],
     ollama: OllamaClient,
-    settings: WorkerSettings,
+    model: str,
     now: datetime,
-    workspace_id: UUID | None = None,
-) -> None:
-    """See the module docstring. Raises OllamaUnavailable / PaperlessUnavailable (transient)
-    for the caller to retry; any other exception is final for the caller."""
-    job = await _load(sessions, keys, settings, ledger_id, workspace_id)
-    if job is None or await _has_row(index, job.workspace, ledger_id):
-        return
-    model = settings.extraction_model
+) -> FieldsRow:
+    """Reads the content, runs the model twice and writes the row; returns the stored row."""
     async with paperless(job.paperless_url, token=job.token) as client:
         content = normalise(await client.document_content(job.doc_id))[:MAX_CONTENT_CHARS]
         runs: list[tuple[RunName, _Run]] = []
@@ -374,14 +421,13 @@ async def extract_document(
     if not runs:
         flags = (NO_TEXT,)
     elif values_a is None and values_b is None:
-        flags = (EXTRACTION_FAILED,)
-    signals = _signals(values_a, values_b, kept, paperless_type)
+        flags = (EXTRACTION_FAILED, BAD_OUTPUT)
     row = FieldsRow(
-        ledger_id=ledger_id,
+        ledger_id=job.ledger_id,
         document_type=kept["document_type"],
         values=kept,
         confidence={},
-        signals=signals,
+        signals=_signals(values_a, values_b, kept, paperless_type),
         flags=flags,
         source=dict.fromkeys(FIELD_NAMES, "extraction"),
         model=model,
@@ -389,29 +435,42 @@ async def extract_document(
         updated_at=now,
     )
     async with (await index.engine(job.workspace)).begin() as conn:
-        written = await _write_once(conn, row, runs)
-    if not written:
-        return  # a concurrent run wrote the row first: its audit stands
-    if EXTRACTION_FAILED in flags:
-        log.warning("extraction of document %s failed: %s", ledger_id, BAD_OUTPUT)
-        await _audit(
-            sessions,
-            job.workspace.id,
-            ledger_id,
-            "document.extraction_failed",
-            {"code": BAD_OUTPUT},
-            now,
-        )
+        return await _write_once(conn, row, runs)
+
+
+async def extract_document(
+    ledger_id: UUID,
+    *,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: KeyService,
+    index: IndexEngines,
+    paperless: Callable[..., PaperlessClient],
+    ollama: OllamaClient,
+    settings: WorkerSettings,
+    now: datetime,
+    workspace_id: UUID | None = None,
+) -> None:
+    """See the module docstring. Raises OllamaUnavailable / PaperlessUnavailable (transient)
+    for the caller to retry; any other exception is final for the caller."""
+    job = await _load(sessions, keys, settings, ledger_id, workspace_id)
+    if job is None:
         return
-    agree = sum(1 for s in signals.values() if s["runs_agree"] is True)
-    await _audit(
-        sessions,
-        job.workspace.id,
-        ledger_id,
-        "document.extracted",
-        {"model": model, "runs_agree_count": agree},
-        now,
-    )
+    # 1. Obtain the row: the stored one (a redelivery, or a run whose audit was lost), or a
+    #    fresh extraction.
+    row = await _stored_row(index, job.workspace, ledger_id)
+    if row is None:
+        row = await _extract(
+            job,
+            index=index,
+            paperless=paperless,
+            ollama=ollama,
+            model=settings.extraction_model,
+            now=now,
+        )
+    # 2. Make sure it is audited, exactly once.
+    await _ensure_audited(sessions, job.workspace.id, ledger_id, row, now)
+    # 3. Task 5: score and route `row` here. The ledger is still `received` (checked by
+    #    `_load`), whether the row was written now or by an earlier run.
 
 
 async def record_extraction_failed(
@@ -422,11 +481,14 @@ async def record_extraction_failed(
     index: IndexEngines,
     settings: WorkerSettings,
     now: datetime,
+    workspace_id: UUID | None = None,
 ) -> None:
-    """Retries ran out (or a final error): flag `extraction_failed` and audit it, once.
+    """Retries ran out (or a final error): flag `extraction_failed` (with `code`) and audit it,
+    once.
 
-    A row that an extraction already wrote is left alone; so is another region's document or
-    one that is no longer `received`.
+    A row an extraction already wrote is kept (and its own event ensured instead). Another
+    region's document, one of another workspace than `workspace_id`, or one no longer
+    `received` is left alone.
     """
     async with sessions() as session:
         found = (
@@ -440,27 +502,27 @@ async def record_extraction_failed(
     if found is None:
         return
     ledger, workspace, region = found
+    if workspace_id is not None and workspace.id != workspace_id:
+        return
     try:
         assert_region(region, settings)
     except RegionMismatch:
         return
     if ledger.state is not DocumentState.received:
         return
-    row = FieldsRow(
+    failed = FieldsRow(
         ledger_id=ledger_id,
         values=dict.fromkeys(FIELD_NAMES),
-        flags=(EXTRACTION_FAILED,),
+        flags=(EXTRACTION_FAILED, code),
         source={},
         model=settings.extraction_model,
         extracted_at=now,
         updated_at=now,
     )
     async with (await index.engine(workspace)).begin() as conn:
-        written = await _write_once(conn, row, [])
-    if written:
-        await _audit(
-            sessions, workspace.id, ledger_id, "document.extraction_failed", {"code": code}, now
-        )
+        row = await _write_once(conn, failed, [])
+    await _ensure_audited(sessions, workspace.id, ledger_id, row, now)
+    # Task 5: route `row` here too (an `extraction_failed` row goes to review).
 
 
 async def requeue_unextracted(

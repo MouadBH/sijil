@@ -66,27 +66,32 @@ async def test_arabic_fixture_text_extracted(harness: Harness) -> None:
     assert NUMBER in content
 
 
-async def test_scanned_arabic_ocr(harness: Harness) -> None:
-    content = await content_of(harness, await consumed(harness, "scan-02-ar.png", FileKind.png))
-    similarity = best_line_similarity(content, NAME_AR)
+@pytest.fixture
+async def scan_content(harness: Harness) -> str:
+    """The text Paperless's OCR made of scan-02-ar.png, once consumed."""
+    return await content_of(harness, await consumed(harness, "scan-02-ar.png", FileKind.png))
+
+
+async def test_scanned_arabic_ocr(scan_content: str) -> None:
+    similarity = best_line_similarity(scan_content, NAME_AR)
     print(f"OCR-SUPPLIER-SIMILARITY {similarity:.3f}")
-    assert ICE in content
+    assert ICE in scan_content
     # The digits of the number; the full number is the strict xfail below.
-    assert NUMBER.removeprefix("F-") in content
+    assert NUMBER.removeprefix("F-") in scan_content
     assert similarity >= MIN_NAME_SIMILARITY
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason=(
         "Observed with Tesseract ara+fra+eng in Paperless 3.4.1: the bold Latin number in the "
         "RTL line 'فاتورة رقم F-2026-01002' comes out as '2026-01002-]' (the 'F-' prefix "
         "misread and moved). Strict: this starts failing the day OCR gets it right."
     ),
 )
-async def test_scanned_arabic_ocr_reads_the_full_number(harness: Harness) -> None:
-    content = await content_of(harness, await consumed(harness, "scan-02-ar.png", FileKind.png))
-    assert NUMBER in content
+async def test_scanned_arabic_ocr_reads_the_full_number(scan_content: str) -> None:
+    assert NUMBER in scan_content
 
 
 async def test_archive_is_pdfa(harness: Harness) -> None:

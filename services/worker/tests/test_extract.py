@@ -771,7 +771,8 @@ async def test_exhausted_retries_record_extraction_failed(
         now=NOW,
     )
     row = await fields_of(engines, ready, ledger.id)
-    assert row.flags == ("extraction_failed",)
+    # The code rides along in the flags, so a lost audit can be rebuilt from the row.
+    assert row.flags == ("extraction_failed", "extraction.ai_unavailable")
     (event,) = await events(db, ready)
     assert event.action == "document.extraction_failed"
     assert event.data == {"code": "extraction.ai_unavailable"}
@@ -800,6 +801,132 @@ async def test_record_failed_leaves_an_extracted_row_alone(
     row = await fields_of(engines, ready, ledger.id)
     assert row.flags == ()
     assert [e.action for e in await events(db, ready)] == ["document.extracted"]
+
+
+async def test_record_failed_skips_a_row_of_another_workspace(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    await record_extraction_failed(
+        ledger.id, "extraction.error", sessions=sessions, index=engines, settings=SETTINGS,
+        now=NOW, workspace_id=uuid.uuid4(),
+    )  # fmt: skip
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await events(db, ready) == []
+
+
+def _audit_fails_once(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    from sijil_worker import extract as module
+
+    real = module._append_event
+    calls: list[str] = []
+
+    async def flaky(session: AsyncSession, **kw: Any) -> None:
+        calls.append(kw["action"])
+        if len(calls) == 1:
+            raise ConnectionError("database gone mid-commit")
+        await real(session, **kw)
+
+    monkeypatch.setattr(module, "_append_event", flaky)
+    return calls
+
+
+async def test_lost_extracted_audit_is_rebuilt_on_the_next_run(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    calls = _audit_fails_once(monkeypatch)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        with pytest.raises(ConnectionError):
+            await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert await fields_of(engines, ready, ledger.id) is not None  # the row committed
+    assert await events(db, ready) == []
+    # The retry finds the row, runs no model, and writes the missing audit from it.
+    again = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, again)
+        await run(ledger, sessions, keys, engines, again)  # and only once
+    assert again.requests == []
+    (event,) = await events(db, ready)
+    assert event.action == "document.extracted"
+    assert event.data == {"model": "qwen3:4b", "runs_agree_count": len(FIELD_NAMES)}
+    assert calls == ["document.extracted", "document.extracted"]
+
+
+async def test_lost_failure_audit_is_rebuilt_on_the_next_run(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engines: IndexEngines,
+    ready: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    _audit_fails_once(monkeypatch)
+
+    async def record() -> None:
+        await record_extraction_failed(
+            ledger.id, "extraction.ai_unavailable", sessions=sessions, index=engines,
+            settings=SETTINGS, now=NOW,
+        )  # fmt: skip
+
+    with pytest.raises(ConnectionError):
+        await record()
+    assert await events(db, ready) == []
+    await record()
+    await record()
+    (event,) = await events(db, ready)
+    assert event.action == "document.extraction_failed"
+    assert event.data == {"code": "extraction.ai_unavailable"}
+
+
+async def test_lost_bad_output_audit_is_rebuilt_by_the_next_extraction(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    _audit_fails_once(monkeypatch)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        with pytest.raises(ConnectionError):
+            await run(ledger, sessions, keys, engines, FakeOllama({1: "x", 2: "y"}))
+        await run(ledger, sessions, keys, engines, FakeOllama({}))
+    (event,) = await events(db, ready)
+    assert event.action == "document.extraction_failed"
+    assert event.data == {"code": "extraction.ai_bad_output"}
+
+
+async def test_concurrent_reaudits_write_one_event(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    import asyncio
+
+    ledger = await make_ledger(db, ready)
+
+    async def record() -> None:
+        await record_extraction_failed(
+            ledger.id, "extraction.error", sessions=sessions, index=engines,
+            settings=SETTINGS, now=NOW,
+        )  # fmt: skip
+
+    await asyncio.gather(*(record() for _ in range(4)))
+    assert len(await events(db, ready)) == 1
 
 
 ARGS = {"ledger_id": "00000000-0000-0000-0000-000000000001", "workspace_id": None}
@@ -836,7 +963,8 @@ def _recording(
         attempts.append(ledger_id)
         raise error
 
-    async def record(ledger_id: str, code: str) -> None:
+    async def record(ledger_id: str, workspace_id: str | None, code: str) -> None:
+        assert workspace_id == ARGS["workspace_id"]
         failed.append((ledger_id, code))
 
     monkeypatch.setattr(tasks, "_extract", extract)
@@ -873,6 +1001,22 @@ def test_final_failure_records_extraction_failed_at_once(
 def test_extract_backoff_numbers() -> None:
     assert (tasks.EXTRACT_BACKOFF_FACTOR_S, tasks.EXTRACT_BACKOFF_MAX_S) == (30, 900)
     assert tasks.EXTRACT_MAX_RETRIES == 8
+
+
+@pytest.mark.parametrize(
+    ("retries", "low", "high"),
+    [(0, 15, 30), (1, 30, 60), (4, 240, 480), (5, 450, 900), (7, 450, 900)],
+)
+def test_extract_countdown_is_equal_jitter(retries: int, low: float, high: float) -> None:
+    """Half fixed, half random: never the near-zero waits full jitter allows."""
+    assert tasks.extract_countdown(retries, rand=lambda: 0.0) == low
+    assert tasks.extract_countdown(retries, rand=lambda: 1.0) == high
+    assert low <= tasks.extract_countdown(retries) <= high
+
+
+def test_eight_retries_always_outlast_half_an_hour() -> None:
+    shortest = sum(tasks.extract_countdown(r, rand=lambda: 0.0) for r in range(8))
+    assert shortest >= 30 * 60
 
 
 def test_extract_task_is_routed_to_the_extraction_queue() -> None:

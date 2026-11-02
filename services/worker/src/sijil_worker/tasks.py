@@ -1,4 +1,5 @@
 import asyncio
+import random
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID
@@ -244,12 +245,20 @@ def requeue_stuck_ingest_task() -> int:
     return asyncio.run(_requeue())
 
 
-# Extraction outlasts an Ollama or Paperless that is down for a while, like ingest: 30 s, 1 min,
-# 2 min ... capped at 15 min (full jitter), 8 times. After that the document is flagged
-# `extraction_failed` (audited) so that it goes to review instead of waiting for ever.
+# Extraction outlasts an Ollama or Paperless that is down for a while: 30 s, 1 min, 2 min ...
+# capped at 15 min, 8 times, with equal jitter (half fixed, half random), so the retries always
+# span at least ~30 min. After that the document is flagged `extraction_failed` (audited) so that
+# it goes to review instead of waiting for ever.
 EXTRACT_MAX_RETRIES = 8
 EXTRACT_BACKOFF_FACTOR_S = 30
 EXTRACT_BACKOFF_MAX_S = 900
+
+
+def extract_countdown(retries: int, rand: Callable[[], float] = random.random) -> float:  # noqa: S311
+    """Seconds before retry number `retries + 1`: in [base / 2, base], base = 30 s * 2^retries
+    capped at 900 s. Unlike full jitter it never picks a near-zero wait."""
+    base = float(min(EXTRACT_BACKOFF_FACTOR_S * 2 ** min(retries, 16), EXTRACT_BACKOFF_MAX_S))
+    return base / 2 + rand() * base / 2
 
 
 def is_extract_transient(exc: BaseException) -> bool:
@@ -300,14 +309,20 @@ async def _extract(ledger_id: str, workspace_id: str | None) -> None:
         await engine.dispose()
 
 
-async def _extract_failed(ledger_id: str, code: str) -> None:
+async def _extract_failed(ledger_id: str, workspace_id: str | None, code: str) -> None:
     settings = WorkerSettings()
     engine = make_engine(settings.database_url)
     sessions = make_sessionmaker(engine)
     engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
     try:
         await record_extraction_failed(
-            UUID(ledger_id), code, sessions=sessions, index=engines, settings=settings, now=utcnow()
+            UUID(ledger_id),
+            code,
+            sessions=sessions,
+            index=engines,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id) if workspace_id else None,
         )
     finally:
         await engines.aclose()
@@ -329,16 +344,10 @@ def extract_document_task(
         asyncio.run(_extract(ledger_id, workspace_id))
     except Exception as exc:
         if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
-            countdown = get_exponential_backoff_interval(
-                factor=EXTRACT_BACKOFF_FACTOR_S,
-                retries=retries,
-                maximum=EXTRACT_BACKOFF_MAX_S,
-                full_jitter=True,
-            )
-            raise self.retry(exc=exc, countdown=countdown) from exc
+            raise self.retry(exc=exc, countdown=extract_countdown(retries)) from exc
         # Retries ran out, or a final error: the document must reach review, never wait for
         # ever in `received`.
-        asyncio.run(_extract_failed(ledger_id, extraction_error_code(exc)))
+        asyncio.run(_extract_failed(ledger_id, workspace_id, extraction_error_code(exc)))
         raise
 
 

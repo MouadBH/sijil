@@ -125,6 +125,8 @@ class PaperlessClient:
             headers=headers,
             auth=httpx.BasicAuth(*basic) if basic else None,
             timeout=timeout,
+            # Never an environment proxy: document content goes to the tenant only.
+            trust_env=False,
         )
 
     async def __aenter__(self) -> Self:
@@ -399,31 +401,42 @@ class PaperlessClient:
             and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
         }
 
-    async def ensure_document_type(self, name: str, match: str, algorithm: int) -> int:
-        """The id of the document type called `name` (case-insensitive), created if missing.
-
-        An existing type keeps its id; its matching rule is set to `match`/`algorithm`
-        (case-insensitive) if it differs.
-        """
+    async def _document_type_id(self, name: str) -> int | None:
         response = await self._request(
             "GET", "/api/document_types/", params={"name__iexact": name, "page_size": 100}
         )
         try:
-            rows = [
-                r
+            ids = [
+                int(r["id"])
                 for r in response.json()["results"]
                 if str(r["name"]).casefold() == name.casefold()
             ]
         except (ValueError, KeyError, TypeError):
             raise PaperlessBadResponse("GET /api/document_types/: unexpected body") from None
+        return min(ids) if ids else None
+
+    async def ensure_document_type(self, name: str, match: str, algorithm: int) -> int:
+        """The id of the document type called `name` (case-insensitive), created if missing.
+
+        An existing type is reused exactly as it is: its matching rule is never changed (a
+        tenant admin may have edited it). Race-safe: if another caller created the type between
+        our lookup and our create (Paperless refuses the duplicate name), theirs is returned.
+        """
+        existing = await self._document_type_id(name)
+        if existing is not None:
+            return existing
         rule = {"match": match, "matching_algorithm": algorithm, "is_insensitive": True}
-        if rows:
-            existing = min(rows, key=lambda r: int(r["id"]))
-            type_id = int(existing["id"])
-            if any(existing.get(k) != v for k, v in rule.items()):
-                await self._request("PATCH", f"/api/document_types/{type_id}/", json=rule)
-            return type_id
-        created = await self._request("POST", "/api/document_types/", json={"name": name, **rule})
+        try:
+            created = await self._request(
+                "POST", "/api/document_types/", json={"name": name, **rule}
+            )
+        except PaperlessError as exc:
+            if isinstance(exc, PaperlessUnavailable):
+                raise
+            winner = await self._document_type_id(name)
+            if winner is None:
+                raise
+            return winner
         try:
             return int(created.json()["id"])
         except (ValueError, KeyError, TypeError):

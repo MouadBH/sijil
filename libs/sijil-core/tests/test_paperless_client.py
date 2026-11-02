@@ -341,33 +341,65 @@ def _type_row(**row: object) -> httpx.Response:
 
 
 @respx.mock
-async def test_ensure_document_type_reuses_by_name_and_fixes_its_rule() -> None:
+async def test_ensure_document_type_reuses_by_name_and_never_changes_its_rule() -> None:
+    """A tenant admin may have edited the rule: an existing type is reused as it is."""
     respx.get(f"{BASE}/api/document_types/").mock(
         return_value=_type_row(id=4, name="Invoice", match="", matching_algorithm=0)
     )
-    patch = respx.patch(f"{BASE}/api/document_types/4/").mock(
-        return_value=httpx.Response(200, json={"id": 4})
-    )
+    patch = respx.patch(f"{BASE}/api/document_types/4/")
     post = respx.post(f"{BASE}/api/document_types/")
     async with PaperlessClient(BASE, token="t") as client:
         assert await client.ensure_document_type("invoice", "x", 4) == 4
     assert not post.called
-    assert json.loads(patch.calls.last.request.content) == {
-        "match": "x",
-        "matching_algorithm": 4,
-        "is_insensitive": True,
-    }
+    assert not patch.called
 
 
 @respx.mock
-async def test_ensure_document_type_same_rule_is_left_alone() -> None:
+async def test_ensure_document_type_lost_create_race_returns_the_winner() -> None:
+    """Two first extractions: the other one created the type between our GET and POST."""
     respx.get(f"{BASE}/api/document_types/").mock(
-        return_value=_type_row(id=4, name="invoice", match="x", matching_algorithm=4)
+        side_effect=[
+            httpx.Response(200, json={"results": []}),
+            _type_row(id=9, name="invoice", match="x", matching_algorithm=4),
+        ]
     )
-    patch = respx.patch(f"{BASE}/api/document_types/4/")
+    respx.post(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(400, json={"name": ["already exists"]})
+    )
     async with PaperlessClient(BASE, token="t") as client:
-        assert await client.ensure_document_type("invoice", "x", 4) == 4
-    assert not patch.called
+        assert await client.ensure_document_type("invoice", "x", 4) == 9
+
+
+@respx.mock
+async def test_ensure_document_type_create_refused_and_still_absent_raises() -> None:
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/document_types/").mock(return_value=httpx.Response(400, json={}))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessError):
+            await client.ensure_document_type("invoice", "x", 4)
+
+
+@respx.mock
+async def test_ensure_document_type_create_unavailable_is_not_swallowed() -> None:
+    listing = respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/document_types/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.ensure_document_type("invoice", "x", 4)
+    assert listing.call_count == 1
+
+
+def test_environment_proxies_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Document content must never go through a proxy taken from the environment."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:3128")
+    client = PaperlessClient(BASE, token="t")
+    assert client._http._trust_env is False
+    assert not client._http._mounts
 
 
 @respx.mock
