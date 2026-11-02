@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Final
+from typing import Any, Final, Literal
 from uuid import UUID
 
 from sqlalchemy import URL, select, text
@@ -37,11 +37,14 @@ from sijil_core.settings import CoreSettings
 SCHEMA_VERSION: Final = 1
 MAX_ENGINES: Final = 32
 LOCKED_CODE: Final = "retention.locked"
+# SQLSTATE the triggers raise it with (custom class "SJ": Sijil).
+LOCKED_SQLSTATE: Final = "SJ001"
 # Serialises concurrent first runs of the DDL on one database.
 _SCHEMA_LOCK_KEY: Final = 0x53696A696C  # "Sijil"
 
-_DDL: Final[tuple[str, ...]] = (
-    """CREATE TABLE document_fields (
+_DDL: Final[dict[int, tuple[str, ...]]] = {
+    1: (
+        """CREATE TABLE document_fields (
         ledger_id uuid PRIMARY KEY,
         document_type text,
         "values" jsonb NOT NULL,
@@ -58,8 +61,8 @@ _DDL: Final[tuple[str, ...]] = (
         CONSTRAINT document_fields_sealed_together
             CHECK ((sealed_at IS NULL) = (fields_sha256 IS NULL))
     )""",
-    "CREATE INDEX document_fields_ice ON document_fields ((\"values\" ->> 'supplier_ice'))",
-    """CREATE TABLE extraction_run (
+        "CREATE INDEX document_fields_ice ON document_fields ((\"values\" ->> 'supplier_ice'))",
+        """CREATE TABLE extraction_run (
         id bigserial PRIMARY KEY,
         ledger_id uuid NOT NULL,
         run text NOT NULL CHECK (run IN ('a', 'b')),
@@ -67,30 +70,31 @@ _DDL: Final[tuple[str, ...]] = (
         raw jsonb NOT NULL,
         at timestamptz NOT NULL DEFAULT now()
     )""",
-    "CREATE INDEX extraction_run_ledger ON extraction_run (ledger_id)",
-    """CREATE FUNCTION document_fields_frozen() RETURNS trigger LANGUAGE plpgsql AS $$
+        "CREATE INDEX extraction_run_ledger ON extraction_run (ledger_id)",
+        """CREATE FUNCTION document_fields_frozen() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
         IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
-            RAISE EXCEPTION 'retention.locked';
+            RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
         END IF;
         IF OLD.sealed_at IS NOT NULL THEN
-            RAISE EXCEPTION 'retention.locked';
+            RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
         END IF;
         RETURN NEW;
     END $$""",
-    """CREATE TRIGGER document_fields_frozen BEFORE UPDATE OR DELETE ON document_fields
+        """CREATE TRIGGER document_fields_frozen BEFORE UPDATE OR DELETE ON document_fields
         FOR EACH ROW EXECUTE FUNCTION document_fields_frozen()""",
-    """CREATE TRIGGER document_fields_no_truncate BEFORE TRUNCATE ON document_fields
+        """CREATE TRIGGER document_fields_no_truncate BEFORE TRUNCATE ON document_fields
         FOR EACH STATEMENT EXECUTE FUNCTION document_fields_frozen()""",
-    """CREATE FUNCTION extraction_run_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+        """CREATE FUNCTION extraction_run_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
-        RAISE EXCEPTION 'index.append_only';
+        RAISE EXCEPTION 'index.append_only' USING ERRCODE = 'SJ002';
     END $$""",
-    """CREATE TRIGGER extraction_run_append_only BEFORE UPDATE OR DELETE ON extraction_run
+        """CREATE TRIGGER extraction_run_append_only BEFORE UPDATE OR DELETE ON extraction_run
         FOR EACH ROW EXECUTE FUNCTION extraction_run_append_only()""",
-    """CREATE TRIGGER extraction_run_no_truncate BEFORE TRUNCATE ON extraction_run
+        """CREATE TRIGGER extraction_run_no_truncate BEFORE TRUNCATE ON extraction_run
         FOR EACH STATEMENT EXECUTE FUNCTION extraction_run_append_only()""",
-)
+    ),
+}
 
 
 class RetentionLocked(Exception):  # noqa: N818 - named for the machine code it maps to
@@ -131,14 +135,11 @@ async def ensure_schema(conn: AsyncConnection) -> None:
 async def _ensure_schema(conn: AsyncConnection) -> None:
     await conn.exec_driver_sql(f"SELECT pg_advisory_xact_lock({_SCHEMA_LOCK_KEY})")
     await conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS index_schema (version int PRIMARY KEY)")
-    applied = (await conn.exec_driver_sql("SELECT max(version) FROM index_schema")).scalar()
-    if applied is not None and applied >= SCHEMA_VERSION:
-        return
-    for statement in _DDL:
-        await conn.exec_driver_sql(statement)
-    await conn.execute(
-        text("INSERT INTO index_schema (version) VALUES (:v)"), {"v": SCHEMA_VERSION}
-    )
+    applied = (await conn.exec_driver_sql("SELECT max(version) FROM index_schema")).scalar() or 0
+    for version in sorted(v for v in _DDL if v > applied):
+        for statement in _DDL[version]:
+            await conn.exec_driver_sql(statement)
+        await conn.execute(text("INSERT INTO index_schema (version) VALUES (:v)"), {"v": version})
 
 
 # Access -------------------------------------------------------------------------------------
@@ -150,6 +151,8 @@ _COLUMNS: Final = (
 
 
 def _locked(exc: DBAPIError) -> bool:
+    if getattr(exc.orig, "sqlstate", None) == LOCKED_SQLSTATE:
+        return True
     return LOCKED_CODE in str(exc.orig)
 
 
@@ -175,7 +178,11 @@ async def read_fields(conn: AsyncConnection, ledger_id: UUID) -> FieldsRow | Non
 
 
 async def write_extraction(conn: AsyncConnection, row: FieldsRow) -> None:
-    """Upsert of an extraction result. Raises `RetentionLocked` once the row is sealed."""
+    """Upsert of an extraction result. Raises `RetentionLocked` once the row is sealed.
+
+    It replaces the whole unsealed row, user edits included, so it must only run before review
+    (ledger state `received`).
+    """
     try:
         await conn.execute(
             text(
@@ -219,7 +226,7 @@ async def update_fields(
     ledger_id: UUID,
     values: Mapping[str, str | None],
     *,
-    source: str,
+    source: Literal["extraction", "user"],
     updated_by: UUID | None,
     now: datetime,
 ) -> FieldsRow:
@@ -260,7 +267,20 @@ async def update_fields(
 async def seal_fields(
     conn: AsyncConnection, ledger_id: UUID, *, fields_sha256: str, sealed_at: datetime
 ) -> FieldsRow:
-    """Seals the row once. Same hash again is a no-op; a different one is `RetentionLocked`."""
+    """Seals the row once. Same hash again is a no-op; a different one is `RetentionLocked`.
+
+    Race-safe: the row is locked `FOR UPDATE` inside a transaction (one is opened if none is
+    active), so of two concurrent seals the loser sees the winner's row.
+    """
+    if conn.in_transaction():
+        return await _seal(conn, ledger_id, fields_sha256, sealed_at)
+    async with conn.begin():
+        return await _seal(conn, ledger_id, fields_sha256, sealed_at)
+
+
+async def _seal(
+    conn: AsyncConnection, ledger_id: UUID, fields_sha256: str, sealed_at: datetime
+) -> FieldsRow:
     locked = await conn.execute(
         text(f"SELECT {_COLUMNS} FROM document_fields WHERE ledger_id = :id FOR UPDATE"),  # noqa: S608
         {"id": ledger_id},
@@ -273,13 +293,18 @@ async def seal_fields(
         if existing.fields_sha256 == fields_sha256:
             return existing
         raise RetentionLocked
-    result = await conn.execute(
-        text(
-            "UPDATE document_fields SET sealed_at = :at, fields_sha256 = :sha "  # noqa: S608
-            f"WHERE ledger_id = :id RETURNING {_COLUMNS}"
-        ),
-        {"at": sealed_at, "sha": fields_sha256, "id": ledger_id},
-    )
+    try:
+        result = await conn.execute(
+            text(
+                "UPDATE document_fields SET sealed_at = :at, fields_sha256 = :sha "  # noqa: S608
+                f"WHERE ledger_id = :id RETURNING {_COLUMNS}"
+            ),
+            {"at": sealed_at, "sha": fields_sha256, "id": ledger_id},
+        )
+    except DBAPIError as exc:
+        if _locked(exc):
+            raise RetentionLocked from exc
+        raise
     return _row(result.mappings().one())
 
 
@@ -375,7 +400,7 @@ class IndexEngines:
         self._ensure = ensure
         self._max = max_engines
         self._engines: OrderedDict[UUID, AsyncEngine] = OrderedDict()
-        self._lock = asyncio.Lock()
+        self._building: dict[UUID, asyncio.Lock] = {}
 
     async def _password(self, workspace: Workspace) -> str:
         kind = CredentialKind.index_db_password
@@ -394,26 +419,40 @@ class IndexEngines:
         ).decode()
 
     async def engine(self, workspace: Workspace) -> AsyncEngine:
-        async with self._lock:
+        """The workspace's engine, built (credential read, schema ensured) on first use.
+
+        Callers must `assert_region` first, and must not keep the engine beyond one unit of
+        work: it can be evicted and disposed once 32 other workspaces have been used.
+        A cache hit awaits nothing; a build holds only that workspace's lock, never a global one.
+        """
+        cached = self._engines.get(workspace.id)
+        if cached is not None:
+            self._engines.move_to_end(workspace.id)
+            return cached
+        lock = self._building.setdefault(workspace.id, asyncio.Lock())
+        async with lock:
             cached = self._engines.get(workspace.id)
             if cached is not None:
-                self._engines.move_to_end(workspace.id)
                 return cached
-            password = await self._password(workspace)
-            engine = self._factory(index_url(self._settings, workspace.index_db_name, password))
             try:
-                await self._ensure(engine)
-            except BaseException:
-                await engine.dispose()
-                raise
-            self._engines[workspace.id] = engine
-            while len(self._engines) > self._max:
-                _, evicted = self._engines.popitem(last=False)
-                await evicted.dispose()
-            return engine
+                password = await self._password(workspace)
+                engine = self._factory(index_url(self._settings, workspace.index_db_name, password))
+                try:
+                    await self._ensure(engine)
+                except BaseException:
+                    await engine.dispose()
+                    raise
+                self._engines[workspace.id] = engine
+                evicted = []
+                while len(self._engines) > self._max:
+                    evicted.append(self._engines.popitem(last=False)[1])
+            finally:
+                self._building.pop(workspace.id, None)
+        for old in evicted:
+            await old.dispose()
+        return engine
 
     async def aclose(self) -> None:
-        async with self._lock:
-            engines, self._engines = list(self._engines.values()), OrderedDict()
+        engines, self._engines = list(self._engines.values()), OrderedDict()
         for engine in engines:
             await engine.dispose()

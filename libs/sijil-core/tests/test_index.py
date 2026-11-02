@@ -23,26 +23,38 @@ NOW = datetime(2027, 3, 1, 10, 0, tzinfo=UTC)
 SHA = "a" * 64
 
 
-@pytest.fixture(scope="module")
-def index_db_url() -> Iterator[str]:
+def _admin_run(raw: str, statement: str) -> None:
+    async def go() -> None:
+        engine = create_async_engine(raw, isolation_level="AUTOCOMMIT")
+        try:
+            async with engine.connect() as c:
+                await c.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def _database() -> Iterator[str]:
     raw = os.environ.get("SIJIL_TEST_DATABASE_URL")
     if not raw:
         pytest.skip("set SIJIL_TEST_DATABASE_URL")
     name = f"sijil_idx_{uuid.uuid4().hex[:12]}"
-
-    async def admin(statement: str) -> None:
-        engine = create_async_engine(raw, isolation_level="AUTOCOMMIT")
-        try:
-            async with engine.connect() as conn:
-                await conn.execute(text(statement))
-        finally:
-            await engine.dispose()
-
-    asyncio.run(admin(f"CREATE DATABASE {name}"))
+    _admin_run(raw, f"CREATE DATABASE {name}")
     try:
         yield make_url(raw).set(database=name).render_as_string(hide_password=False)
     finally:
-        asyncio.run(admin(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+        _admin_run(raw, f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+
+
+@pytest.fixture(scope="module")
+def index_db_url() -> Iterator[str]:
+    yield from _database()
+
+
+@pytest.fixture
+def fresh_db_url() -> Iterator[str]:
+    yield from _database()
 
 
 @pytest.fixture
@@ -83,17 +95,107 @@ async def test_ensure_schema_idempotent(conn: AsyncConnection) -> None:
     assert versions == [index.SCHEMA_VERSION]
 
 
-async def test_concurrent_first_runs_apply_once(index_db_url: str) -> None:
-    engine = create_async_engine(index_db_url)
+async def test_concurrent_first_runs_apply_once(fresh_db_url: str) -> None:
+    """Nothing exists yet: four first runs race on the advisory lock, one applies the DDL."""
+    engine = create_async_engine(fresh_db_url)
     try:
-        async with engine.begin() as c1:
-            await index.ensure_schema(c1)
         results = await asyncio.gather(
             *(_run_ensure(engine) for _ in range(4)), return_exceptions=True
         )
         assert results == [None] * 4
+        async with engine.connect() as c:
+            versions = (await c.execute(text("SELECT version FROM index_schema"))).scalars().all()
+        assert versions == [index.SCHEMA_VERSION]
     finally:
         await engine.dispose()
+
+
+async def test_later_versions_apply_in_order(
+    fresh_db_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine = create_async_engine(fresh_db_url)
+    try:
+        await _run_ensure(engine)
+        monkeypatch.setattr(index, "SCHEMA_VERSION", 3)
+        monkeypatch.setattr(
+            index,
+            "_DDL",
+            {
+                **index._DDL,
+                2: ("CREATE TABLE v2 (id int PRIMARY KEY)",),
+                3: ("CREATE TABLE v3 (id int REFERENCES v2 (id))",),
+            },
+        )
+        await _run_ensure(engine)
+        await _run_ensure(engine)
+        async with engine.connect() as c:
+            versions = (
+                (await c.execute(text("SELECT version FROM index_schema ORDER BY version")))
+                .scalars()
+                .all()
+            )
+        assert versions == [1, 2, 3]
+    finally:
+        await engine.dispose()
+
+
+async def test_triggers_raise_dedicated_sqlstate(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    with pytest.raises(DBAPIError) as exc:
+        await conn.execute(
+            text("DELETE FROM document_fields WHERE ledger_id = :id"), {"id": fields.ledger_id}
+        )
+    assert exc.value.orig.sqlstate == "SJ001"  # type: ignore[union-attr]
+
+
+async def test_concurrent_seals_are_race_safe(index_db_url: str) -> None:
+    e1 = create_async_engine(index_db_url)
+    e2 = create_async_engine(index_db_url)
+    try:
+        async with e1.begin() as c:
+            await index.ensure_schema(c)
+            fields = row(number="F-1")
+            await index.write_extraction(c, fields)
+        same, other = "a" * 64, "b" * 64
+
+        async def seal(engine: AsyncEngine, sha: str) -> FieldsRow:
+            async with engine.connect() as c:
+                result = await index.seal_fields(
+                    c, fields.ledger_id, fields_sha256=sha, sealed_at=NOW
+                )
+                await c.commit()
+                return result
+
+        # Same hash from two connections: both succeed, one row.
+        r1, r2 = await asyncio.gather(seal(e1, same), seal(e2, same))
+        assert r1.fields_sha256 == r2.fields_sha256 == same
+        # A different hash loses.
+        with pytest.raises(RetentionLocked):
+            await seal(e2, other)
+
+        racing = row(number="F-2")
+        async with e1.begin() as c:
+            await index.write_extraction(c, racing)
+
+        async def seal_racing(engine: AsyncEngine, sha: str) -> FieldsRow:
+            async with engine.connect() as c:
+                result = await index.seal_fields(
+                    c, racing.ledger_id, fields_sha256=sha, sealed_at=NOW
+                )
+                await c.commit()
+                return result
+
+        outcomes = await asyncio.gather(
+            seal_racing(e1, same), seal_racing(e2, other), return_exceptions=True
+        )
+        winners = [o for o in outcomes if isinstance(o, FieldsRow)]
+        losers = [o for o in outcomes if isinstance(o, RetentionLocked)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+    finally:
+        await e1.dispose()
+        await e2.dispose()
 
 
 async def _run_ensure(engine: AsyncEngine) -> None:
@@ -353,7 +455,7 @@ async def test_engines_lru_disposes_evicted() -> None:
     keys = LocalKeyService(b"k" * 32)
     created: list[FakeEngine] = []
     ws = [workspace_named(f"w{i}") for i in range(3)]
-    # One credential row serves every workspace here, so give each its own context.
+    # The helper's single credential only fits ws[0]: every workspace gets a fixed password below.
     engines = engines_for(ws[0], keys, created, [], max_engines=2)
 
     async def password(w: Workspace) -> str:
@@ -369,3 +471,64 @@ async def test_engines_lru_disposes_evicted() -> None:
     assert e0 is cast(Any, created[0])
     await engines.aclose()
     assert all(e.disposed for e in created)
+
+
+def plain_engines(ensure: Any, max_engines: int = 32) -> tuple[IndexEngines, list[FakeEngine]]:
+    created: list[FakeEngine] = []
+
+    def factory(url: URL) -> Any:
+        engine = FakeEngine(url)
+        created.append(engine)
+        return engine
+
+    engines = IndexEngines(
+        SETTINGS,
+        LocalKeyService(b"k" * 32),
+        FakeSessions(None),  # type: ignore[arg-type]
+        engine_factory=factory,
+        ensure=ensure,
+        max_engines=max_engines,
+    )
+
+    async def password(_w: Workspace) -> str:
+        return "pw"
+
+    engines._password = password  # type: ignore[method-assign,assignment]
+    return engines, created
+
+
+async def test_slow_workspace_does_not_block_cached_ones() -> None:
+    gate = asyncio.Event()
+
+    async def ensure(engine: Any) -> None:
+        if engine.url.database == "index_slow":
+            await gate.wait()
+
+    engines, _ = plain_engines(ensure)
+    fast, slow = workspace_named("fast"), workspace_named("slow")
+    cached = await engines.engine(fast)
+    pending = asyncio.create_task(engines.engine(slow))
+    await asyncio.sleep(0.05)
+    assert not pending.done()
+    assert await asyncio.wait_for(engines.engine(fast), 0.5) is cached
+    # A different new workspace is not held up by the slow one either.
+    other = await asyncio.wait_for(engines.engine(workspace_named("other")), 0.5)
+    assert other is not None
+    gate.set()
+    await pending
+
+
+async def test_concurrent_first_calls_build_one_engine() -> None:
+    calls = 0
+
+    async def ensure(_engine: Any) -> None:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+
+    engines, created = plain_engines(ensure)
+    ws = workspace_named("one")
+    results = await asyncio.gather(*(engines.engine(ws) for _ in range(5)))
+    assert len(created) == 1
+    assert calls == 1
+    assert all(r is results[0] for r in results)
