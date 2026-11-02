@@ -1,5 +1,4 @@
 import asyncio
-import os
 import uuid
 from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
@@ -7,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
@@ -16,6 +15,7 @@ from sijil_core.crypto import LocalKeyService, seal
 from sijil_core.db.models import CredentialKind, TenantCredential, Workspace
 from sijil_core.index import FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.settings import CoreSettings
+from tests.support.index_db import throwaway_index_db
 
 pytestmark = pytest.mark.db
 
@@ -23,38 +23,14 @@ NOW = datetime(2027, 3, 1, 10, 0, tzinfo=UTC)
 SHA = "a" * 64
 
 
-def _admin_run(raw: str, statement: str) -> None:
-    async def go() -> None:
-        engine = create_async_engine(raw, isolation_level="AUTOCOMMIT")
-        try:
-            async with engine.connect() as c:
-                await c.execute(text(statement))
-        finally:
-            await engine.dispose()
-
-    asyncio.run(go())
-
-
-def _database() -> Iterator[str]:
-    raw = os.environ.get("SIJIL_TEST_DATABASE_URL")
-    if not raw:
-        pytest.skip("set SIJIL_TEST_DATABASE_URL")
-    name = f"sijil_idx_{uuid.uuid4().hex[:12]}"
-    _admin_run(raw, f"CREATE DATABASE {name}")
-    try:
-        yield make_url(raw).set(database=name).render_as_string(hide_password=False)
-    finally:
-        _admin_run(raw, f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
-
-
 @pytest.fixture(scope="module")
 def index_db_url() -> Iterator[str]:
-    yield from _database()
+    yield from throwaway_index_db()
 
 
 @pytest.fixture
 def fresh_db_url() -> Iterator[str]:
-    yield from _database()
+    yield from throwaway_index_db()
 
 
 @pytest.fixture
@@ -268,6 +244,24 @@ async def test_extraction_run_append_only(conn: AsyncConnection) -> None:
     assert "index.append_only" in await refused(conn, "UPDATE extraction_run SET model = 'x'")
     assert "index.append_only" in await refused(conn, "DELETE FROM extraction_run")
     assert "index.append_only" in await refused(conn, "TRUNCATE extraction_run")
+
+
+async def test_append_run_records_each_run(conn: AsyncConnection) -> None:
+    ledger_id = uuid.uuid4()
+    await index.append_run(conn, ledger_id, "a", "qwen3:4b", {"number": "F-1"}, NOW)
+    await index.append_run(conn, ledger_id, "b", "qwen3:4b", {"error": "x"}, NOW)
+    rows = (
+        await conn.execute(
+            text(
+                "SELECT run, model, raw, at FROM extraction_run WHERE ledger_id = :id ORDER BY id"
+            ),
+            {"id": ledger_id},
+        )
+    ).all()
+    assert [(r.run, r.model, r.raw, r.at) for r in rows] == [
+        ("a", "qwen3:4b", {"number": "F-1"}, NOW),
+        ("b", "qwen3:4b", {"error": "x"}, NOW),
+    ]
 
 
 async def test_update_fields_merges_and_marks_user(conn: AsyncConnection) -> None:

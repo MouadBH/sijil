@@ -31,6 +31,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.filetypes import FileKind
+from sijil_core.ingest import Enqueue
 from sijil_core.paperless import PaperlessClient, PaperlessUnavailable
 from sijil_core.settings import CoreSettings
 from sijil_core.tenancy import tenant_ref
@@ -132,6 +133,7 @@ async def run(
     *,
     will_retry: bool = False,
     settings: CoreSettings = SETTINGS,
+    enqueue_extract: Enqueue | None = None,
 ) -> None:
     await ingest_document(
         ledger.id,
@@ -143,6 +145,7 @@ async def run(
         poll_interval_s=0,
         settings=settings,
         will_retry=lambda _exc: will_retry,
+        enqueue_extract=enqueue_extract,
     )
 
 
@@ -1041,3 +1044,82 @@ async def test_stored_task_that_is_unknown_or_failed_is_replaced_by_a_new_upload
     assert row.ingest_state is IngestState.consumed
     assert row.paperless_task_id == TASK_ID
     assert row.paperless_doc_id == 5
+
+
+async def test_ingest_consumed_enqueues_extract_after_commit(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    seen: list[tuple[uuid.UUID, uuid.UUID, IngestState, int]] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        # A fresh session sees only committed data: the row must already be `consumed`.
+        async with sessions() as other:
+            row = await other.get(DocumentLedger, ledger_id)
+            assert row is not None
+            audited = len(
+                list(
+                    await other.scalars(
+                        select(AuditEvent).where(AuditEvent.workspace_id == workspace_id)
+                    )
+                )
+            )
+            seen.append((ledger_id, workspace_id, row.ingest_state, audited))
+
+    with respx.mock(assert_all_called=False) as router:
+        mock_flow(router)
+        await run(ledger, sessions, keys, memory_store, enqueue_extract=enqueue)
+    assert seen == [(ledger.id, ready.id, IngestState.consumed, 1)]
+    # A redelivery of the settled row sends nothing again.
+    with respx.mock(assert_all_called=False) as router:
+        mock_flow(router)
+        await run(ledger, sessions, keys, memory_store, enqueue_extract=enqueue)
+    assert len(seen) == 1
+
+
+async def test_failed_extract_enqueue_does_not_fail_ingest(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+
+    async def broken(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        raise ConnectionError("broker down")
+
+    with respx.mock(assert_all_called=False) as router:
+        mock_flow(router)
+        await run(ledger, sessions, keys, memory_store, enqueue_extract=broken)
+    assert (await reload(db, ledger)).ingest_state is IngestState.consumed
+
+
+async def test_unsupported_ingest_does_not_enqueue_extract(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    sent: list[uuid.UUID] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append(ledger_id)
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/").respond(200, json={"results": []})
+        router.post(f"{URL}/api/documents/post_document/").respond(
+            400, json={"document": ["File type text/xml not supported"]}
+        )
+        await run(ledger, sessions, keys, memory_store, enqueue_extract=enqueue)
+    assert (await reload(db, ledger)).ingest_state is IngestState.unsupported
+    assert sent == []

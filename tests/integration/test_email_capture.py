@@ -17,7 +17,7 @@ from sqlalchemy import select
 
 from sijil_core.db.models import DocumentLedger, DocumentSource, IngestState
 from sijil_core.storage import ObjectRef
-from tests.integration.test_ingest_formats import Harness, harness  # noqa: F401
+from tests.support.t1 import Harness
 
 pytestmark = pytest.mark.integration
 

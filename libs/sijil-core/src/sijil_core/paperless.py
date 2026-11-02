@@ -368,3 +368,78 @@ class PaperlessClient:
 
     async def delete_document(self, doc_id: int) -> None:
         await self._request("DELETE", f"/api/documents/{doc_id}/")
+
+    async def document_content(self, doc_id: int) -> str:
+        """The document's text as Paperless extracted it (OCR or text layer), or ""."""
+        response = await self._request(
+            "GET", f"/api/documents/{doc_id}/", params={"fields": "id,content"}
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/documents/{id}/: not JSON") from None
+        if not isinstance(body, dict):
+            raise PaperlessBadResponse("GET /api/documents/{id}/: unexpected body")
+        content = body.get("content")
+        return content if isinstance(content, str) else ""
+
+    async def document_suggestions(self, doc_id: int) -> dict[str, list[int]]:
+        """Paperless's matching suggestions (`document_types`, `tags`, ...): id lists only."""
+        response = await self._request("GET", f"/api/documents/{doc_id}/suggestions/")
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/documents/{id}/suggestions/: not JSON") from None
+        if not isinstance(body, dict):
+            raise PaperlessBadResponse("GET /api/documents/{id}/suggestions/: unexpected body")
+        return {
+            str(key): [int(v) for v in value]
+            for key, value in body.items()
+            if isinstance(value, list)
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        }
+
+    async def ensure_document_type(self, name: str, match: str, algorithm: int) -> int:
+        """The id of the document type called `name` (case-insensitive), created if missing.
+
+        An existing type keeps its id; its matching rule is set to `match`/`algorithm`
+        (case-insensitive) if it differs.
+        """
+        response = await self._request(
+            "GET", "/api/document_types/", params={"name__iexact": name, "page_size": 100}
+        )
+        try:
+            rows = [
+                r
+                for r in response.json()["results"]
+                if str(r["name"]).casefold() == name.casefold()
+            ]
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("GET /api/document_types/: unexpected body") from None
+        rule = {"match": match, "matching_algorithm": algorithm, "is_insensitive": True}
+        if rows:
+            existing = min(rows, key=lambda r: int(r["id"]))
+            type_id = int(existing["id"])
+            if any(existing.get(k) != v for k, v in rule.items()):
+                await self._request("PATCH", f"/api/document_types/{type_id}/", json=rule)
+            return type_id
+        created = await self._request("POST", "/api/document_types/", json={"name": name, **rule})
+        try:
+            return int(created.json()["id"])
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("POST /api/document_types/: unexpected body") from None
+
+    async def set_title_and_type(self, doc_id: int, title: str, document_type_id: int) -> None:
+        await self._request(
+            "PATCH",
+            f"/api/documents/{doc_id}/",
+            json={"title": title, "document_type": document_type_id},
+        )
+
+    async def download(self, doc_id: int, *, original: bool = False) -> bytes:
+        """The archived (PDF/A) version, or the original with `original=True`."""
+        params = {"original": "true"} if original else None
+        response = await self._request(
+            "GET", f"/api/documents/{doc_id}/download/", params=params, headers={"Accept": "*/*"}
+        )
+        return response.content

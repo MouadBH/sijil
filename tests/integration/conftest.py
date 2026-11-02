@@ -7,7 +7,7 @@ tenant like the control plane does. DockerRuntime's own attachment list stays pr
 
 import contextlib
 import socket
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import AbstractContextManager
 
 import docker
@@ -16,6 +16,7 @@ from docker.errors import APIError, NotFound
 
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
+from tests.support.t1 import Harness
 
 AttachRunner = Callable[[str], AbstractContextManager[None]]
 
@@ -55,3 +56,14 @@ def attach_runner(docker_client: docker.DockerClient) -> AttachRunner:
                 network.disconnect(me, force=True)
 
     return attach
+
+
+@pytest.fixture
+async def harness() -> AsyncIterator[Harness]:
+    """A throw-away workspace on the sample tenant t1 (see tests/support/t1.py)."""
+    h = Harness()
+    await h.prepare_paperless()
+    try:
+        yield h
+    finally:
+        await h.close()

@@ -14,11 +14,14 @@ from sqlalchemy.exc import OperationalError
 from sijil_core.crypto import LocalKeyService
 from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
+from sijil_core.index import IndexEngines
+from sijil_core.ollama import OllamaClient, OllamaError, OllamaUnavailable
 from sijil_core.paperless import (
     PaperlessClient,
     PaperlessError,
     PaperlessUnavailable,
 )
+from sijil_core.region import RegionMismatch
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
@@ -26,9 +29,15 @@ from sijil_worker.drift import (
     enqueue_drift_checks,
     record_check_failed,
 )
+from sijil_worker.extract import (
+    extract_document,
+    record_extraction_failed,
+    requeue_unextracted,
+)
 from sijil_worker.ingest import (
     INGEST_MAX_RETRIES,
     ConsumeFailed,
+    WorkspaceNotActive,
     ingest_document,
     is_transient_cause,
     requeue_stuck_ingest,
@@ -145,6 +154,18 @@ def reconcile_tenants_task() -> list[str]:
         client.close()
 
 
+EXTRACT_TASK = ("sijil.extract_document", "extraction")
+
+
+async def _send_extract(ledger_id: UUID, workspace_id: UUID) -> None:
+    name, queue = EXTRACT_TASK
+    current_app.send_task(
+        name,
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue=queue,
+    )
+
+
 async def _ingest(
     ledger_id: str,
     workspace_id: str,
@@ -164,6 +185,7 @@ async def _ingest(
             workspace_id=UUID(workspace_id),
             will_retry=will_retry,
             retry_after_s=retry_after_s,
+            enqueue_extract=_send_extract,
         )
     finally:
         await engine.dispose()
@@ -220,6 +242,121 @@ async def _requeue() -> int:
 def requeue_stuck_ingest_task() -> int:
     """Re-send ingest for rows nothing is working on (lost message, delay over, dead worker)."""
     return asyncio.run(_requeue())
+
+
+# Extraction outlasts an Ollama or Paperless that is down for a while, like ingest: 30 s, 1 min,
+# 2 min ... capped at 15 min (full jitter), 8 times. After that the document is flagged
+# `extraction_failed` (audited) so that it goes to review instead of waiting for ever.
+EXTRACT_MAX_RETRIES = 8
+EXTRACT_BACKOFF_FACTOR_S = 30
+EXTRACT_BACKOFF_MAX_S = 900
+
+
+def is_extract_transient(exc: BaseException) -> bool:
+    """Ollama or Paperless down, slow or 5xx, the workspace paused, the database unreachable."""
+    if isinstance(exc, OllamaError):
+        return isinstance(exc, OllamaUnavailable)
+    return isinstance(exc, WorkspaceNotActive) or is_transient(exc)
+
+
+def extraction_error_code(exc: BaseException) -> str:
+    """The machine code audited with `document.extraction_failed`."""
+    if isinstance(exc, OllamaUnavailable):
+        return "extraction.ai_unavailable"
+    if isinstance(exc, OllamaError):
+        return "extraction.ai_error"
+    if isinstance(exc, PaperlessUnavailable):
+        return "extraction.paperless_unavailable"
+    if isinstance(exc, PaperlessError):
+        return "extraction.paperless_error"
+    if isinstance(exc, WorkspaceNotActive):
+        return "extraction.workspace_not_active"
+    if isinstance(exc, RegionMismatch):
+        return "extraction.region_mismatch"
+    return "extraction.error"
+
+
+async def _extract(ledger_id: str, workspace_id: str | None) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        async with OllamaClient(settings.ollama_url, settings.ai_allowed_hosts) as ollama:
+            await extract_document(
+                UUID(ledger_id),
+                sessions=sessions,
+                keys=keys,
+                index=engines,
+                paperless=PaperlessClient,
+                ollama=ollama,
+                settings=settings,
+                now=utcnow(),
+                workspace_id=UUID(workspace_id) if workspace_id else None,
+            )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _extract_failed(ledger_id: str, code: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        await record_extraction_failed(
+            UUID(ledger_id), code, sessions=sessions, index=engines, settings=settings, now=utcnow()
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True,
+    name="sijil.extract_document",
+    queue="extraction",
+    max_retries=EXTRACT_MAX_RETRIES,
+)
+def extract_document_task(
+    self: "Task[Any, Any]", ledger_id: str, workspace_id: str | None = None
+) -> None:
+    """Fields of one consumed document by the in-region model (see sijil_worker.extract)."""
+    retries = int(self.request.retries or 0)
+    try:
+        asyncio.run(_extract(ledger_id, workspace_id))
+    except Exception as exc:
+        if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=EXTRACT_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=EXTRACT_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        # Retries ran out, or a final error: the document must reach review, never wait for
+        # ever in `received`.
+        asyncio.run(_extract_failed(ledger_id, extraction_error_code(exc)))
+        raise
+
+
+async def _requeue_extract() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await requeue_unextracted(
+            make_sessionmaker(engine), _send_extract, region=settings.region
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unextracted")
+def requeue_unextracted_task() -> int:
+    """Re-send extraction for consumed rows still `received` (a lost message)."""
+    return asyncio.run(_requeue_extract())
 
 
 DRIFT_MAX_RETRIES = 5

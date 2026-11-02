@@ -58,6 +58,10 @@ x-worker-env: &worker-env
   SIJIL_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-sijil}
   SIJIL_TESSDATA_VOLUME: ${COMPOSE_PROJECT_NAME:-sijil}_tessdata
   SIJIL_TENANT_SUBNET_POOL: 10.240.0.0/16
+  # Extraction: the compose `ollama` (network `ai`) is the only AI host allowed.
+  SIJIL_OLLAMA_URL: http://ollama:11434
+  SIJIL_AI_ALLOWED_HOSTS: ollama
+  SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
 
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
@@ -114,7 +118,8 @@ services:
     profiles: [models]
     entrypoint: ["sh", "-c", "ollama serve & sleep 3 && ollama pull \"$$OLLAMA_MODEL\""]
     environment:
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:8b}
+      # `make models` passes SIJIL_EXTRACTION_MODEL here (see the Makefile).
+      OLLAMA_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
     volumes: [ollama:/root/.ollama]
     networks: [core]
 

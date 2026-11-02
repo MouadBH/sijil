@@ -224,6 +224,24 @@ async def write_extraction(conn: AsyncConnection, row: FieldsRow) -> None:
         raise
 
 
+async def append_run(
+    conn: AsyncConnection,
+    ledger_id: UUID,
+    run: Literal["a", "b"],
+    model: str | None,
+    raw: Mapping[str, Any],
+    at: datetime,
+) -> None:
+    """Records what one model run said (evidence; the table is append-only)."""
+    await conn.execute(
+        text(
+            "INSERT INTO extraction_run (ledger_id, run, model, raw, at) "
+            "VALUES (:ledger_id, :run, :model, CAST(:raw AS jsonb), :at)"
+        ),
+        {"ledger_id": ledger_id, "run": run, "model": model, "raw": json.dumps(raw), "at": at},
+    )
+
+
 async def update_fields(
     conn: AsyncConnection,
     ledger_id: UUID,

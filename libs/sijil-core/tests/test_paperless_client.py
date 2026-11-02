@@ -8,6 +8,7 @@ import respx
 from sijil_core.paperless import (
     SERVICE_PERMISSIONS,
     SUPPORT_PERMISSIONS,
+    PaperlessBadResponse,
     PaperlessClient,
     PaperlessDoc,
     PaperlessError,
@@ -264,3 +265,131 @@ async def test_500_raises_unavailable() -> None:
             await client._request("GET", "/api/documents/")
     assert exc.value.status == 500
     assert route.call_count == 1  # 500 is mapped, not retried inside the client
+
+
+# M3: content, suggestions, document types, title/type ------------------------------------
+
+
+@respx.mock
+async def test_document_content_reads_only_the_content_field() -> None:
+    route = respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "content": "FACTURE N° F-1"})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.document_content(7) == "FACTURE N° F-1"
+    assert route.calls.last.request.url.params["fields"] == "id,content"
+
+
+@respx.mock
+async def test_document_content_absent_is_empty() -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "content": None})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.document_content(7) == ""
+
+
+@respx.mock
+async def test_document_content_bad_body_is_bad_response() -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(return_value=httpx.Response(200, json=[1]))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessBadResponse):
+            await client.document_content(7)
+
+
+@respx.mock
+async def test_document_suggestions_keeps_id_lists_only() -> None:
+    respx.get(f"{BASE}/api/documents/7/suggestions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "correspondents": [],
+                "tags": [3],
+                "document_types": [5, 2],
+                "storage_paths": [],
+                "dates": ["2026-09-30"],
+            },
+        )
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        suggestions = await client.document_suggestions(7)
+    assert suggestions["document_types"] == [5, 2]
+    assert suggestions["tags"] == [3]
+    assert "dates" not in suggestions
+
+
+@respx.mock
+async def test_ensure_document_type_creates_when_missing() -> None:
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    post = respx.post(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(201, json={"id": 11})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_document_type("invoice", r"\bfacture\b", 4) == 11
+    assert json.loads(post.calls.last.request.content) == {
+        "name": "invoice",
+        "match": r"\bfacture\b",
+        "matching_algorithm": 4,
+        "is_insensitive": True,
+    }
+
+
+def _type_row(**row: object) -> httpx.Response:
+    return httpx.Response(200, json={"results": [{"is_insensitive": True, **row}]})
+
+
+@respx.mock
+async def test_ensure_document_type_reuses_by_name_and_fixes_its_rule() -> None:
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=_type_row(id=4, name="Invoice", match="", matching_algorithm=0)
+    )
+    patch = respx.patch(f"{BASE}/api/document_types/4/").mock(
+        return_value=httpx.Response(200, json={"id": 4})
+    )
+    post = respx.post(f"{BASE}/api/document_types/")
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_document_type("invoice", "x", 4) == 4
+    assert not post.called
+    assert json.loads(patch.calls.last.request.content) == {
+        "match": "x",
+        "matching_algorithm": 4,
+        "is_insensitive": True,
+    }
+
+
+@respx.mock
+async def test_ensure_document_type_same_rule_is_left_alone() -> None:
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=_type_row(id=4, name="invoice", match="x", matching_algorithm=4)
+    )
+    patch = respx.patch(f"{BASE}/api/document_types/4/")
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_document_type("invoice", "x", 4) == 4
+    assert not patch.called
+
+
+@respx.mock
+async def test_set_title_and_type_patches_the_document() -> None:
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_title_and_type(7, "2026-09-30 Atlas F-1", 11)
+    assert json.loads(patch.calls.last.request.content) == {
+        "title": "2026-09-30 Atlas F-1",
+        "document_type": 11,
+    }
+
+
+@respx.mock
+async def test_download_archive_or_original() -> None:
+    route = respx.get(f"{BASE}/api/documents/7/download/").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.7")
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.download(7) == b"%PDF-1.7"
+        assert "original" not in route.calls.last.request.url.params
+        await client.download(7, original=True)
+        assert route.calls.last.request.url.params["original"] == "true"

@@ -44,6 +44,7 @@ down:
 smoke:
 	infra/scripts/smoke.sh
 
+# Pulls SIJIL_EXTRACTION_MODEL (from the environment or infra/compose/.env; qwen3:4b by default).
 models:
 	$(COMPOSE) --profile models run --rm ollama-pull
 

@@ -1,0 +1,939 @@
+"""Extraction of a consumed document: Paperless content -> two Ollama runs -> the index row.
+
+Paperless is respx, Ollama an httpx MockTransport, the index a throw-away database reached
+through a real `IndexEngines` (its credential sealed like provisioning does).
+"""
+
+import hashlib
+import json
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, get_args
+
+import httpx
+import pytest
+import respx
+from sqlalchemy import select, text
+from sqlalchemy.engine import URL
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from sijil_core import index
+from sijil_core.crypto import LocalKeyService, seal
+from sijil_core.db.models import (
+    AuditEvent,
+    CredentialKind,
+    DocumentLedger,
+    DocumentSource,
+    DocumentState,
+    IngestState,
+    Organisation,
+    OrgType,
+    TenantCredential,
+    Workspace,
+    WorkspaceState,
+)
+from sijil_core.fields import DOCUMENT_TYPES, FIELD_NAMES
+from sijil_core.index import FieldsRow, IndexEngines
+from sijil_core.ollama import OllamaClient, OllamaUnavailable
+from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
+from sijil_worker import tasks
+from sijil_worker.app import make_celery
+from sijil_worker.extract import (
+    PROMPT_A,
+    PROMPT_B,
+    RawExtraction,
+    extract_document,
+    extraction_schema,
+    record_extraction_failed,
+    requeue_unextracted,
+)
+from sijil_worker.settings import WorkerSettings
+from sijil_worker.taxonomy import RULES, ensure_taxonomy
+from tests.support.index_db import throwaway_index_db
+
+pytestmark = pytest.mark.db
+
+PAPERLESS = "http://paperless-ws:8000"
+OLLAMA = "http://ollama:11434"
+TOKEN = "tok-" + "e" * 36
+DOC_ID = 7
+NOW = datetime(2026, 10, 2, 9, 30, tzinfo=UTC)
+SETTINGS = WorkerSettings.model_construct(region="ma-cas", environment="test")
+FIXTURES = Path(__file__).parents[3] / "fixtures"
+MANIFEST = {i["file"]: i for i in json.loads((FIXTURES / "invoices" / "manifest.json").read_text())}
+SUPPLIERS = {s["ice"]: s for s in json.loads((FIXTURES / "suppliers.json").read_text())}
+SAMPLE_01 = MANIFEST["sample-01-fr.pdf"]
+SUPPLIER_01 = SUPPLIERS[SAMPLE_01["supplier_ice"]]
+
+# SAMPLE: what Paperless gives for fixtures/invoices/sample-01-fr.pdf (fictitious company).
+CONTENT_01 = (
+    "SAMPLE / ÉCHANTILLON\n"
+    f"{SUPPLIER_01['name']}\nCasablanca\nICE : {SUPPLIER_01['ice']}\n"
+    f"FACTURE N° {SAMPLE_01['number']}\nDate : {SAMPLE_01['date']}\n"
+    "Client : Entreprise Exemple SARL — Casablanca\n"
+    f"Désignation : {SAMPLE_01['item']}\n"
+    "Total HT 1 250,00 MAD\nTVA 20 % 250,00 MAD\nTotal TTC 1 500,00 MAD\n"
+)
+# SAMPLE: the values a model copies from it, as printed.
+RAW_01: dict[str, str | None] = {
+    "document_type": "invoice",
+    "supplier_name": SUPPLIER_01["name"],
+    "supplier_ice": SUPPLIER_01["ice"],
+    "date": SAMPLE_01["date"],
+    "number": SAMPLE_01["number"],
+    "total_ht": "1 250,00 MAD",
+    "vat": "250,00 MAD",
+    "vat_rate": "20 %",
+    "total_ttc": "1 500,00 MAD",
+    "currency": "MAD",
+}
+CANONICAL_01 = {
+    "document_type": "invoice",
+    "supplier_name": SUPPLIER_01["name"],
+    "supplier_ice": SAMPLE_01["supplier_ice"],
+    "date": SAMPLE_01["date"],
+    "number": SAMPLE_01["number"],
+    "total_ht": SAMPLE_01["ht"],
+    "vat": SAMPLE_01["tva"],
+    "vat_rate": str(SUPPLIER_01["vat_rate"]),
+    "total_ttc": SAMPLE_01["ttc"],
+    "currency": SAMPLE_01["currency"],
+}
+TYPE_IDS = {name: n + 1 for n, name in enumerate(DOCUMENT_TYPES)}
+
+
+# Fixtures ---------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sijil_core.paperless._BACKOFF_S", 0)
+
+
+@pytest.fixture
+def keys() -> LocalKeyService:
+    return LocalKeyService(b"k" * 32)
+
+
+@pytest.fixture
+def sessions(db: AsyncSession) -> async_sessionmaker[AsyncSession]:
+    return async_sessionmaker(db.bind, expire_on_commit=False)
+
+
+@pytest.fixture(scope="module")
+def index_db_url() -> Iterator[str]:
+    yield from throwaway_index_db()
+
+
+def _credential(ws: Workspace, keys: LocalKeyService, kind: CredentialKind, secret: str) -> Any:
+    envelope = seal(secret.encode(), keys, ws.kms_key_id, f"{ws.id}:{kind}")
+    return TenantCredential(workspace_id=ws.id, kind=kind, envelope=envelope.to_bytes())
+
+
+@pytest.fixture
+async def ready(db: AsyncSession, workspace: Workspace, keys: LocalKeyService) -> Workspace:
+    """Active, with its Paperless URL, service token and index database password."""
+    workspace.paperless_url = PAPERLESS
+    db.add(_credential(workspace, keys, CredentialKind.service_token, TOKEN))
+    db.add(_credential(workspace, keys, CredentialKind.index_db_password, "pw"))
+    await db.commit()
+    return workspace
+
+
+@pytest.fixture
+async def engines(
+    index_db_url: str, keys: LocalKeyService, sessions: async_sessionmaker[AsyncSession]
+) -> AsyncIterator[IndexEngines]:
+    """The real engine cache, with every workspace's database being the throw-away one."""
+
+    def factory(_url: URL) -> AsyncEngine:
+        return create_async_engine(index_db_url)
+
+    found = IndexEngines(SETTINGS, keys, sessions, engine_factory=factory)
+    yield found
+    await found.aclose()
+
+
+async def make_ledger(
+    db: AsyncSession,
+    workspace: Workspace,
+    *,
+    state: DocumentState = DocumentState.received,
+    ingest_state: IngestState = IngestState.consumed,
+    age: timedelta = timedelta(0),
+) -> DocumentLedger:
+    sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    row = DocumentLedger(
+        workspace_id=workspace.id,
+        sha256=sha,
+        md5="0" * 32,
+        size_bytes=10,
+        content_kind="pdf",
+        source=DocumentSource.upload,
+        object_key=f"k/{sha}",
+        object_version_id="v1",
+        state=state,
+        ingest_state=ingest_state,
+        paperless_doc_id=DOC_ID if ingest_state is IngestState.consumed else None,
+        retention_until=NOW.date() + timedelta(days=3650),
+        ingested_at=NOW - age,
+    )
+    db.add(row)
+    await db.commit()
+    return row
+
+
+class FakeOllama:
+    """Answers by seed (1 = run A, 2 = run B); records every request."""
+
+    def __init__(self, answers: dict[int, Any]) -> None:
+        self.answers = answers
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        body = json.loads(request.content)
+        answer = self.answers[body["options"]["seed"]]
+        if isinstance(answer, httpx.Response):
+            return answer
+        content = answer if isinstance(answer, str) else json.dumps(answer)
+        return httpx.Response(200, json={"message": {"role": "assistant", "content": content}})
+
+    def client(self) -> OllamaClient:
+        return OllamaClient(OLLAMA, {"ollama"}, transport=httpx.MockTransport(self))
+
+
+def _document_types(request: httpx.Request) -> httpx.Response:
+    name = request.url.params["name__iexact"]
+    rule = RULES.get(name)
+    row = {
+        "id": TYPE_IDS[name],
+        "name": name,
+        "match": rule or "",
+        "matching_algorithm": 4 if rule else 0,
+        "is_insensitive": True,
+    }
+    return httpx.Response(200, json={"results": [row]})
+
+
+def mock_paperless(
+    router: respx.MockRouter,
+    *,
+    content: str = CONTENT_01,
+    suggested: list[int] | None = None,
+) -> respx.Route:
+    route = router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(
+        200, json={"id": DOC_ID, "content": content}
+    )
+    router.get(f"{PAPERLESS}/api/document_types/").mock(side_effect=_document_types)
+    router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/suggestions/").respond(
+        200,
+        json={
+            "correspondents": [],
+            "tags": [],
+            "document_types": [TYPE_IDS["invoice"]] if suggested is None else suggested,
+            "storage_paths": [],
+            "dates": [],
+        },
+    )
+    return route
+
+
+def paperless(base_url: str, **kw: Any) -> PaperlessClient:
+    return PaperlessClient(base_url, **kw)
+
+
+async def run(
+    ledger: DocumentLedger,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ollama: FakeOllama,
+    *,
+    settings: WorkerSettings = SETTINGS,
+) -> None:
+    async with ollama.client() as client:
+        await extract_document(
+            ledger.id,
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=paperless,
+            ollama=client,
+            settings=settings,
+            now=NOW,
+        )
+
+
+async def fields_of(engines: IndexEngines, workspace: Workspace, ledger_id: uuid.UUID) -> Any:
+    async with (await engines.engine(workspace)).connect() as conn:
+        return await index.read_fields(conn, ledger_id)
+
+
+async def runs_of(engines: IndexEngines, workspace: Workspace, ledger_id: uuid.UUID) -> Any:
+    async with (await engines.engine(workspace)).connect() as conn:
+        result = await conn.execute(
+            text("SELECT run, model, raw FROM extraction_run WHERE ledger_id = :id ORDER BY id"),
+            {"id": ledger_id},
+        )
+        return result.all()
+
+
+async def events(db: AsyncSession, workspace: Workspace) -> list[AuditEvent]:
+    rows = await db.scalars(
+        select(AuditEvent).where(AuditEvent.workspace_id == workspace.id).order_by(AuditEvent.seq)
+    )
+    return list(rows)
+
+
+async def reload(db: AsyncSession, ledger: DocumentLedger) -> DocumentLedger:
+    row = await db.get(DocumentLedger, ledger.id, populate_existing=True)
+    assert row is not None
+    return row
+
+
+# The model contract -----------------------------------------------------------------------
+
+
+def test_raw_extraction_has_every_field_as_optional_text() -> None:
+    assert tuple(RawExtraction.model_fields) == FIELD_NAMES
+    literal, none = get_args(RawExtraction.model_fields["document_type"].annotation)
+    assert get_args(literal) == DOCUMENT_TYPES
+    assert none is type(None)
+    assert RawExtraction().model_dump() == dict.fromkeys(FIELD_NAMES)
+
+
+def test_extraction_schema_is_nullable_strings_and_a_type_enum() -> None:
+    schema = extraction_schema()
+    assert schema["type"] == "object"
+    assert schema["required"] == list(FIELD_NAMES)
+    assert list(schema["properties"]) == list(FIELD_NAMES)
+    for name in FIELD_NAMES:
+        assert schema["properties"][name]["type"] == ["string", "null"]
+    assert schema["properties"]["document_type"]["enum"] == [*DOCUMENT_TYPES, None]
+
+
+@pytest.mark.parametrize("prompt", [PROMPT_A, PROMPT_B], ids=["a", "b"])
+def test_prompts_carry_the_rules(prompt: str) -> None:
+    for label in (
+        "Total HT",
+        "المجموع دون احتساب الرسوم",
+        "TVA",
+        "الضريبة على القيمة المضافة",
+        "Total TTC",
+        "المجموع مع احتساب الرسوم",
+        "ICE",
+        "التعريف الموحد للمقاولة",
+        "DH",
+        "درهم",
+        "MAD",
+        "Client",
+        "الزبون",
+        "null",
+    ):
+        assert label in prompt, label
+    lowered = prompt.lower()
+    assert "issued" in lowered
+    assert "as printed" in lowered
+    assert "order" in lowered
+    for name in FIELD_NAMES:
+        assert name in prompt
+
+
+def test_prompts_are_worded_differently() -> None:
+    assert PROMPT_A != PROMPT_B
+    assert PROMPT_A.split("\n")[0] != PROMPT_B.split("\n")[0]
+
+
+def test_settings_defaults_and_hosts_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = {
+        "SIJIL_REGION": "ma-cas",
+        "SIJIL_ENVIRONMENT": "test",
+        "SIJIL_REDIS_URL": "redis://127.0.0.1:1/0",
+        "SIJIL_MASTER_KEY": "a" * 43 + "=",
+        "SIJIL_DATABASE_URL": "postgresql+asyncpg://x:y@h/z",
+        "SIJIL_PROVISIONER_DATABASE_URL": "postgresql+asyncpg://x:y@h/z",
+        "SIJIL_TENANT_IMAGE": "img:1",
+        "SIJIL_COMPOSE_PROJECT": "sijil",
+        "SIJIL_TESSDATA_VOLUME": "t",
+    }
+    for key, value in base.items():
+        monkeypatch.setenv(key, value)
+    s = WorkerSettings()
+    assert (s.extraction_model, s.ollama_url, s.ai_allowed_hosts) == (
+        "qwen3:4b",
+        "http://ollama:11434",
+        frozenset({"ollama"}),
+    )
+    monkeypatch.setenv("SIJIL_AI_ALLOWED_HOSTS", "ollama, ollama-2")
+    assert WorkerSettings().ai_allowed_hosts == frozenset({"ollama", "ollama-2"})
+
+
+# Taxonomy ---------------------------------------------------------------------------------
+
+
+async def test_ensure_taxonomy_idempotent() -> None:
+    """A fake Paperless store of document types: the second run creates and changes nothing."""
+    store: dict[int, dict[str, Any]] = {}
+
+    def listing(request: httpx.Request) -> httpx.Response:
+        name = request.url.params["name__iexact"].casefold()
+        rows = [r for r in store.values() if r["name"].casefold() == name]
+        return httpx.Response(200, json={"results": rows})
+
+    def create(request: httpx.Request) -> httpx.Response:
+        row = {"id": len(store) + 1, **json.loads(request.content)}
+        store[row["id"]] = row
+        return httpx.Response(201, json=row)
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{PAPERLESS}/api/document_types/").mock(side_effect=listing)
+        post = router.post(f"{PAPERLESS}/api/document_types/").mock(side_effect=create)
+        patch = router.patch(url__regex=rf"{PAPERLESS}/api/document_types/\d+/")
+        async with PaperlessClient(PAPERLESS, token=TOKEN) as client:
+            first = await ensure_taxonomy(client)
+            second = await ensure_taxonomy(client)
+    assert first == second
+    assert set(first) == set(DOCUMENT_TYPES)
+    assert post.call_count == len(DOCUMENT_TYPES)
+    assert not patch.called
+    by_name = {r["name"]: r for r in store.values()}
+    assert by_name["invoice"]["match"] == r"\b(facture|invoice)\b|فاتورة"
+    assert by_name["receipt"]["match"] == r"\b(re[çc]u|receipt|ticket de caisse)\b|وصل"
+    assert by_name["contract"]["match"] == r"\b(contrat|contract)\b|عقد"
+    assert (
+        by_name["bank_statement"]["match"]
+        == r"relev[ée] (bancaire|de compte)|bank statement|كشف الحساب"
+    )
+    assert by_name["payslip"]["match"] == r"bulletin de (paie|salaire)|payslip|ورقة الأداء"
+    assert by_name["tax_notice"]["match"] == r"avis d'imposition|tax notice|إشعار ضريبي"
+    assert all(r["is_insensitive"] is True for r in store.values())
+    assert {n: r["matching_algorithm"] for n, r in by_name.items()} == {
+        **dict.fromkeys(DOCUMENT_TYPES, 4),
+        "other": 0,
+    }
+    assert by_name["other"]["match"] == ""
+
+
+# The pipeline -----------------------------------------------------------------------------
+
+
+async def test_extraction_schema(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """sample-01, both runs agreeing: the stored values are the manifest's canonical strings."""
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, ollama)
+    row = await fields_of(engines, ready, ledger.id)
+    assert isinstance(row, FieldsRow)
+    assert dict(row.values) == CANONICAL_01
+    assert row.document_type == "invoice"
+    assert row.confidence == {}
+    assert row.flags == ()
+    assert row.model == "qwen3:4b"
+    assert row.extracted_at == NOW
+    assert row.source == dict.fromkeys(FIELD_NAMES, "extraction")
+    assert all(row.signals[name]["runs_agree"] is True for name in FIELD_NAMES)
+    assert row.signals["document_type"]["paperless_agrees"] is True
+    # Both runs are kept as evidence, and both used the schema with their own prompt and seed.
+    runs = await runs_of(engines, ready, ledger.id)
+    assert [(r.run, r.model, r.raw) for r in runs] == [
+        ("a", "qwen3:4b", RAW_01),
+        ("b", "qwen3:4b", RAW_01),
+    ]
+    bodies = [json.loads(r.content) for r in ollama.requests]
+    assert [b["options"]["seed"] for b in bodies] == [1, 2]
+    assert [b["messages"][0]["content"] for b in bodies] == [PROMPT_A, PROMPT_B]
+    assert all(b["format"] == extraction_schema() for b in bodies)
+    assert all(CONTENT_01.strip() in b["messages"][1]["content"] for b in bodies)
+    # The ledger is left for routing (Task 5); the audit records the run.
+    assert (await reload(db, ledger)).state is DocumentState.received
+    (event,) = await events(db, ready)
+    assert event.action == "document.extracted"
+    assert event.data == {"model": "qwen3:4b", "runs_agree_count": len(FIELD_NAMES)}
+
+
+async def test_no_external_host_called(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    # respx refuses any request it has no route for, so an unknown host would fail the run.
+    with respx.mock(assert_all_called=False, assert_all_mocked=True) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, ollama)
+        paperless_hosts = {call.request.url.host for call in router.calls}
+    assert paperless_hosts == {"paperless-ws"}
+    assert {r.url.host for r in ollama.requests} == {"ollama"}
+    with pytest.raises(ValueError, match=r"^ai\.host_not_allowed$"):
+        OllamaClient("https://api.example.com", {"ollama"})
+
+
+async def test_two_runs_disagree_sets_signal_false(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    # Run B reads another TTC, writes the HT differently (same value), and misses the number.
+    run_b = {**RAW_01, "total_ttc": "1 050,00 MAD", "total_ht": "1250.00", "number": None}
+    # Run A misses the VAT rate: run B's is kept.
+    run_a = {**RAW_01, "vat_rate": None}
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, suggested=[TYPE_IDS["receipt"]])
+        await run(ledger, sessions, keys, engines, FakeOllama({1: run_a, 2: run_b}))
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.values["total_ttc"] == "1500.00"  # run A's value is the one kept
+    assert row.values["number"] == SAMPLE_01["number"]
+    assert row.values["vat_rate"] == "20"
+    assert row.signals["total_ttc"]["runs_agree"] is False
+    assert row.signals["number"]["runs_agree"] is False  # one side None
+    assert row.signals["vat_rate"]["runs_agree"] is False
+    assert row.signals["total_ht"]["runs_agree"] is True  # equal once canonical
+    assert row.signals["supplier_ice"]["runs_agree"] is True
+    assert row.signals["document_type"]["paperless_agrees"] is False
+    (event,) = await events(db, ready)
+    assert event.data["runs_agree_count"] == len(FIELD_NAMES) - 3
+
+
+async def test_paperless_suggesting_no_type_is_not_applicable(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, suggested=[999])  # not one of ours
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.signals["document_type"]["paperless_agrees"] is None
+
+
+async def test_arabic_content_is_normalised_and_truncated(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    # Bidi controls and presentation forms as Paperless gives them, then far too much text.
+    content = "‫ﻓﺎﺗﻮﺭﺓ‬  ‪F-2026-01002‬\n" + "x" * 20_000
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, content=content)
+        await run(ledger, sessions, keys, engines, ollama)
+    sent = json.loads(ollama.requests[0].content)["messages"][1]["content"]
+    assert "فاتورة F-2026-01002\n" in sent
+    assert "‫" not in sent and "‪" not in sent
+    body = sent.split("<<<\n", 1)[1].rsplit("\n>>>", 1)[0]
+    assert len(body) == 12_000
+    assert body.count("x") == 12_000 - len("فاتورة F-2026-01002\n")
+
+
+async def test_empty_content_flags_no_text_without_calling_the_model(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, content=" ‫‬ \n ")
+        await run(ledger, sessions, keys, engines, ollama)
+    assert ollama.requests == []
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.flags == ("no_text",)
+    assert dict(row.values) == dict.fromkeys(FIELD_NAMES)
+    (event,) = await events(db, ready)
+    assert event.action == "document.extracted"
+    assert event.data == {"model": "qwen3:4b", "runs_agree_count": 0}
+
+
+async def test_one_malformed_run_uses_the_other(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: "{not json", 2: RAW_01}))
+    row = await fields_of(engines, ready, ledger.id)
+    assert dict(row.values) == CANONICAL_01
+    assert "extraction_failed" not in row.flags
+    assert all(row.signals[name]["runs_agree"] is False for name in FIELD_NAMES)
+    runs = await runs_of(engines, ready, ledger.id)
+    assert runs[0].raw == {"error": "ai.bad_output", "content": "{not json"}
+
+
+async def test_malformed_json_twice_routes_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    # A value of the wrong type is a schema mismatch too.
+    wrong_type = {**RAW_01, "total_ttc": 1500}
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: "nope", 2: wrong_type}))
+    row = await fields_of(engines, ready, ledger.id)
+    assert "extraction_failed" in row.flags
+    assert dict(row.values) == dict.fromkeys(FIELD_NAMES)
+    assert len(await runs_of(engines, ready, ledger.id)) == 2
+    (event,) = await events(db, ready)
+    assert event.action == "document.extraction_failed"
+    assert event.data == {"code": "extraction.ai_bad_output"}
+
+
+async def test_ollama_unavailable_is_retried(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """Ollama down: the run raises for Celery to retry, and nothing is recorded meanwhile."""
+    ledger = await make_ledger(db, ready)
+    down = FakeOllama({1: RAW_01, 2: httpx.Response(503, json={"error": "busy"})})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        with pytest.raises(OllamaUnavailable):
+            await run(ledger, sessions, keys, engines, down)
+    assert (await reload(db, ledger)).state is DocumentState.received
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await runs_of(engines, ready, ledger.id) == []  # no half-run evidence
+    assert await events(db, ready) == []
+    # The retry, with Ollama back, extracts normally.
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert (await fields_of(engines, ready, ledger.id)).values == CANONICAL_01
+
+
+async def test_paperless_unavailable_is_raised_for_retry(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(500)
+        with pytest.raises(PaperlessUnavailable):
+            await run(ledger, sessions, keys, engines, ollama)
+    assert ollama.requests == []
+    assert await fields_of(engines, ready, ledger.id) is None
+
+
+@pytest.mark.parametrize(
+    ("state", "ingest_state"),
+    [
+        (DocumentState.received, IngestState.queued),
+        (DocumentState.received, IngestState.sending),
+        (DocumentState.received, IngestState.failed),
+        (DocumentState.received, IngestState.unsupported),
+        (DocumentState.needs_review, IngestState.consumed),
+        (DocumentState.filed, IngestState.consumed),
+    ],
+)
+async def test_extract_noop_unless_received_and_consumed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    state: DocumentState,
+    ingest_state: IngestState,
+) -> None:
+    ledger = await make_ledger(db, ready, state=state, ingest_state=ingest_state)
+    ollama = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, ollama)
+        assert not router.calls
+    assert ollama.requests == []
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await events(db, ready) == []
+
+
+async def test_already_extracted_is_noop(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """A redelivery (or the sweep) never re-runs the model over an existing row."""
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    again = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, again)
+        assert not router.calls
+    assert again.requests == []
+    assert len(await runs_of(engines, ready, ledger.id)) == 2
+    assert len(await events(db, ready)) == 1
+
+
+async def test_foreign_region_row_is_left_alone(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({})
+    other_region = WorkerSettings.model_construct(region="eu-fra", environment="test")
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, ollama, settings=other_region)
+        assert not router.calls
+    assert ollama.requests == []
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await events(db, ready) == []
+    assert "region" in caplog.text
+
+
+async def test_audit_has_no_field_values(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    (event,) = await events(db, ready)
+    dumped = json.dumps(event.data, ensure_ascii=False)
+    for value in (*RAW_01.values(), *CANONICAL_01.values(), "1250", "1500", "Atlas"):
+        if value not in (None, "invoice", "MAD", "20"):
+            assert str(value) not in dumped, value
+    assert set(event.data) == {"model", "runs_agree_count"}
+    assert all(isinstance(v, str | int) for v in event.data.values())
+
+
+# Retries running out ----------------------------------------------------------------------
+
+
+async def test_exhausted_retries_record_extraction_failed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    await record_extraction_failed(
+        ledger.id,
+        "extraction.ai_unavailable",
+        sessions=sessions,
+        index=engines,
+        settings=SETTINGS,
+        now=NOW,
+    )
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.flags == ("extraction_failed",)
+    (event,) = await events(db, ready)
+    assert event.action == "document.extraction_failed"
+    assert event.data == {"code": "extraction.ai_unavailable"}
+    # Never twice, and never over a row an extraction wrote.
+    await record_extraction_failed(
+        ledger.id, "extraction.ai_unavailable", sessions=sessions, index=engines,
+        settings=SETTINGS, now=NOW,
+    )  # fmt: skip
+    assert len(await events(db, ready)) == 1
+
+
+async def test_record_failed_leaves_an_extracted_row_alone(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    await record_extraction_failed(
+        ledger.id, "extraction.error", sessions=sessions, index=engines, settings=SETTINGS, now=NOW
+    )
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.flags == ()
+    assert [e.action for e in await events(db, ready)] == ["document.extracted"]
+
+
+ARGS = {"ledger_id": "00000000-0000-0000-0000-000000000001", "workspace_id": None}
+
+
+def _settings() -> WorkerSettings:
+    return WorkerSettings(
+        region="ma-cas",
+        environment="test",
+        redis_url="redis://127.0.0.1:1/0",
+        master_key="a" * 43 + "=",
+        database_url="postgresql+asyncpg://x:y@127.0.0.1:1/z",
+        provisioner_database_url="postgresql+asyncpg://x:y@127.0.0.1:1/z",
+        tenant_image="img:1",
+        compose_project="sijil",
+        tessdata_volume="t",
+    )
+
+
+@pytest.fixture
+def eager_app() -> None:
+    app = make_celery(_settings())
+    app.conf.task_always_eager = True
+    app.set_current()
+
+
+def _recording(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> tuple[list[str], list[tuple[str, str]]]:
+    attempts: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    async def extract(ledger_id: str, workspace_id: str | None) -> None:
+        attempts.append(ledger_id)
+        raise error
+
+    async def record(ledger_id: str, code: str) -> None:
+        failed.append((ledger_id, code))
+
+    monkeypatch.setattr(tasks, "_extract", extract)
+    monkeypatch.setattr(tasks, "_extract_failed", record)
+    return attempts, failed
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (OllamaUnavailable("ai.unavailable: HTTP 503", 503), "extraction.ai_unavailable"),
+        (PaperlessUnavailable("down"), "extraction.paperless_unavailable"),
+    ],
+)
+def test_transient_failures_retry_then_record_extraction_failed(
+    eager_app: None, monkeypatch: pytest.MonkeyPatch, error: Exception, code: str
+) -> None:
+    attempts, failed = _recording(monkeypatch, error)
+    result = tasks.extract_document_task.apply(kwargs=ARGS)
+    assert isinstance(result.result, type(error))
+    assert len(attempts) == tasks.EXTRACT_MAX_RETRIES + 1 == 9
+    assert failed == [(ARGS["ledger_id"], code)]  # once, when nothing will retry
+
+
+def test_final_failure_records_extraction_failed_at_once(
+    eager_app: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts, failed = _recording(monkeypatch, PaperlessError("HTTP 404", 404))
+    tasks.extract_document_task.apply(kwargs=ARGS)
+    assert len(attempts) == 1
+    assert failed == [(ARGS["ledger_id"], "extraction.paperless_error")]
+
+
+def test_extract_backoff_numbers() -> None:
+    assert (tasks.EXTRACT_BACKOFF_FACTOR_S, tasks.EXTRACT_BACKOFF_MAX_S) == (30, 900)
+    assert tasks.EXTRACT_MAX_RETRIES == 8
+
+
+def test_extract_task_is_routed_to_the_extraction_queue() -> None:
+    assert tasks.extract_document_task.name == "sijil.extract_document"
+    assert getattr(tasks.extract_document_task, "queue", None) == "extraction"
+
+
+def test_beat_requeues_unextracted_every_ten_minutes() -> None:
+    entry = make_celery(_settings()).conf.beat_schedule["requeue-unextracted"]
+    assert entry == {"task": "sijil.requeue_unextracted", "schedule": 600}
+    assert tasks.requeue_unextracted_task.name == "sijil.requeue_unextracted"
+
+
+# The sweep --------------------------------------------------------------------------------
+
+
+async def test_requeue_unextracted_sends_old_received_consumed_rows_of_this_region(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], ready: Workspace
+) -> None:
+    old = timedelta(minutes=30)
+    due = await make_ledger(db, ready, age=old)
+    await make_ledger(db, ready)  # just consumed: its own task is on the way
+    await make_ledger(db, ready, age=old, state=DocumentState.needs_review)
+    await make_ledger(db, ready, age=old, ingest_state=IngestState.queued)
+    await make_ledger(db, ready, age=old, ingest_state=IngestState.unsupported)
+    foreign_org = Organisation(name="F", type=OrgType.business, country="FR", region="eu-fra")
+    db.add(foreign_org)
+    await db.flush()
+    foreign = Workspace(
+        org_id=foreign_org.id,
+        name="F",
+        slug=f"f-{uuid.uuid4().hex[:8]}",
+        state=WorkspaceState.active,
+        db_name="paperless_f",
+        index_db_name="index_f",
+        kms_key_id="kek-f",
+    )
+    db.add(foreign)
+    await db.commit()
+    await make_ledger(db, foreign, age=old)
+    sent: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append((ledger_id, workspace_id))
+
+    count = await requeue_unextracted(sessions, enqueue, region="ma-cas", now=NOW)
+    assert count == 1
+    assert sent == [(due.id, ready.id)]
+
+
+async def test_requeue_unextracted_survives_a_failed_enqueue(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], ready: Workspace
+) -> None:
+    for _ in range(2):
+        await make_ledger(db, ready, age=timedelta(hours=1))
+    calls: list[uuid.UUID] = []
+
+    async def flaky(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        calls.append(ledger_id)
+        if len(calls) == 1:
+            raise ConnectionError("broker down")
+
+    assert await requeue_unextracted(sessions, flaky, region="ma-cas", now=NOW) == 1
+    assert len(calls) == 2

@@ -9,6 +9,7 @@ from sijil_worker.settings import WorkerSettings
 
 RECONCILE_INTERVAL_S = 300
 REQUEUE_INGEST_INTERVAL_S = 300
+REQUEUE_EXTRACT_INTERVAL_S = 600
 QUEUES = ("default", "provisioning", "ingest", "extraction")
 
 
@@ -33,6 +34,10 @@ def make_celery(settings: WorkerSettings) -> Celery:
             "requeue-stuck-ingest": {
                 "task": "sijil.requeue_stuck_ingest",
                 "schedule": REQUEUE_INGEST_INTERVAL_S,
+            },
+            "requeue-unextracted": {
+                "task": "sijil.requeue_unextracted",
+                "schedule": REQUEUE_EXTRACT_INTERVAL_S,
             },
             "drift-check-nightly": {
                 "task": "sijil.drift_check_all",
