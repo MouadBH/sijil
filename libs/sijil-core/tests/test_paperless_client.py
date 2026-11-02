@@ -254,3 +254,13 @@ async def test_documents_by_ids_bad_body_is_paperless_error() -> None:
     async with PaperlessClient(BASE, token="t") as client:
         with pytest.raises(PaperlessError):
             await client.documents_by_ids([1])
+
+
+@respx.mock
+async def test_500_raises_unavailable() -> None:
+    route = respx.get(f"{BASE}/api/documents/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable) as exc:
+            await client._request("GET", "/api/documents/")
+    assert exc.value.status == 500
+    assert route.call_count == 1  # 500 is mapped, not retried inside the client

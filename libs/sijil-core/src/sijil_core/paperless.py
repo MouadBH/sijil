@@ -46,7 +46,7 @@ class PaperlessForbidden(PaperlessError):  # noqa: N818
 
 class PaperlessUnavailable(PaperlessError):  # noqa: N818
     """Paperless could not be reached, timed out or dropped the connection, or kept answering
-    502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
+    500/502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
 
 
 class PaperlessBadResponse(PaperlessError):  # noqa: N818
@@ -170,6 +170,10 @@ class PaperlessClient:
         status = response.status_code
         if status == 403:
             raise PaperlessForbidden(f"{where}: HTTP 403", 403)
+        if status == 500:
+            # Transient: a tenant whose own database is down answers 500. Not retried in
+            # `_request` (only 502-504 are); the caller's backoff handles it.
+            raise PaperlessUnavailable(f"{where}: HTTP 500", 500)
         if status >= 400:
             raise PaperlessError(f"{where}: HTTP {status}", status)
         return response

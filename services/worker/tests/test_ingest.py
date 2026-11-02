@@ -352,6 +352,26 @@ async def test_exhausted_transient_retries_delay_instead_of_failing(
     assert (await audit.verify(db, ready.id)).ok
 
 
+async def test_ingest_500_is_delayed_not_failed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{URL}/api/documents/").respond(200, json={"results": []})
+        router.post(f"{URL}/api/documents/post_document/").respond(500)
+        with pytest.raises(PaperlessUnavailable):
+            await run(ledger, sessions, keys, memory_store, will_retry=False)
+    row = await reload(db, ledger)
+    assert row.ingest_state is IngestState.queued
+    assert row.ingest_next_attempt_at is not None
+    assert [e.action for e in await events(db, ready)] == ["document.ingest_delayed"]
+
+
 @pytest.mark.parametrize(
     ("attempts_before", "hours"),
     [(0, 1), (9, 2), (18, 4), (27, 8), (36, 16), (45, 24), (900, 24)],
