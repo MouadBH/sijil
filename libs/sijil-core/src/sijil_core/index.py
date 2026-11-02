@@ -13,6 +13,7 @@ The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schem
 
 import asyncio
 import json
+import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -33,6 +34,8 @@ from sqlalchemy.ext.asyncio import (
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.models import CredentialKind, TenantCredential, Workspace
 from sijil_core.settings import CoreSettings
+
+log = logging.getLogger(__name__)
 
 SCHEMA_VERSION: Final = 1
 MAX_ENGINES: Final = 32
@@ -270,7 +273,9 @@ async def seal_fields(
     """Seals the row once. Same hash again is a no-op; a different one is `RetentionLocked`.
 
     Race-safe: the row is locked `FOR UPDATE` inside a transaction (one is opened if none is
-    active), so of two concurrent seals the loser sees the winner's row.
+    active), so of two concurrent seals the loser sees the winner's row. That idempotency (a
+    same-hash loser returning the row) needs a transactional connection. On an AUTOCOMMIT one the
+    trigger still refuses the loser with `RetentionLocked`, which is safe.
     """
     if conn.in_transaction():
         return await _seal(conn, ledger_id, fields_sha256, sealed_at)
@@ -380,6 +385,14 @@ async def apply_schema(settings: CoreSettings, name: str, password: str) -> None
         await engine.dispose()
 
 
+async def _dispose(engine: AsyncEngine) -> None:
+    """Best effort: one engine failing to close must not leak the rest or surprise a caller."""
+    try:
+        await engine.dispose()
+    except Exception:
+        log.warning("disposing an index engine failed", exc_info=False)
+
+
 class IndexEngines:
     """Engines to the workspaces' index databases: an LRU, schema ensured once per engine."""
 
@@ -429,30 +442,29 @@ class IndexEngines:
         if cached is not None:
             self._engines.move_to_end(workspace.id)
             return cached
+        # One lock per workspace, kept for good: popping it would let a waiter and a new caller
+        # build under different locks.
         lock = self._building.setdefault(workspace.id, asyncio.Lock())
+        evicted: list[AsyncEngine] = []
         async with lock:
             cached = self._engines.get(workspace.id)
             if cached is not None:
                 return cached
+            password = await self._password(workspace)
+            engine = self._factory(index_url(self._settings, workspace.index_db_name, password))
             try:
-                password = await self._password(workspace)
-                engine = self._factory(index_url(self._settings, workspace.index_db_name, password))
-                try:
-                    await self._ensure(engine)
-                except BaseException:
-                    await engine.dispose()
-                    raise
-                self._engines[workspace.id] = engine
-                evicted = []
-                while len(self._engines) > self._max:
-                    evicted.append(self._engines.popitem(last=False)[1])
-            finally:
-                self._building.pop(workspace.id, None)
+                await self._ensure(engine)
+            except BaseException:
+                await _dispose(engine)
+                raise
+            self._engines[workspace.id] = engine
+            while len(self._engines) > self._max:
+                evicted.append(self._engines.popitem(last=False)[1])
         for old in evicted:
-            await old.dispose()
+            await _dispose(old)
         return engine
 
     async def aclose(self) -> None:
         engines, self._engines = list(self._engines.values()), OrderedDict()
         for engine in engines:
-            await engine.dispose()
+            await _dispose(engine)

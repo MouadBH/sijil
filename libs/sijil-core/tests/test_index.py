@@ -1,7 +1,7 @@
 import asyncio
 import os
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -516,6 +516,84 @@ async def test_slow_workspace_does_not_block_cached_ones() -> None:
     assert other is not None
     gate.set()
     await pending
+
+
+async def test_failed_build_then_concurrent_callers_cache_one_engine() -> None:
+    attempts = 0
+
+    async def ensure(_engine: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        await asyncio.sleep(0.05)
+        if attempts == 1:
+            raise ConnectionError("down")
+
+    engines, created = plain_engines(ensure)
+    ws = workspace_named("flaky")
+    first = asyncio.create_task(engines.engine(ws))
+    second = asyncio.create_task(engines.engine(ws))  # waits behind the failing build
+    with pytest.raises(ConnectionError):
+        await first
+    await asyncio.sleep(0.02)  # second is now building
+    third = asyncio.create_task(engines.engine(ws))  # arrives while it builds
+    cached = await second
+    assert await third is cached
+    assert [e for e in created if not e.disposed] == [cast(Any, cached)]
+    assert len(engines._engines) == 1
+
+
+async def test_dispose_failure_is_best_effort() -> None:
+    async def ensure(_engine: Any) -> None:
+        return None
+
+    engines, created = plain_engines(ensure, max_engines=1)
+
+    async def bad() -> None:
+        raise OSError("boom")
+
+    a, b, c = (workspace_named(n) for n in "abc")
+    await engines.engine(a)
+    created[0].dispose = bad  # type: ignore[method-assign]
+    await engines.engine(b)  # evicts a: its dispose fails, the caller is unaffected
+    await engines.engine(c)  # evicts b
+    assert created[1].disposed
+    created[2].dispose = bad  # type: ignore[method-assign]
+    await engines.aclose()  # does not raise
+
+
+async def test_seal_loser_after_stale_read_is_retention_locked(
+    index_db_url: str, conn: AsyncConnection
+) -> None:
+    """The row looks unsealed at SELECT, is sealed before the UPDATE: the trigger refuses."""
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    other = create_async_engine(index_db_url, isolation_level="AUTOCOMMIT")
+
+    class Snapshot:
+        def __init__(self, rows: Sequence[Any]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> "Snapshot":
+            return self
+
+        def first(self) -> Any:
+            return self._rows[0] if self._rows else None
+
+    class Stale:
+        async def execute(self, statement: Any, params: Any = None) -> Any:
+            result = await conn.execute(statement, params)
+            if "FOR UPDATE" not in str(statement):
+                return result
+            unsealed = result.mappings().all()
+            async with other.connect() as c2:  # the winner seals in between
+                await index.seal_fields(c2, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+            return Snapshot(unsealed)
+
+    try:
+        with pytest.raises(RetentionLocked):
+            await index._seal(Stale(), fields.ledger_id, "b" * 64, NOW)  # type: ignore[arg-type]
+    finally:
+        await other.dispose()
 
 
 async def test_concurrent_first_calls_build_one_engine() -> None:
