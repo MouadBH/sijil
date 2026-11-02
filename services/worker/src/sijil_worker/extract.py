@@ -57,7 +57,6 @@ from sijil_core.confidence import (
     compute_signals,
     kept,
     min_confidence_pct,
-    plausible_date,
     route,
     scores,
 )
@@ -81,7 +80,7 @@ from sijil_core.ingest import Enqueue
 from sijil_core.ollama import OllamaBadOutput, OllamaClient
 from sijil_core.paperless import PaperlessClient
 from sijil_core.region import RegionMismatch, assert_region
-from sijil_core.retention import fiscal_retain_until, region_local_date
+from sijil_core.retention import fiscal_retain_until, region_local_date, retention_basis
 from sijil_core.storage import ObjectRef
 from sijil_core.text import normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
@@ -547,14 +546,9 @@ async def _route(
             return None
         confidence, flags = await _flags_and_scores(index, workspace, row)
         decision = route(confidence, flags, row.document_type)
-        # Only a plausible date may raise retention: an object lock is never shortened, so a
-        # misread year must not lock the original for longer. The arrival date stands in.
-        # Plausibility is judged against this (routing) run's region-local today, and the date
-        # is capped at it: a date one day ahead (a time zone apart, on 31 December) never adds
-        # a year of lock.
-        today = region_local_date(now, region)
-        dated = plausible_date(row.values.get("date"), today)
-        basis = min(dated, today) if dated else region_local_date(ledger.ingested_at, region)
+        # Only a plausible date may raise retention (the same basis as the seal): an object
+        # lock is never shortened, so a misread year must not lock the original for longer.
+        basis = retention_basis(row.values.get("date"), ledger.ingested_at, region, now)
         target = max(ledger.retention_until, fiscal_retain_until(basis, country))
         if target > ledger.retention_until:
             try:

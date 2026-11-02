@@ -6,6 +6,7 @@ import unicodedata
 from collections.abc import Callable, Mapping
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from typing import Final
 
 from sijil_core.audit import canonical_json
 from sijil_core.text import normalise
@@ -310,12 +311,13 @@ def parse_field(name: str, raw: str | None) -> str | None:
 # --- the sealed hash ----------------------------------------------------------------------
 
 
-def fields_digest(values: Mapping[str, str | None], *, document_type: str | None) -> str:
-    """`fields_sha256`: SHA-256 of the canonical JSON of every field (a missing one is null) and
-    the document type. Sealing stores it on the ledger; exports recompute it to prove the
-    values are the sealed ones. Names outside FIELD_NAMES are ignored."""
-    payload = {
-        "fields": {name: values.get(name) for name in FIELD_NAMES},
-        "document_type": document_type,
-    }
+DIGEST_VERSION: Final = 1
+
+
+def fields_digest(values: Mapping[str, str | None]) -> str:
+    """`fields_sha256`: exactly `sha256(canonical_json({"v": 1, "fields": {name: value or null
+    for every name in FIELD_NAMES}}))`. `document_type` is one of the fields, never a second
+    key; names outside FIELD_NAMES are ignored. Sealing stores it on the ledger and the index
+    row; the mirror and exports recompute it to prove the values are the sealed ones."""
+    payload = {"v": DIGEST_VERSION, "fields": {name: values.get(name) for name in FIELD_NAMES}}
     return hashlib.sha256(canonical_json(payload)).hexdigest()

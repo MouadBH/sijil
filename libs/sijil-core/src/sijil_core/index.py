@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import (
 
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.models import CredentialKind, TenantCredential, Workspace
+from sijil_core.fields import fields_digest
 from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
@@ -102,6 +103,11 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
 
 class RetentionLocked(Exception):  # noqa: N818 - named for the machine code it maps to
     """The row is sealed: the database refused the change (`retention.locked`)."""
+
+
+class FieldsChanged(Exception):  # noqa: N818 - named for the machine code it maps to
+    """The row's values no longer hash to the digest the caller computed: they changed since
+    the caller read them (`seal.fields_changed`). Nothing was sealed."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -317,7 +323,10 @@ async def set_scores(
 async def seal_fields(
     conn: AsyncConnection, ledger_id: UUID, *, fields_sha256: str, sealed_at: datetime
 ) -> FieldsRow:
-    """Seals the row once. Same hash again is a no-op; a different one is `RetentionLocked`.
+    """Seals the row once with `fields_sha256`, which must be the digest of the values it holds:
+    the digest is recomputed from the row locked FOR UPDATE, and a mismatch (the values
+    changed since the caller hashed them) raises `FieldsChanged`, sealing nothing. A sealed row
+    with the same hash is returned as it is (a retry); with another hash, `RetentionLocked`.
 
     Race-safe: the row is locked `FOR UPDATE` inside a transaction (one is opened if none is
     active), so of two concurrent seals the loser sees the winner's row. That idempotency (a
@@ -345,6 +354,8 @@ async def _seal(
         if existing.fields_sha256 == fields_sha256:
             return existing
         raise RetentionLocked
+    if fields_digest(existing.values) != fields_sha256:
+        raise FieldsChanged
     try:
         result = await conn.execute(
             text(

@@ -62,3 +62,24 @@ def test_fiscal_retain_until_ma() -> None:
     assert fiscal_retain_until(date(2026, 12, 31), "MA") == date(2036, 12, 31)
     with pytest.raises(KeyError):
         fiscal_retain_until(date(2026, 1, 1), "XX")
+
+
+ARRIVED = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+NOW_R = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("doc_date", "basis"),
+    [
+        ("2026-09-30", date(2026, 9, 30)),  # a plausible date
+        ("2026-11-03", date(2026, 11, 2)),  # one day ahead: plausible, capped at today
+        ("2099-01-01", date(2026, 10, 1)),  # implausible: the arrival date
+        ("2005-01-01", date(2026, 10, 1)),  # more than 15 years back: the arrival date
+        (None, date(2026, 10, 1)),
+        ("not a date", date(2026, 10, 1)),
+    ],
+)
+def test_retention_basis_is_shared_by_routing_and_seal(doc_date: str | None, basis: date) -> None:
+    from sijil_core.retention import retention_basis
+
+    assert retention_basis(doc_date, ARRIVED, "ma-cas", NOW_R) == basis

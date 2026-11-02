@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_en
 from sijil_core import index
 from sijil_core.crypto import LocalKeyService, seal
 from sijil_core.db.models import CredentialKind, TenantCredential, Workspace
-from sijil_core.index import FieldsRow, IndexEngines, RetentionLocked
+from sijil_core.fields import fields_digest
+from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.settings import CoreSettings
 from tests.support.index_db import throwaway_index_db
 
@@ -56,6 +57,11 @@ def row(ledger_id: uuid.UUID | None = None, /, **values: str | None) -> FieldsRo
         extracted_at=NOW,
         updated_at=NOW,
     )
+
+
+def sha(fields: FieldsRow) -> str:
+    """The digest a seal of this row must carry."""
+    return fields_digest(fields.values)
 
 
 async def refused(conn: AsyncConnection, sql: str, **params: Any) -> str:
@@ -133,7 +139,7 @@ async def test_concurrent_seals_are_race_safe(index_db_url: str) -> None:
             await index.ensure_schema(c)
             fields = row(number="F-1")
             await index.write_extraction(c, fields)
-        same, other = "a" * 64, "b" * 64
+        same, other = sha(fields), "b" * 64
 
         async def seal(engine: AsyncEngine, sha: str) -> FieldsRow:
             async with engine.connect() as c:
@@ -163,12 +169,14 @@ async def test_concurrent_seals_are_race_safe(index_db_url: str) -> None:
                 return result
 
         outcomes = await asyncio.gather(
-            seal_racing(e1, same), seal_racing(e2, other), return_exceptions=True
+            seal_racing(e1, sha(racing)), seal_racing(e2, other), return_exceptions=True
         )
         winners = [o for o in outcomes if isinstance(o, FieldsRow)]
-        losers = [o for o in outcomes if isinstance(o, RetentionLocked)]
+        # Another hash never wins: refused as changed values, or as locked once sealed.
+        losers = [o for o in outcomes if isinstance(o, RetentionLocked | FieldsChanged)]
         assert len(winners) == 1
         assert len(losers) == 1
+        assert winners[0].fields_sha256 == sha(racing)
     finally:
         await e1.dispose()
         await e2.dispose()
@@ -197,7 +205,7 @@ async def test_write_extraction_upserts(conn: AsyncConnection) -> None:
 async def test_sealed_row_update_refused(conn: AsyncConnection) -> None:
     fields = row(number="F-1")
     await index.write_extraction(conn, fields)
-    await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    await index.seal_fields(conn, fields.ledger_id, fields_sha256=sha(fields), sealed_at=NOW)
     message = await refused(
         conn,
         "UPDATE document_fields SET \"values\" = '{}'::jsonb WHERE ledger_id = :id",
@@ -320,15 +328,37 @@ async def test_update_fields_unknown_ledger(conn: AsyncConnection) -> None:
 async def test_seal_fields_idempotent_same_hash_different_refused(conn: AsyncConnection) -> None:
     fields = row(number="F-1")
     await index.write_extraction(conn, fields)
-    sealed = await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
-    assert (sealed.sealed_at, sealed.fields_sha256) == (NOW, SHA)
+    digest = sha(fields)
+    sealed = await index.seal_fields(conn, fields.ledger_id, fields_sha256=digest, sealed_at=NOW)
+    assert (sealed.sealed_at, sealed.fields_sha256) == (NOW, digest)
     later = datetime(2027, 4, 1, tzinfo=UTC)
-    again = await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=later)
+    again = await index.seal_fields(conn, fields.ledger_id, fields_sha256=digest, sealed_at=later)
     assert again == sealed
     with pytest.raises(RetentionLocked):
         await index.seal_fields(conn, fields.ledger_id, fields_sha256="b" * 64, sealed_at=later)
     with pytest.raises(LookupError):
         await index.seal_fields(conn, uuid.uuid4(), fields_sha256=SHA, sealed_at=NOW)
+
+
+async def test_seal_fields_refuses_values_that_changed_since_they_were_hashed(
+    conn: AsyncConnection,
+) -> None:
+    """The digest is recomputed from the row locked FOR UPDATE: a caller that hashed values an
+    edit has since replaced gets FieldsChanged, and nothing is sealed."""
+    fields = row(number="F-1", total_ttc="120.00")
+    await index.write_extraction(conn, fields)
+    stale = sha(fields)
+    await index.update_fields(
+        conn, fields.ledger_id, {"total_ttc": "130.00"}, source="user", updated_by=None, now=NOW
+    )
+    with pytest.raises(FieldsChanged):
+        await index.seal_fields(conn, fields.ledger_id, fields_sha256=stale, sealed_at=NOW)
+    current = await index.read_fields(conn, fields.ledger_id)
+    assert current is not None and current.sealed_at is None
+    sealed = await index.seal_fields(
+        conn, fields.ledger_id, fields_sha256=fields_digest(current.values), sealed_at=NOW
+    )
+    assert sealed.fields_sha256 == fields_digest(sealed.values)
 
 
 async def test_set_scores_replaces_confidence_and_flags_only(conn: AsyncConnection) -> None:
@@ -353,7 +383,7 @@ async def test_set_scores_replaces_confidence_and_flags_only(conn: AsyncConnecti
 async def test_set_scores_refused_once_sealed(conn: AsyncConnection) -> None:
     fields = row(number="F-1")
     await index.write_extraction(conn, fields)
-    await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    await index.seal_fields(conn, fields.ledger_id, fields_sha256=sha(fields), sealed_at=NOW)
     with pytest.raises(RetentionLocked):
         await index.set_scores(conn, fields.ledger_id, {"number": 1.0}, ())
 
@@ -379,9 +409,9 @@ async def test_known_supplier_is_name_on_latest_sealed_row(conn: AsyncConnection
     )
     for r in (old, new, unsealed):
         await index.write_extraction(conn, r)
-    await index.seal_fields(conn, old.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    await index.seal_fields(conn, old.ledger_id, fields_sha256=sha(old), sealed_at=NOW)
     await index.seal_fields(
-        conn, new.ledger_id, fields_sha256=SHA, sealed_at=datetime(2027, 5, 1, tzinfo=UTC)
+        conn, new.ledger_id, fields_sha256=sha(new), sealed_at=datetime(2027, 5, 1, tzinfo=UTC)
     )
     assert await index.known_supplier(conn, ice) == "New SARL"
     assert await index.known_supplier(conn, "999999999999999") is None
@@ -626,12 +656,14 @@ async def test_seal_loser_after_stale_read_is_retention_locked(
                 return result
             unsealed = result.mappings().all()
             async with other.connect() as c2:  # the winner seals in between
-                await index.seal_fields(c2, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+                await index.seal_fields(
+                    c2, fields.ledger_id, fields_sha256=sha(fields), sealed_at=NOW
+                )
             return Snapshot(unsealed)
 
     try:
         with pytest.raises(RetentionLocked):
-            await index._seal(Stale(), fields.ledger_id, "b" * 64, NOW)  # type: ignore[arg-type]
+            await index._seal(Stale(), fields.ledger_id, sha(fields), NOW)  # type: ignore[arg-type]
     finally:
         await other.dispose()
 

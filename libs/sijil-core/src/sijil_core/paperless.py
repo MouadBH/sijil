@@ -488,7 +488,12 @@ class PaperlessClient:
     ) -> None:
         """Sets these custom field values (`{field id: value}`) on the document, and its type if
         given. A PATCH of `custom_fields` replaces the document's whole list, so the document's
-        other custom fields are read first and sent back unchanged."""
+        other custom fields are read first and sent back unchanged.
+
+        Lost update: the read and the PATCH are two requests, so a custom field someone sets or
+        changes on this document in Paperless between them is overwritten by its earlier value
+        (or dropped, if added in between). Paperless 3.4.1 offers no conditional update; the
+        window is one round trip, and our own `sijil_*` values are re-set on every mirror."""
         response = await self._request(
             "GET", f"/api/documents/{doc_id}/", params={"fields": "id,custom_fields"}
         )

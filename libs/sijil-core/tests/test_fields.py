@@ -131,18 +131,31 @@ def test_parse_field_canonical_strings() -> None:
         parse_field("nope", "x")
 
 
-def test_fields_digest_is_canonical_json_of_every_field_and_the_type() -> None:
-    values = {"number": "F-1", "total_ttc": "1500.00", "unknown": "ignored"}
-    expected = hashlib.sha256(
-        canonical_json(
-            {
-                "fields": {name: values.get(name) for name in FIELD_NAMES},
-                "document_type": "invoice",
-            }
-        )
-    ).hexdigest()
-    assert fields_digest(values, document_type="invoice") == expected
-    # A missing name is a null: absent and explicit null hash the same.
-    assert fields_digest({**values, "vat": None}, document_type="invoice") == expected
-    assert fields_digest(values, document_type="receipt") != expected
-    assert fields_digest({**values, "number": "F-2"}, document_type="invoice") != expected
+# SAMPLE (fictitious supplier). The digest is pinned: exports and any later check recompute it.
+GOLDEN_VALUES = {
+    "document_type": "invoice",
+    "supplier_name": "Atlas Télécom SAMPLE SARL",
+    "supplier_ice": "001905837000041",
+    "date": "2026-09-30",
+    "number": "F-2026-01001",
+    "total_ht": "1250.00",
+    "vat": "250.00",
+    "total_ttc": "1500.00",
+    "currency": "MAD",
+}
+GOLDEN_DIGEST = "4b203a544da6d2a11beb8a3b59277ce298e01f6686888a3515bc6065dac048e1"
+
+
+def test_fields_digest_golden() -> None:
+    """Exactly sha256(canonical_json({"v": 1, "fields": {every name: value or null}})): the
+    type is one of the fields, never a second key."""
+    assert fields_digest(GOLDEN_VALUES) == GOLDEN_DIGEST
+    payload = {"v": 1, "fields": {name: GOLDEN_VALUES.get(name) for name in FIELD_NAMES}}
+    assert hashlib.sha256(canonical_json(payload)).hexdigest() == GOLDEN_DIGEST
+
+
+def test_fields_digest_nulls_and_unknown_names() -> None:
+    # A missing name is a null; a name outside FIELD_NAMES is ignored.
+    assert fields_digest({**GOLDEN_VALUES, "vat_rate": None, "colour": "x"}) == GOLDEN_DIGEST
+    assert fields_digest({**GOLDEN_VALUES, "document_type": "receipt"}) != GOLDEN_DIGEST
+    assert fields_digest({**GOLDEN_VALUES, "number": "F-2"}) != GOLDEN_DIGEST
