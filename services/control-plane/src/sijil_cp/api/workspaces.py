@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sijil_core import inbound
 from sijil_core.db.models import OrgType, Role, User, Workspace, WorkspaceState
 from sijil_core.tenancy import tenant_db_names, tenant_ref
 from sijil_cp.deps import get_db, require_totp_compliance
@@ -30,6 +31,7 @@ class WorkspaceOut(BaseModel):
     slug: str
     state: WorkspaceState
     role: Role
+    inbound_email: str
 
 
 class WorkspaceIn(BaseModel):
@@ -37,7 +39,7 @@ class WorkspaceIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
 
 
-def workspace_out(workspace: Workspace, role: Role) -> WorkspaceOut:
+def workspace_out(workspace: Workspace, role: Role, inbound_domain: str) -> WorkspaceOut:
     return WorkspaceOut(
         id=workspace.id,
         org_id=workspace.org_id,
@@ -45,6 +47,7 @@ def workspace_out(workspace: Workspace, role: Role) -> WorkspaceOut:
         slug=workspace.slug,
         state=workspace.state,
         role=role,
+        inbound_email=inbound.address(workspace.slug, workspace.inbound_token, inbound_domain),
     )
 
 
@@ -92,5 +95,6 @@ async def create_workspace(
 @router.get("/workspaces/{workspace_id}")
 async def get_workspace(
     ctx: Annotated[WorkspaceContext, Depends(require_workspace(Action.workspace_read))],
+    request: Request,
 ) -> WorkspaceOut:
-    return workspace_out(ctx.workspace, ctx.role)
+    return workspace_out(ctx.workspace, ctx.role, request.app.state.settings.inbound_domain)

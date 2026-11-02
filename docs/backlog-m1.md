@@ -3,8 +3,8 @@
 These are minor findings from the M1 per-task reviews and the final review, deferred during the build. None blocks merge. Findings already fixed later in M1 are left out.
 
 ## First M2 task
-- **Reconciler.** Re-attach control-plane, worker and the shared helpers to `label=sijil.tenant` networks after compose recreates them. Today a `make up` that rebuilds those services silently cuts active tenants off.
-- **IP pool for dev tenant networks.** Use a dedicated small IPAM pool; Docker's default pools allow about 31 bridge networks.
+- ~~**Reconciler.** Re-attach control-plane, worker and the shared helpers to `label=sijil.tenant` networks after compose recreates them. Today a `make up` that rebuilds those services silently cuts active tenants off.~~ Done in M2: `sijil_worker.reconcile`, run when the worker starts and every 300 s by `beat`.
+- ~~**IP pool for dev tenant networks.** Use a dedicated small IPAM pool; Docker's default pools allow about 31 bridge networks.~~ Done in M2: tenant networks are /28s from `SIJIL_TENANT_SUBNET_POOL` (`10.240.0.0/16`).
 
 ## Production milestone
 - Set uvicorn `forwarded_allow_ips` to the real proxy, so rate limits key on the client IP and not the proxy's.
@@ -77,3 +77,63 @@ These are minor findings from the M1 per-task reviews and the final review, defe
   - A `print` in the acceptance test.
   - A redundant `GRANT CONNECT` on `postgres`.
   - Stale tenant-network wording in CLAUDE.md.
+
+## M2: deferred review findings
+
+Minor findings from the M2 per-task reviews and the final review, deferred by the controller. None blocks merge. Items fixed in the final fix wave are left out.
+
+### Must be in the M4 plan
+- **Orphan locked versions (final M1).** A put that lands in the store but whose ledger insert never commits (crash, lost race) leaves a GOVERNANCE-locked version no row points at. M4 needs a reconciliation sweep (versions without a ledger row) and a decision on what happens to them.
+- **Sealing credential.** `seal`, `extend_retention` and `governance_remove` need their own, narrower object-store credential; the services' `sijil-app` key deliberately cannot do them (it holds `s3:PutObjectRetention` only because a locked put requires it; the store refuses to shorten without the bypass).
+- **Seal race.** The residual race between seal steps (a) and (b): callers must serialise seal/extend per object version with a row lock.
+
+### Final review
+- **REGION_TZ (M5).** `region_local_date` raises a bare `KeyError` for a region missing from `REGION_TZ`; validate regions at startup.
+- **Storage-unavailable code (M6).** `ingest.storage_unavailable` covers any `ClientError`/`BotoCoreError`, including an `AccessDenied` that is a credential problem, not an outage.
+- **SMTP replies (M7).** Whole-message 552/554/550 refusals are not audited, `email.rejected` kind is always `unknown`, and some permanent failures answer 4xx (a persistent non-`IngestError` loops on 451 with duplicate audit rows).
+- **Open-alert index (T9).** Alert dedup relies on the advisory lock only; add a partial unique index on open `(workspace_id, ledger_id, kind)` (and the NULL `ledger_id` case).
+- **Exact checksum lookup (T6) rejected.** Paperless 3.4.1 declares `checksum` with `iexact` (and prefix/suffix/contains) only and ignores a bare `checksum=`, so the lookup stays `checksum__iexact` (pinned by `test_checksum_lookup_uses_the_filter_paperless_honours`); its index cost is open.
+- **Hibernated uploads.** `409 workspace.not_ready` refuses uploads to a `hibernated` workspace; when idle hibernation ships, uploads must wake it instead.
+
+### Ingest and drift
+- The original is buffered twice in memory (about 200 MB for a 100 MB file); stream it to httpx.
+- `cannot identify image file` marks a corrupt image `unsupported` (final), not `failed`.
+- Pre-0005 rows stuck in `sending` with a NULL `ingest_claimed_at` are never recovered (dev only).
+- A run can outlast its lease (about twice the poll timeout); a second run then resumes the stored task (bounded).
+- The lease is recomputed inline instead of using `CLAIM_LEASE`; the partial index on `ingest_next_attempt_at` helps the sweep little; no test that the recorded countdown equals Celery's.
+- Drift: a `consumed` row without `paperless_doc_id` is skipped silently on the Paperless side; the 02:30 fan-out is a thundering herd; alerts are never auto-resolved; no test of a mid-run Paperless failure after committed pages, or of concurrent dedup.
+- The documents list reports the engine `ok` on pages with no consumed documents, hiding an outage or a missing credential.
+
+### Capture, upload and SMTP
+- `ClientDisconnect` during an upload is logged as a 500 with a traceback.
+- `CeleryEnqueuer` publish retries can delay the 202 while Redis is down (use `retry=False` or a short policy).
+- The XML rule accepts SVG/XHTML with script: never serve an original inline as XML or SVG. XML test gaps: DOCTYPE SYSTEM, parameter entities, a leading comment.
+- The ZIP64 locator offset is trusted (older CPython 3.13.x patches could be bypassed; capped by the 100 MiB limit).
+- The unused `upload.invalid` code; `MemoryObjectStore` reads whole files.
+- SMTP holds several in-memory copies of a 100 MB message; no RCPT cap or rate limit on the public port; a forwarded email's inner attachments are archived separately too.
+- Documents API: a DB session is held during the Paperless call; the cursor timestamp is not bounds-checked.
+
+### Schema and audit
+- No `BEFORE TRUNCATE` trigger on the ledger or audit log (the app role lacks TRUNCATE; the owner can).
+- No CHECKs for lowercase hex `sha256`/`md5`, the `inbound_token` charset, or `seq >= 1`; no server defaults on enum columns.
+- `source_email_id` is unindexed and not tied to the same workspace.
+- `member.role_changed` is written when the role is unchanged; an org with no workspace records no org events; tail truncation of the chain needs an external anchor (design).
+
+### Infra and tests
+- Bootstrap retries permanent `ClientError`s 30 times.
+- Integration tests write sealed objects into the real originals bucket and leave org/workspace/credential/ledger rows (the upload perf test 20 per run).
+- Worktree runs share the compose project `sijil`, so `make down ARGS=-v` wipes the shared dev stack.
+- `clean-tenants.sh`: the container filter lacks the project label; the Makefile's `findstring -v` matches any `-v` substring.
+- The beat entries lack `expires` (burst after worker downtime); `beat` gets the full worker environment, secrets included.
+- Reconcile: per-member `network.containers` lookups, duplicate except branches, a possible race with `destroy`; the subnet pool is not in `.env.example` and a pool smaller than /28 gives a bare `ValueError`.
+- Seed: `KeyError` when `SIJIL_DATABASE_URL` is unset, unguarded `SIJIL_IT_CP_URL` override, a wrong password's 401 falls through to signup, no pytest timeout, the engine is not disposed on failure.
+
+### From the M2 fix-wave re-review
+- **Paperless HTTP 500 is final.** Ingest treats a 500 as non-transient (`ingest.paperless_error`) → `failed`, and re-upload is refused 409; a tenant whose own DB is down answers 500. Treat 500 as transient (bounded by the 24 h delay cap) — do this early in M3.
+- `delay_after` assumes one attempt per Celery retry; sweep restarts can advance the doubling by one cycle (bounded, cosmetic).
+- `bootstrap-storage` does not retry admin-API 503s while RustFS starts (`migrate` fails once; re-run works).
+- `ensure_app_user` closes a caller-supplied httpx client.
+- App-credential test doesn't assert the key cannot switch GOVERNANCE→COMPLIANCE; the key can extend a GOVERNANCE lock arbitrarily (non-destructive).
+- `clean-tenants.sh` exits without a warning when the Docker daemon is down.
+- DB connection loss surfaces as SQLAlchemy InterfaceError/DBAPIError, not always OperationalError — widen `is_transient_cause`.
+- A workspace stuck in error/hibernated writes one `document.ingest_delayed` per document per day — watch audit-chain growth.

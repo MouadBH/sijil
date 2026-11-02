@@ -28,16 +28,36 @@ x-paperless: &paperless
 x-sijil-env: &sijil-env
   SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
   SIJIL_ENVIRONMENT: dev
+  SIJIL_INBOUND_DOMAIN: in.sijil.local
   SIJIL_REDIS_URL: redis://redis:6379/0
 
+# Every running service gets the least-privilege `sijil-app` key (put, read, list; no delete,
+# no BypassGovernanceRetention), which `migrate` provisions. Only `migrate` and the test runner
+# hold the RustFS root key.
+x-objectstore-env: &objectstore-env
+  SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
+  SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_APP_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_APP_SECRET_KEY:?}
+  SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
+
+x-objectstore-root-env: &objectstore-root-env
+  SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
+  SIJIL_OBJECTSTORE_ACCESS_KEY: ${OBJECTSTORE_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_SECRET_KEY: ${OBJECTSTORE_SECRET_KEY:?}
+  SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
+  # The credential `sijil-cp bootstrap-storage` provisions (and the tests check).
+  SIJIL_OBJECTSTORE_APP_ACCESS_KEY: ${SIJIL_OBJECTSTORE_APP_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_APP_SECRET_KEY: ${SIJIL_OBJECTSTORE_APP_SECRET_KEY:?}
+
 x-worker-env: &worker-env
-  <<: *sijil-env
+  <<: [*sijil-env, *objectstore-env]
   SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
   SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
   SIJIL_PROVISIONER_DATABASE_URL: postgresql+asyncpg://sijil_provisioner:${SIJIL_PROVISIONER_DB_PASSWORD:?}@postgres:5432/postgres
   SIJIL_TENANT_IMAGE: ghcr.io/paperless-ngx/paperless-ngx:3.4.1
   SIJIL_COMPOSE_PROJECT: ${COMPOSE_PROJECT_NAME:-sijil}
   SIJIL_TESSDATA_VOLUME: ${COMPOSE_PROJECT_NAME:-sijil}_tessdata
+  SIJIL_TENANT_SUBNET_POOL: 10.240.0.0/16
 
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
@@ -177,15 +197,17 @@ services:
     build:
       context: ../..
       dockerfile: services/control-plane/Dockerfile
-    command: ["alembic", "upgrade", "head"]
+    command: ["sh", "-c", "alembic upgrade head && sijil-cp bootstrap-storage"]
     restart: "no"
     environment:
+      <<: *objectstore-root-env
       SIJIL_REGION: ${SIJIL_REGION:?SIJIL_REGION is required}
       SIJIL_ENVIRONMENT: dev
       SIJIL_MIGRATION_DATABASE_URL: postgresql+asyncpg://sijil_cp_owner:${SIJIL_CP_OWNER_DB_PASSWORD:?}@postgres:5432/sijil_cp
     networks: [core]
     depends_on:
       postgres: { condition: service_healthy }
+      objectstore: { condition: service_started }
 
   control-plane:
     build:
@@ -193,7 +215,7 @@ services:
       dockerfile: services/control-plane/Dockerfile
     restart: unless-stopped
     environment:
-      <<: *sijil-env
+      <<: [*sijil-env, *objectstore-env]
       SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
       SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
       SIJIL_COOKIE_SECURE: "false" # dev runs over http on localhost
@@ -225,6 +247,37 @@ services:
       postgres: { condition: service_healthy }
       tessdata-init: { condition: service_completed_successfully }
 
+  smtp:
+    # Inbound email capture (CAP-1): archives mail per workspace address. No Docker socket and
+    # no tenant networks: it needs only the database, the object store and the broker.
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["sijil-smtp"]
+    # Public edge: only what SmtpSettings reads. No master key, no provisioner credentials.
+    environment:
+      <<: [*sijil-env, *objectstore-env]
+      SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+    ports: ["127.0.0.1:2525:2525"]
+    networks: [core]
+    depends_on:
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  beat:
+    # Schedules the periodic tasks (re-attaching compose services to tenant networks).
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "sijil_worker.main", "beat", "--loglevel", "INFO", "-s", "/tmp/celerybeat-schedule"]
+    environment: *worker-env
+    networks: [core]
+    depends_on:
+      redis: { condition: service_started }
+
   tests:
     # `make itest`: pytest inside the tenant networks, which have no published ports.
     build:
@@ -238,7 +291,8 @@ services:
       # tenant networks they create. The socket is root on the host; never do this in production.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      <<: *worker-env
+      # Root key: the store tests exercise seal and governance removal (bypass).
+      <<: [*objectstore-root-env, *worker-env]
       UV_PROJECT_ENVIRONMENT: /opt/venv
       SIJIL_IT_T1_URL: http://paperless-t1:8000
       SIJIL_IT_T1_ADMIN_PASSWORD: ${T1_ADMIN_PASSWORD:?}

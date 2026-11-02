@@ -243,7 +243,7 @@ async def test_workspace_out_never_exposes_paperless_url(
     r = await alice.client.get(f"/v1/workspaces/{ws['id']}")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"id", "org_id", "name", "slug", "state", "role"}
+    assert set(body) == {"id", "org_id", "name", "slug", "state", "role", "inbound_email"}
     assert "tenant-secret" not in r.text
     assert body["role"] == "owner"
 

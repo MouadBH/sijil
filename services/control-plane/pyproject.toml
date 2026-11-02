@@ -14,10 +14,11 @@ dependencies = [
   "argon2-cffi>=23.1",
   "pyotp>=2.9",
   "celery[redis]>=5.4",
+  "python-multipart>=0.0.20",
 ]
 
 [project.scripts]
-sijil-cp = "sijil_cp.main:run"
+sijil-cp = "sijil_cp.cli:main"
 
 [tool.uv.sources]
 sijil-core = { workspace = true }

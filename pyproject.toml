@@ -19,6 +19,7 @@ dev = [
   "ruff>=0.8",
   "celery-types>=0.22",
   "types-docker>=7.1",
+  "boto3-stubs[s3]>=1.35",
   # fixtures/ generator and its tests
   "reportlab>=4.2",
   "arabic-reshaper>=3.0",
@@ -55,6 +56,8 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--import-mode=importlib -m 'not integration'"
+# The repository root, so suites can import the shared doubles in `tests.support`.
+pythonpath = ["."]
 markers = [
   "db: needs Postgres (set SIJIL_TEST_DATABASE_URL)",
   "integration: needs the compose stack; run with `make itest`",

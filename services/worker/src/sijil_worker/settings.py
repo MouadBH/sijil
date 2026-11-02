@@ -1,3 +1,5 @@
+from ipaddress import IPv4Network
+
 from pydantic import RedisDsn
 
 from sijil_core.crypto import KeySettings
@@ -12,3 +14,5 @@ class WorkerSettings(KeySettings):
     tenant_image: str
     compose_project: str
     tessdata_volume: str
+    # Tenant networks are carved (as /28) out of this pool, away from Docker's default pools.
+    tenant_subnet_pool: IPv4Network = IPv4Network("10.240.0.0/16")

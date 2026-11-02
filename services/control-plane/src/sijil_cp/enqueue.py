@@ -9,10 +9,15 @@ from fastapi import Request
 from sijil_core.db.models import JobKind
 
 _TASKS = {JobKind.provision_workspace: ("sijil.provision_workspace", "provisioning")}
+INGEST_TASK = ("sijil.ingest_document", "ingest")
 
 
 class Enqueuer(Protocol):
     def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None: ...
+
+    def send_ingest(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        """Push an accepted original into the workspace's Paperless (worker, queue `ingest`)."""
+        ...
 
 
 class CeleryEnqueuer:
@@ -26,6 +31,14 @@ class CeleryEnqueuer:
         self._app.send_task(
             name,
             kwargs={"job_id": str(job_id), "workspace_id": str(workspace_id)},
+            queue=queue,
+        )
+
+    def send_ingest(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        name, queue = INGEST_TASK
+        self._app.send_task(
+            name,
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
             queue=queue,
         )
 

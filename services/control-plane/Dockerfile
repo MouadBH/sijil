@@ -15,4 +15,4 @@ ENV PATH="/opt/venv/bin:$PATH"
 WORKDIR /src/services/control-plane
 EXPOSE 8000
 # Migrations run separately as the schema owner: `alembic upgrade head` (compose service `migrate`).
-CMD ["sijil-cp"]
+CMD ["sijil-cp", "serve"]

@@ -49,11 +49,26 @@ class PaperlessUnavailable(PaperlessError):  # noqa: N818
     502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
 
 
+class PaperlessBadResponse(PaperlessError):  # noqa: N818
+    """Paperless answered 2xx with a body of an unexpected shape (not JSON, or not the object
+    the endpoint documents)."""
+
+
+class PaperlessUnsupportedType(PaperlessError):  # noqa: N818
+    """Paperless refused the upload because it cannot consume this file type (HTTP 400,
+    `{"document": ["File type text/xml not supported"]}` in 3.4.1). Final, never retried."""
+
+
 @dataclass(frozen=True)
 class PaperlessTask:
     task_id: str
     status: str
     related_document: int | None
+    # Paperless's own failure text for a FAILURE task (`result_data.error_message`). Used to
+    # classify the failure; callers must not log it or store it.
+    error: str | None = None
+    # False when Paperless has no record of the task id (never seen, or purged).
+    known: bool = True
 
 
 def _related_document(row: dict[str, Any]) -> int | None:
@@ -66,6 +81,31 @@ def _related_document(row: dict[str, Any]) -> int | None:
         return int(result["document_id"])
     legacy = row.get("related_document")
     return int(str(legacy).split(",")[0]) if legacy else None
+
+
+def _error_message(row: dict[str, Any]) -> str | None:
+    result = row.get("result_data")
+    if isinstance(result, dict) and result.get("error_message"):
+        return str(result["error_message"])
+    legacy = row.get("result")  # older versions put the text in `result`
+    return str(legacy) if isinstance(legacy, str) and legacy else None
+
+
+def _is_unsupported_type(response: httpx.Response) -> bool:
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    messages = body.get("document") if isinstance(body, dict) else None
+    return isinstance(messages, list) and any("not supported" in str(m) for m in messages)
+
+
+@dataclass(frozen=True)
+class PaperlessDoc:
+    id: int
+    title: str | None
+    created: str | None
+    original_file_name: str | None
 
 
 class PaperlessClient:
@@ -204,13 +244,57 @@ class PaperlessClient:
             raise PaperlessError("user not found")
         return {str(p) for p in user["user_permissions"]}
 
-    async def upload(self, content: bytes, filename: str) -> str:
+    async def upload(self, content: bytes, filename: str, title: str | None = None) -> str:
+        """Queue `content` for consumption and return the Paperless task id.
+
+        Raises PaperlessUnsupportedType when Paperless refuses the file type outright. Retries
+        only connection failures (nothing was sent); gateway errors surface as Unavailable.
+        """
+        where = "POST /api/documents/post_document/"
+        data = {"title": title} if title else None
+        for attempt in range(_ATTEMPTS):
+            last = attempt == _ATTEMPTS - 1
+            try:
+                response = await self._http.post(
+                    "/api/documents/post_document/",
+                    files={"document": (filename, content, "application/octet-stream")},
+                    data=data,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if last:
+                    raise PaperlessUnavailable(f"{where}: connection failed") from None
+            except httpx.TransportError as exc:
+                raise PaperlessUnavailable(f"{where}: {type(exc).__name__}") from None
+            except httpx.HTTPError as exc:
+                raise PaperlessError(f"{where}: {type(exc).__name__}") from None
+            else:
+                if response.status_code == 400 and _is_unsupported_type(response):
+                    raise PaperlessUnsupportedType(f"{where}: HTTP 400", 400)
+                if response.status_code in _RETRY_STATUS:
+                    # Not retried here: the POST may already have been applied, so the caller
+                    # resumes by task id / checksum instead of uploading again.
+                    raise PaperlessUnavailable(f"{where}: HTTP {response.status_code}")
+                return str(self._checked(where, response).json())
+            await asyncio.sleep(_BACKOFF_S * 2**attempt)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def find_document_by_checksum(self, sha256: str) -> int | None:
+        """Id of the oldest live document whose original has this SHA-256, or None.
+
+        Paperless 3.4.1 keys documents by the SHA-256 of the original and does not refuse
+        duplicates, so this is what makes ingest idempotent.
+
+        `checksum__iexact`, never a bare `checksum=`: 3.4.1 declares only istartswith,
+        iendswith, icontains and iexact for this field, and silently ignores an undeclared
+        filter, which would return every document (tests/integration/test_paperless_contract).
+        """
         response = await self._request(
-            "POST",
-            "/api/documents/post_document/",
-            files={"document": (filename, content, "application/octet-stream")},
+            "GET",
+            "/api/documents/",
+            params={"checksum__iexact": sha256, "ordering": "id", "page_size": 1},
         )
-        return str(response.json())
+        results = response.json().get("results") or []
+        return int(results[0]["id"]) if results else None
 
     async def task(self, task_id: str) -> PaperlessTask:
         response = await self._request("GET", "/api/tasks/", params={"task_id": task_id})
@@ -218,17 +302,65 @@ class PaperlessClient:
         if isinstance(rows, dict):
             rows = rows.get("results", [])
         if not rows:
-            return PaperlessTask(task_id=task_id, status="PENDING", related_document=None)
+            return PaperlessTask(
+                task_id=task_id, status="PENDING", related_document=None, known=False
+            )
         row = rows[0]
         return PaperlessTask(
             task_id=task_id,
             status=str(row["status"]).upper(),  # 3.4.1 reports lowercase ("success")
             related_document=_related_document(row),
+            error=_error_message(row),
         )
 
     async def get_document(self, doc_id: int) -> dict[str, Any]:
         response = await self._request("GET", f"/api/documents/{doc_id}/")
         return dict(response.json())
+
+    async def document_metadata(self, doc_id: int) -> dict[str, Any] | None:
+        """`/api/documents/{id}/metadata/`, or None when Paperless has no such document (404,
+        which includes one in the trash). Transport errors and 5xx raise PaperlessUnavailable."""
+        try:
+            response = await self._request("GET", f"/api/documents/{doc_id}/metadata/")
+        except PaperlessError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/documents/{id}/metadata/: not JSON") from None
+        if not isinstance(body, dict):
+            raise PaperlessBadResponse("GET /api/documents/{id}/metadata/: unexpected body")
+        return dict(body)
+
+    async def documents_by_ids(self, ids: Sequence[int]) -> dict[int, PaperlessDoc]:
+        """Titles and names of the given documents in one request (ids missing in Paperless
+        are simply absent). A malformed answer surfaces as PaperlessError."""
+        wanted = sorted(set(ids))
+        if not wanted:
+            return {}
+        response = await self._request(
+            "GET",
+            "/api/documents/",
+            params={
+                "id__in": ",".join(str(i) for i in wanted),
+                "page_size": len(wanted),
+                "fields": "id,title,created,original_file_name",
+            },
+        )
+        try:
+            return {
+                int(r["id"]): PaperlessDoc(
+                    id=int(r["id"]),
+                    title=r.get("title"),
+                    created=r.get("created"),
+                    original_file_name=r.get("original_file_name"),
+                )
+                for r in response.json()["results"]
+            }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise PaperlessError("GET /api/documents/: unexpected body") from None
 
     async def delete_document(self, doc_id: int) -> None:
         await self._request("DELETE", f"/api/documents/{doc_id}/")

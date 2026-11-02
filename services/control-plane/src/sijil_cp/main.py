@@ -5,8 +5,9 @@ from fastapi import APIRouter, FastAPI
 from redis.asyncio import Redis
 
 from sijil_core.crypto import LocalKeyService
+from sijil_core.storage import S3ObjectStore
 from sijil_cp import __version__
-from sijil_cp.api import auth, health, jobs, members, orgs, workspaces
+from sijil_cp.api import auth, documents, health, jobs, members, orgs, workspaces
 from sijil_cp.auth import csrf
 from sijil_cp.auth.csrf import CsrfMiddleware
 from sijil_cp.db import make_engine, make_sessionmaker
@@ -40,6 +41,8 @@ def create_app(settings: CpSettings) -> FastAPI:
     app.state.keys = LocalKeyService(settings.master_key_bytes())
     # Tests replace this with a recording stand-in; production sends tasks to the worker.
     app.state.enqueuer = CeleryEnqueuer(str(settings.redis_url))
+    # The original store (object lock); tests swap in an in-memory double.
+    app.state.store = S3ObjectStore(settings)
     register_error_handlers(app)
     app.add_middleware(CsrfMiddleware)
 
@@ -51,6 +54,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(workspaces.router)
     v1.include_router(members.router)
     v1.include_router(jobs.router)
+    v1.include_router(documents.router)
     app.include_router(v1)
     return app
 
