@@ -32,6 +32,7 @@ from sijil_core.tenancy import tenant_db_names, tenant_ref
 from sijil_worker.ingest import ingest_document
 from sijil_worker.runtime.base import ADMIN_USERNAME
 from sijil_worker.settings import WorkerSettings
+from tests.support.workspaces import mark_closing
 
 T1_URL = os.environ.get("SIJIL_IT_T1_URL", "http://paperless-t1:8000")
 SERVICE_USER = "sijil-it-ingest"
@@ -49,6 +50,7 @@ class Harness:
         self.sessions = make_sessionmaker(self.engine)
         self.store = S3ObjectStore(StorageSettings())  # type: ignore[call-arg]
         self.refs: list[ObjectRef] = []
+        self.workspace_ids: list[uuid.UUID] = []
         self.token = ""
 
     async def prepare_paperless(self) -> None:
@@ -78,6 +80,7 @@ class Harness:
             db.add(org)
             await db.flush()
             workspace_id = uuid.uuid4()
+            self.workspace_ids.append(workspace_id)  # marked closing by close()
             db_name, index_db_name = tenant_db_names(tenant_ref(workspace_id))
             workspace = Workspace(
                 id=workspace_id,
@@ -153,6 +156,11 @@ class Harness:
             return fresh
 
     async def close(self) -> None:
-        for ref in self.refs:
-            await self.store.governance_remove(ref)
-        await self.engine.dispose()
+        try:
+            for ref in self.refs:
+                await self.store.governance_remove(ref)
+        finally:
+            try:
+                await mark_closing(self.workspace_ids, database_url=self.settings.database_url)
+            finally:
+                await self.engine.dispose()

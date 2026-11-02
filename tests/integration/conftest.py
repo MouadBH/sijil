@@ -7,6 +7,7 @@ tenant like the control plane does. DockerRuntime's own attachment list stays pr
 
 import contextlib
 import socket
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import AbstractContextManager
 
@@ -17,6 +18,7 @@ from docker.errors import APIError, NotFound
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
 from tests.support.t1 import Harness
+from tests.support.workspaces import closing_at_exit
 
 AttachRunner = Callable[[str], AbstractContextManager[None]]
 
@@ -67,3 +69,11 @@ async def harness() -> AsyncIterator[Harness]:
         yield h
     finally:
         await h.close()
+
+
+@pytest.fixture
+async def created_workspaces() -> AsyncIterator[list[uuid.UUID]]:
+    """Append the id of every workspace the test creates: each is marked `closing` at
+    teardown (tests/support/workspaces.py), so it never feeds the live extraction worker."""
+    async with closing_at_exit() as created:
+        yield created

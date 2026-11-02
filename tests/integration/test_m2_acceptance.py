@@ -46,10 +46,14 @@ CONSUME_BUDGET_S = 120
 
 
 async def test_m2_acceptance(
-    docker_runtime: DockerRuntime, worker_settings: WorkerSettings, attach_runner: AttachRunner
+    docker_runtime: DockerRuntime,
+    worker_settings: WorkerSettings,
+    attach_runner: AttachRunner,
+    created_workspaces: list[uuid.UUID],
 ) -> None:
     run = uuid.uuid4().hex[:8]
-    created: list[uuid.UUID] = []  # filled the moment the workspace exists, before seeding can fail
+    # Filled the moment the workspace exists, before seeding can fail; marked closing at teardown.
+    created = created_workspaces
     engine = make_engine(worker_settings.database_url)
     sessions = make_sessionmaker(engine)
     keys = LocalKeyService(worker_settings.master_key_bytes())
