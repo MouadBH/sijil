@@ -2,7 +2,7 @@
 export DOCKER_SOCKET_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo 0)
 COMPOSE := docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env
 
-.PHONY: install lint typecheck test check itest e2e up down smoke seed models
+.PHONY: install lint typecheck test check itest e2e up down smoke seed models eval
 
 install:
 	uv sync --all-packages
@@ -50,3 +50,9 @@ models:
 
 seed:
 	infra/scripts/seed.sh
+
+# Extraction accuracy on the SAMPLE invoices ingested in workspace WS (reported, not gated).
+# Runs in worker-extraction (index, Ollama and Paperless access); fixtures are mounted read-only.
+eval:
+	$(if $(WS),,$(error usage: make eval WS=<workspace id>))
+	$(COMPOSE) exec worker-extraction sijil-eval extraction --set /src/fixtures/invoices/manifest.json --workspace $(WS) $(ARGS)
