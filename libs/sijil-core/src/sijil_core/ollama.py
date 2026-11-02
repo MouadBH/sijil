@@ -17,6 +17,10 @@ from typing import Any, Final, Self
 import httpx
 
 NUM_CTX: Final = 8192
+# The answer is ten short fields (a few hundred tokens). A run that never closes its JSON (seen
+# live: one generating until the 300 s timeout) is cut here and parses as bad output, so it
+# never holds the one model for the whole timeout.
+NUM_PREDICT: Final = 1024
 # What Ollama 0.40 answers (HTTP 500) when the model cannot be loaded: too little memory, or
 # the runner killed (OOM) while loading.
 _LOAD_FAILURE_MARKERS: Final = (
@@ -165,7 +169,12 @@ class OllamaClient:
                 "stream": False,
                 "think": False,
                 "format": dict(schema),
-                "options": {"temperature": 0, "seed": seed, "num_ctx": NUM_CTX},
+                "options": {
+                    "temperature": 0,
+                    "seed": seed,
+                    "num_ctx": NUM_CTX,
+                    "num_predict": NUM_PREDICT,
+                },
             },
         )
         try:

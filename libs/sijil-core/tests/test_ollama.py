@@ -65,8 +65,22 @@ async def test_chat_json_request_shape() -> None:
         "stream": False,
         "think": False,
         "format": SCHEMA,
-        "options": {"temperature": 0, "seed": 2, "num_ctx": 8192},
+        "options": {"temperature": 0, "seed": 2, "num_ctx": 8192, "num_predict": 1024},
     }
+
+
+async def test_a_runaway_answer_is_cut_and_is_bad_output() -> None:
+    """A run that never closes its JSON (seen live: one run generating for 5 min) is cut at
+    `num_predict` tokens; the truncated answer is bad output (the other run is used), never a
+    request that holds the one model until the timeout."""
+
+    def handler(_r: httpx.Request) -> httpx.Response:
+        body = {"message": {"role": "assistant", "content": '{"number": "F-1",   '}}
+        return httpx.Response(200, json=body | {"done_reason": "length"})
+
+    async with client(handler) as ai:
+        with pytest.raises(OllamaBadOutput):
+            await ai.chat_json("m", "s", "u", SCHEMA, seed=1)
 
 
 @pytest.mark.parametrize("status", [500, 502, 503, 504])
