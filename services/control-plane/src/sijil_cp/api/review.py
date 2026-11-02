@@ -21,8 +21,10 @@ Until the seal worker has locked it, the original stays under its GOVERNANCE loc
 provisional date: no key a running service holds can delete or shorten it, and the
 `requeue_unlocked` sweep and the drift check bound that window.
 
-A field edit holds the same ledger lock and commits its index write before releasing it, so a
-seal never hashes the values an edit is replacing.
+A field edit holds the same ledger lock; it commits its `document.fields_edited` event first and
+its index write after (an applied edit is always audited; an index failure then answers 503
+`field.update_failed`). A seal racing it either seals the values it locked, with their digest,
+or gets `seal.fields_changed`.
 """
 
 import asyncio
@@ -41,7 +43,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, tuple_
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, AsyncTransaction
 
 from sijil_core import audit
 from sijil_core import index as index_db
@@ -78,6 +80,7 @@ INCOMPLETE: Final = "seal.fields_incomplete"
 CHANGED: Final = "seal.fields_changed"
 INDEX_UNAVAILABLE: Final = "seal.index_unavailable"
 SEAL_FAILED: Final = "seal.failed"
+UPDATE_FAILED: Final = "field.update_failed"
 REVIEWABLE: Final = frozenset({DocumentState.filed, DocumentState.needs_review})
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
@@ -331,7 +334,8 @@ async def edit_fields(
     _refuse_unless_reviewable(ledger)
     values = _parsed(body.fields)
     names = sorted(values)
-    async with (await _engines(request).engine(workspace)).begin() as conn:
+    async with (await _engines(request).engine(workspace)).connect() as conn:
+        trans = await conn.begin()
         try:
             row = await index_db.update_fields(
                 conn, ledger.id, values, source="user", updated_by=user.id, now=now
@@ -341,7 +345,6 @@ async def edit_fields(
             raise ApiError(LOCKED, 409) from None
         except LookupError:
             raise ApiError(NOT_REVIEWABLE, 409) from None
-        # Flushed (in the ledger lock's transaction), committed below.
         await audit.append(
             db,
             workspace_id=workspace.id,
@@ -354,10 +357,23 @@ async def edit_fields(
             data={"fields": ",".join(names)},
             now=now,
         )
-    # The index edit is committed while the ledger lock is still held; only then does this
-    # commit release it, so a seal can never start on, and hash, the values being replaced.
-    await db.commit()
+        # The audit first (controller ruling): an applied edit always has its event. This
+        # commit releases the ledger lock; a seal that starts now cannot hash the values being
+        # replaced, because `seal_fields` recomputes the digest under the row lock this index
+        # transaction still holds (`seal.fields_changed` if they moved).
+        await db.commit()
+        try:
+            await _commit_index(trans)
+        except Exception as exc:
+            # A logged edit attempt that did not apply: acceptable, and said so.
+            log.warning("field edit of document %s not applied: %s", doc_id, type(exc).__name__)
+            raise ApiError(UPDATE_FAILED, 503) from None
     return _full(ledger, row)
+
+
+async def _commit_index(trans: AsyncTransaction) -> None:
+    """Commits the index edit (a seam: tests make it fail or pause)."""
+    await trans.commit()
 
 
 # Sealing -------------------------------------------------------------------------------------

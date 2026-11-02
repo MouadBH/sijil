@@ -738,12 +738,12 @@ async def test_seal_of_values_that_changed_after_they_were_read_is_409(
     assert r.json()["fields_sha256"] == frozen.fields_sha256 == fields_digest(frozen.values)
 
 
-async def test_patch_commits_the_index_before_it_releases_the_ledger_lock(
+async def test_patch_audits_the_edit_before_it_applies_it(
     member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
     index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch,
 ) -> None:  # fmt: skip
-    """When the control-plane commit releases the ledger lock (and a seal could start), the
-    edit is already committed in the index: a seal can never hash the values it replaced."""
+    """Controller ruling: the `document.fields_edited` event commits first, the index edit
+    after it, so an applied edit always has its audit event."""
     row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
     real_commit = AsyncSession.commit
     seen: list[str | None] = []
@@ -765,7 +765,68 @@ async def test_patch_commits_the_index_before_it_releases_the_ledger_lock(
         _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"total_ttc": "1600.00"}}
     )
     assert r.status_code == 200, r.text
-    assert seen == ["1600.00"]
+    assert seen == [INVOICE["total_ttc"]]  # not applied yet when the audit committed
+    applied = await index.read_fields(index_conn, row.id)
+    assert applied is not None and applied.values["total_ttc"] == "1600.00"
+
+
+async def test_index_failure_after_the_audit_is_field_update_failed(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """A logged edit attempt that did not apply is acceptable; the values stay as they were."""
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+
+    async def failing(trans: Any) -> None:
+        await trans.rollback()
+        raise ConnectionResetError("index connection lost at commit")
+
+    monkeypatch.setattr(review, "_commit_index", failing)
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"total_ttc": "1600.00"}}
+    )
+    assert (r.status_code, _code(r)) == (503, "field.update_failed")
+    [edited] = await _events(db, ws, "document.fields_edited")
+    assert edited.data == {"fields": "total_ttc"}
+    unchanged = await index.read_fields(index_conn, row.id)
+    assert unchanged is not None and unchanged.values["total_ttc"] == INVOICE["total_ttc"]
+
+
+async def test_a_seal_racing_a_patch_never_stores_a_mismatched_digest(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """The PATCH has committed its audit (the ledger lock is free) but not yet its index edit
+    when a seal starts: the seal either seals the values it locked, with their digest, or
+    answers 409 `seal.fields_changed`. Never a digest of other values."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    real_commit_index = review._commit_index
+    outcome: list[Any] = []
+
+    async def pause_then_commit(trans: Any) -> None:
+        # The seal runs now, between the PATCH's audit commit and its index commit. It blocks
+        # on the index row the PATCH holds; let it get there, then commit the edit.
+        seal = asyncio.create_task(member.client.post(_url(ws, f"/documents/{row.id}/seal")))
+        await asyncio.sleep(0.5)
+        await real_commit_index(trans)
+        outcome.append(await seal)
+
+    monkeypatch.setattr(review, "_commit_index", pause_then_commit)
+    r = await member.client.patch(
+        _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"total_ttc": "1600.00"}}
+    )
+    assert r.status_code == 200, r.text
+    [sealed] = outcome
+    frozen = await index.read_fields(index_conn, row.id)
+    assert frozen is not None
+    if sealed.status_code == 200:
+        digest = fields_digest(frozen.values)
+        assert frozen.fields_sha256 == digest == sealed.json()["fields_sha256"]
+        assert (await _ledger(db, row)).fields_sha256 == fields_digest(frozen.values)
+    else:
+        assert (sealed.status_code, _code(sealed)) == (409, "seal.fields_changed")
+        assert frozen.sealed_at is None
+        assert frozen.values["total_ttc"] == "1600.00"
 
 
 @pytest.mark.parametrize("month", ["2026-13", "2026-1", "october", "2026-10-01"])
