@@ -579,8 +579,10 @@ def mirror_fields_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str
 
 
 # The compliance lock (seal worker): 30 s, 1 min ... capped at 15 min, LOCK_MAX_RETRIES times.
-# A permanent refusal is logged by its code and left to the sweep and the drift check: the
-# original stays GOVERNANCE-locked meanwhile, so nothing is lost by waiting.
+# A permanent refusal is logged by its code and its `lock:pending` key is left to expire (1 h):
+# the sweep re-sends that row at most hourly, and rows that keep failing can never fill the
+# sweep's batch ahead of newer rows. The drift check flags it after an hour; the original stays
+# GOVERNANCE-locked meanwhile, so nothing is lost by waiting.
 LOCK_MAX_RETRIES = 8
 LOCK_BACKOFF_FACTOR_S = 30
 LOCK_BACKOFF_MAX_S = 900
@@ -658,10 +660,11 @@ def lock_sealed_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) 
 
             _pending_lock_quietly(refresh)
             raise self.retry(exc=exc, countdown=countdown) from exc
-        _pending_lock_quietly(clear)
         if is_lock_transient(exc):
-            raise  # retries ran out: the sweep sends it again later
-        # Permanent (e.g. AccessDenied): logged by its code only, never retried in a loop.
+            _pending_lock_quietly(clear)
+            raise  # retries ran out: the next sweep may send it again
+        # Permanent (e.g. AccessDenied): logged by its code only. The pending key is kept until
+        # it expires, so the sweep does not re-send this row every five minutes.
         log.error("compliance lock of document %s refused: %s", ledger_id, _store_code(exc))
         return
     _pending_lock_quietly(clear)

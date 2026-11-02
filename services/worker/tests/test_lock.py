@@ -338,3 +338,69 @@ def test_seal_settings_hold_no_master_key_nor_provisioner(monkeypatch: pytest.Mo
     assert settings.objectstore_access_key.get_secret_value() == "sijil-seal"
     assert not hasattr(settings, "master_key")
     assert not hasattr(settings, "provisioner_database_url")
+
+
+class RecordingPending:
+    """Stands in for the broker Redis key: records what the task does to it."""
+
+    def __init__(self) -> None:
+        self.ops: list[str] = []
+
+    async def clear(self, ledger_id: uuid.UUID) -> None:
+        self.ops.append("clear")
+
+    async def refresh(self, ledger_id: uuid.UUID, ttl_s: int) -> None:
+        self.ops.append("refresh")
+
+
+@pytest.mark.parametrize(
+    ("error", "cleared"),
+    [
+        (None, True),  # locked: the key goes
+        (_client_error("ServiceUnavailable", 503), True),  # retries ran out: the sweep re-sends
+        # Permanent: the key stays until its TTL (1 h), so the row is not re-sent at every sweep
+        # and can never hold the head of the sweep against newer rows.
+        (_client_error("AccessDenied", 403), False),
+    ],
+)
+def test_a_permanent_lock_failure_keeps_its_pending_key(
+    eager_app: None, monkeypatch: pytest.MonkeyPatch, error: Exception | None, cleared: bool
+) -> None:
+    pending = RecordingPending()
+
+    def quietly(op: Any) -> None:
+        import asyncio
+
+        asyncio.run(op(pending))
+
+    async def lock(ledger_id: str, workspace_id: str) -> None:
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(tasks, "_pending_lock_quietly", quietly)
+    monkeypatch.setattr(tasks, "_lock_sealed", lock)
+    tasks.lock_sealed_task.apply(kwargs=ARGS)
+    assert ("clear" in pending.ops) is cleared
+
+
+@pytest.mark.db
+async def test_permanently_failing_rows_never_starve_the_sweep(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, pending: PendingExtractions, redis: Redis,
+) -> None:  # fmt: skip
+    """60 old sealed rows whose lock keeps failing permanently (their keys left in place) and
+    one newer row whose first message was lost: the next sweep sends the newer row."""
+    failing = [
+        await _ledger(db, memory_store, workspace, user, sealed_at=NOW - timedelta(hours=1))
+        for _ in range(60)
+    ]
+    for row in failing:
+        assert await pending.claim(row.id)  # what their (failed) runs left behind
+    newer = await _ledger(db, memory_store, workspace, user, sealed_at=NOW - timedelta(minutes=5))
+    sent: list[uuid.UUID] = []
+
+    async def send(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append(ledger_id)
+
+    assert await requeue_unlocked(sessions, send, region="ma-cas", pending=pending, now=NOW) == 1
+    assert sent == [newer.id]

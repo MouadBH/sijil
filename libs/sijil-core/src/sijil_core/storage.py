@@ -72,8 +72,11 @@ class ObjectStore(Protocol):
     async def seal(self, ref: ObjectRef, retain_until: date) -> None:
         """Switch the object to COMPLIANCE mode, keeping any later existing date.
 
-        Callers must serialise seal/extend per object version (a DB row lock): the store cannot
-        make read-then-write atomic.
+        Idempotent: on a COMPLIANCE object it is a no-op at the same or an earlier date and only
+        extends to a later one. Callers need no row lock: the seal worker passes the ledger's
+        `retention_until`, which the ledger trigger freezes once sealed, so concurrent runs
+        (a redelivery, a sweep re-send) all ask for the same date. (`extend_retention` still
+        runs under the ledger row lock at routing.)
         """
         ...
 

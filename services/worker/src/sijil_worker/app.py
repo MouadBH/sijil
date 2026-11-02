@@ -14,7 +14,7 @@ REQUEUE_UNLOCKED_INTERVAL_S = 300
 QUEUES = ("default", "provisioning", "ingest", "extraction", "seal")
 
 
-def make_celery(settings: BrokerSettings) -> Celery:
+def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -> Celery:
     app = Celery("sijil", include=["sijil_worker.tasks"])
     app.conf.update(
         broker_url=str(settings.redis_url),
@@ -51,8 +51,11 @@ def make_celery(settings: BrokerSettings) -> Celery:
         },
     )
 
-    @worker_ready.connect(weak=False)
-    def _reconcile_on_start(**_: Any) -> None:
-        app.send_task("sijil.reconcile_tenants")
+    if reconcile_on_start:
+        # The main worker only (it has the Docker socket): the extraction and seal workers
+        # never ask for a reconcile.
+        @worker_ready.connect(weak=False)
+        def _reconcile_on_start(**_: Any) -> None:
+            app.send_task("sijil.reconcile_tenants")
 
     return app

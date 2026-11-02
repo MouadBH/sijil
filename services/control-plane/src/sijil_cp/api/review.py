@@ -57,6 +57,7 @@ from sijil_core.db.models import (
 )
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, parse_field
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
+from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, retention_basis
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
@@ -79,6 +80,7 @@ NOT_REVIEWABLE: Final = "document.not_reviewable"
 INCOMPLETE: Final = "seal.fields_incomplete"
 CHANGED: Final = "seal.fields_changed"
 INDEX_UNAVAILABLE: Final = "seal.index_unavailable"
+DB_UNAVAILABLE: Final = "seal.db_unavailable"
 SEAL_FAILED: Final = "seal.failed"
 UPDATE_FAILED: Final = "field.update_failed"
 REVIEWABLE: Final = frozenset({DocumentState.filed, DocumentState.needs_review})
@@ -379,6 +381,13 @@ async def _commit_index(trans: AsyncTransaction) -> None:
 # Sealing -------------------------------------------------------------------------------------
 
 
+class _IndexUnavailable(ApiError):
+    """The workspace's index database failed during one seal."""
+
+    def __init__(self) -> None:
+        super().__init__(INDEX_UNAVAILABLE, 503)
+
+
 @dataclass(frozen=True)
 class _Sealer:
     """What one seal needs, so the single seal and the batch run the same code."""
@@ -408,8 +417,11 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
     """Seals the ledger row the caller locked FOR UPDATE (see the module docstring) and
     commits. Raises ApiError for a document that cannot be sealed; nothing is committed then."""
     _refuse_unless_reviewable(ledger)
-    async with sealer.engine.connect() as conn:
-        row = await index_db.read_fields(conn, ledger.id)
+    try:
+        async with sealer.engine.connect() as conn:
+            row = await index_db.read_fields(conn, ledger.id)
+    except (SQLAlchemyError, OSError) as exc:
+        raise _IndexUnavailable from exc
     if row is None:
         raise ApiError(NOT_REVIEWABLE, 409)
     missing = _missing(row)
@@ -432,6 +444,8 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
         raise ApiError(CHANGED, 409) from None
     except RetentionLocked:
         raise ApiError(LOCKED, 409) from None
+    except (SQLAlchemyError, OSError) as exc:
+        raise _IndexUnavailable from exc
     # The ledger, under the lock taken by the caller, and the audit, in one transaction.
     ledger.state = DocumentState.sealed
     ledger.fields_sha256 = digest
@@ -459,11 +473,37 @@ async def _after_commit(request: Request, ledger_id: UUID, workspace_id: UUID) -
     `requeue_unlocked` sweep (and flagged by the drift check after an hour); a lost mirror
     only delays Paperless's copy."""
     enqueuer = get_enqueuer(request)
-    for name, send in (("lock", enqueuer.send_lock), ("mirror", enqueuer.send_mirror)):
+    if await _claim_lock(request, ledger_id):
         try:
-            await asyncio.to_thread(send, ledger_id, workspace_id)
+            await asyncio.to_thread(enqueuer.send_lock, ledger_id, workspace_id)
         except Exception as exc:  # noqa: BLE001 - the broker being down must not undo a seal
-            log.warning("%s enqueue of document %s failed: %s", name, ledger_id, type(exc).__name__)
+            log.warning("lock enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+            await _release_lock(request, ledger_id)
+    try:
+        await asyncio.to_thread(enqueuer.send_mirror, ledger_id, workspace_id)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("mirror enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+
+
+async def _claim_lock(request: Request, ledger_id: UUID) -> bool:
+    """`lock:pending:<id>`, the key the seal worker clears and the sweep honours, so this
+    message and a sweep re-send never run together. False when one is already in flight. A
+    broker Redis that cannot answer does not stop the send (the worker is idempotent)."""
+    try:
+        claimed = await request.app.state.redis.set(
+            pending_key(ledger_id, LOCK_PREFIX), "1", nx=True, ex=PENDING_TTL_S
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("lock claim of document %s failed: %s", ledger_id, type(exc).__name__)
+        return True
+    return bool(claimed)
+
+
+async def _release_lock(request: Request, ledger_id: UUID) -> None:
+    try:
+        await request.app.state.redis.delete(pending_key(ledger_id, LOCK_PREFIX))
+    except Exception as exc:  # noqa: BLE001 - it expires anyway
+        log.warning("lock release of document %s failed: %s", ledger_id, type(exc).__name__)
 
 
 async def _sealer(
@@ -515,10 +555,12 @@ def _batch_cursor(at: datetime, ledger_id: UUID) -> str:
 
 
 def _failure_code(exc: Exception) -> str:
+    """Index failures are `_IndexUnavailable` (an ApiError) by then; any other database or
+    connection error is the control plane's own."""
     if isinstance(exc, ApiError):
         return exc.code
     if isinstance(exc, SQLAlchemyError | OSError):
-        return INDEX_UNAVAILABLE
+        return DB_UNAVAILABLE
     return SEAL_FAILED
 
 

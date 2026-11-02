@@ -7,18 +7,14 @@ a lost message expires (1 h), and the sweep may send again.
 """
 
 from collections.abc import Awaitable, Callable
-from typing import Final
 from uuid import UUID
 
 from redis.asyncio import Redis
 
 from sijil_core.ingest import Enqueue
+from sijil_core.pending import PENDING_TTL_S, pending_key
 
-PENDING_TTL_S: Final = 3600
-
-
-def pending_key(ledger_id: UUID, prefix: str = "extract") -> str:
-    return f"{prefix}:pending:{ledger_id}"
+__all__ = ["PENDING_TTL_S", "PendingExtractions", "PendingOp", "pending_key"]
 
 
 class PendingExtractions:

@@ -853,3 +853,74 @@ def test_mirror_is_sent_to_the_main_workers_default_queue(monkeypatch: pytest.Mo
         ("sijil.mirror_fields", kwargs, "default"),
         ("sijil.lock_sealed", kwargs, "seal"),  # the seal worker, never the control plane
     ]
+
+
+async def test_the_seal_claims_the_lock_pending_key_before_sending(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, redis: Any,
+) -> None:  # fmt: skip
+    """The control plane's lock message and a sweep re-send never run together: both claim
+    `lock:pending:<id>` first."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert await redis.exists(f"lock:pending:{row.id}")
+    assert 0 < await redis.ttl(f"lock:pending:{row.id}") <= 3600
+    assert enqueuer.locks == [(row.id, ws.id)]
+    # Already in flight (a sweep sent it): the control plane does not send a second one.
+    other = await add_document(db, memory_store, index_conn, ws)
+    await redis.set(f"lock:pending:{other.id}", "1", ex=3600)
+    r = await member.client.post(_url(ws, f"/documents/{other.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert enqueuer.locks == [(row.id, ws.id)]
+    assert enqueuer.mirrors == [(row.id, ws.id), (other.id, ws.id)]
+
+
+async def test_a_failed_lock_send_releases_its_claim(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, redis: Any,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+
+    def broken(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        raise ConnectionRefusedError("broker down")
+
+    enqueuer.send_lock = broken
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert not await redis.exists(f"lock:pending:{row.id}")  # the sweep may send it
+
+
+async def test_batch_tells_a_database_failure_from_an_index_failure(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    from sqlalchemy.exc import OperationalError
+
+    docs = [
+        await add_document(
+            db, memory_store, index_conn, ws, ingested_at=datetime(2026, 10, day, tzinfo=UTC)
+        )
+        for day in (13, 14, 15)
+    ]
+    db_broken, index_broken = docs[0].id, docs[1].id
+    real_locked, real_read = review._locked_ledger, index.read_fields
+
+    async def locked(session: Any, workspace: Any, doc_id: uuid.UUID) -> Any:
+        if doc_id == db_broken:
+            raise OperationalError("SELECT", {}, ConnectionResetError("cp db lost"))
+        return await real_locked(session, workspace, doc_id)
+
+    async def read(conn: Any, ledger_id: uuid.UUID) -> Any:
+        if ledger_id == index_broken:
+            raise OperationalError("SELECT", {}, ConnectionResetError("index db lost"))
+        return await real_read(conn, ledger_id)
+
+    monkeypatch.setattr(review, "_locked_ledger", locked)
+    monkeypatch.setattr(index, "read_fields", read)
+    body = (await member.client.post(_url(ws, "/seal-batch"), json={"month": "2026-10"})).json()
+    assert body["sealed"] == 1
+    assert body["skipped"] == [
+        {"id": str(db_broken), "code": "seal.db_unavailable"},
+        {"id": str(index_broken), "code": "seal.index_unavailable"},
+    ]

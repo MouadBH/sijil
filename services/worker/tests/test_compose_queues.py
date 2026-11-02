@@ -122,3 +122,26 @@ def test_only_the_seal_worker_holds_the_seal_key() -> None:
         assert "SIJIL_OBJECTSTORE_SEAL" not in _anchor(anchor), anchor
     for service in ("worker", "worker-extraction", "smtp", "beat"):
         assert "SIJIL_OBJECTSTORE_SEAL" not in _block(service), service
+
+
+def test_only_the_main_worker_reconciles_on_start() -> None:
+    """`sijil.reconcile_tenants` needs the Docker socket: only the main worker sends it when it
+    starts, never the extraction or the seal worker."""
+    from celery.signals import worker_ready
+    from pydantic import RedisDsn
+
+    from sijil_worker.app import make_celery
+    from sijil_worker.settings import BrokerSettings
+
+    settings = BrokerSettings.model_construct(
+        region="ma-cas", environment="test", redis_url=RedisDsn("redis://127.0.0.1:1/0")
+    )
+    before = len(worker_ready.receivers)
+    make_celery(settings)
+    assert len(worker_ready.receivers) == before
+    make_celery(settings, reconcile_on_start=True)
+    assert len(worker_ready.receivers) == before + 1
+    src = ROOT / "services" / "worker" / "src" / "sijil_worker"
+    assert "reconcile_on_start=True" in (src / "main.py").read_text()
+    for entry in ("main_extraction.py", "main_seal.py"):
+        assert "reconcile_on_start" not in (src / entry).read_text(), entry

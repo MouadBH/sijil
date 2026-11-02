@@ -398,3 +398,36 @@ async def test_workspace_gets_inbound_token_and_email(make_actor: MakeActor) -> 
     assert re.fullmatch(r"[a-z0-9-]+\.[a-z2-7]{10}@in\.sijil\.local", ws["inbound_email"])
     got = await alice.client.get(f"/v1/workspaces/{ws['id']}")
     assert got.json()["inbound_email"] == ws["inbound_email"]
+
+
+async def test_0009_downgrade_to_0008_keeps_the_0008_guards(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """Down to 0008 exactly: `object_locked_at` and its CHECK are gone, the sealed row's hash,
+    state and retention are still frozen and the seal CHECK still holds."""
+    db.add(ledger(workspace.id))
+    db.add(ledger(workspace.id, sha=f"{9:064x}"))
+    await db.commit()
+    await db.close()
+    await owner_conn.execute(text(SEAL_SQL + " WHERE sha256 = :sha"), {"u": user.id, "sha": SHA})
+    _alembic(migrated_db.owner_url, "downgrade", "0008")
+    try:
+        assert "object_locked_at" not in await _columns(owner_conn)
+        names = await _constraint_names(owner_conn)
+        assert "ck_document_ledger_object_locked_after_seal" not in names
+        assert "ck_document_ledger_seal_consistent" in names
+        for assignment in SEALED_FROZEN:
+            with pytest.raises(DBAPIError, match="ledger.immutable"):
+                await owner_conn.execute(
+                    text(f"UPDATE document_ledger SET {assignment} WHERE sha256 = :sha"),  # noqa: S608
+                    {"sha": SHA},
+                )
+        with pytest.raises(IntegrityError, match="ck_document_ledger_seal_consistent"):
+            await owner_conn.execute(
+                text("UPDATE document_ledger SET state = 'sealed' WHERE sha256 = :sha"),
+                {"sha": f"{9:064x}"},
+            )
+    finally:
+        _alembic(migrated_db.owner_url, "upgrade", "head")
+    assert "object_locked_at" in await _columns(owner_conn)
