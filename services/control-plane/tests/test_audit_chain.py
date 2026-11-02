@@ -181,8 +181,6 @@ async def test_cli_verify_exit_codes(
     monkeypatch.setenv("SIJIL_OBJECTSTORE_ACCESS_KEY", "test-access")
     monkeypatch.setenv("SIJIL_OBJECTSTORE_SECRET_KEY", "test-secret")
     monkeypatch.setenv("SIJIL_OBJECTSTORE_BUCKET", "sijil-originals-test")
-    monkeypatch.setenv("SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY", "test-seal-access")
-    monkeypatch.setenv("SIJIL_OBJECTSTORE_SEAL_SECRET_KEY", "test-seal-secret")
     loop = asyncio.get_running_loop()
 
     def run() -> int:

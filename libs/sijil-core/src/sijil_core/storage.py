@@ -81,6 +81,11 @@ class ObjectStore(Protocol):
         """Delete an unsealed object, bypassing GOVERNANCE. Fails on a sealed one."""
         ...
 
+    async def retention(self, ref: ObjectRef) -> tuple[str, date] | None:
+        """The version's lock mode and retain-until date (UTC calendar date), or None when the
+        version is absent. Read-only (`s3:GetObjectRetention`): the drift check uses it."""
+        ...
+
 
 def _end_of_day(day: date) -> datetime:
     return datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=UTC)
@@ -217,6 +222,12 @@ class S3ObjectStore(ObjectStore):
     def _seal(self, ref: ObjectRef, retain_until: date) -> None:
         mode, current = self._current(ref)
         target = max(current, _end_of_day(retain_until))
+        if mode == "COMPLIANCE":
+            # Already sealed (a retried lock task): idempotent. A later date only extends,
+            # which COMPLIANCE allows without any bypass; never shortened.
+            if target > current:
+                self._set(ref, "COMPLIANCE", target)
+            return
         # (a) Extend in GOVERNANCE without bypass: the store refuses shortening here, so a
         # concurrent extend cannot be overwritten by a stale date.
         if mode == "GOVERNANCE" and target > current:
@@ -230,6 +241,18 @@ class S3ObjectStore(ObjectStore):
 
     async def governance_remove(self, ref: ObjectRef) -> None:
         await asyncio.to_thread(self._remove, ref)
+
+    async def retention(self, ref: ObjectRef) -> tuple[str, date] | None:
+        return await asyncio.to_thread(self._retention, ref)
+
+    def _retention(self, ref: ObjectRef) -> tuple[str, date] | None:
+        try:
+            mode, until = self._current(ref)
+        except ClientError as exc:
+            if _error_code(exc) in _ABSENT_CODES:
+                return None
+            raise
+        return mode, until.astimezone(UTC).date()
 
     def _remove(self, ref: ObjectRef) -> None:
         self.client.delete_object(

@@ -42,8 +42,6 @@ def make_settings(**overrides: str) -> CpSettings:
         "objectstore_access_key": "test-access",
         "objectstore_secret_key": "test-secret",
         "objectstore_bucket": "sijil-originals-test",
-        "objectstore_seal_access_key": "test-seal-access",
-        "objectstore_seal_secret_key": "test-seal-secret",
     } | overrides
     return CpSettings.model_validate(values)
 
@@ -129,6 +127,7 @@ class RecordingEnqueuer:
         self.calls: list[tuple[JobKind, UUID, UUID]] = []
         self.ingests: list[tuple[UUID, UUID]] = []
         self.mirrors: list[tuple[UUID, UUID]] = []
+        self.locks: list[tuple[UUID, UUID]] = []
 
     def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None:
         self.calls.append((kind, job_id, workspace_id))
@@ -138,6 +137,9 @@ class RecordingEnqueuer:
 
     def send_mirror(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self.mirrors.append((ledger_id, workspace_id))
+
+    def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self.locks.append((ledger_id, workspace_id))
 
 
 @pytest.fixture
@@ -205,9 +207,7 @@ def cp_app(
 ) -> FastAPI:
     app = make_db_app()
     app.state.enqueuer = enqueuer
-    # One in-memory bucket behind both credentials (the app key and the sealing key).
     app.state.store = memory_store
-    app.state.seal_store = memory_store
     app.dependency_overrides[deps.get_now] = lambda: clock.now
     return app
 

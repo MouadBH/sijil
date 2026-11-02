@@ -48,7 +48,7 @@ x-objectstore-root-env: &objectstore-root-env
   # The credential `sijil-cp bootstrap-storage` provisions (and the tests check).
   SIJIL_OBJECTSTORE_APP_ACCESS_KEY: ${SIJIL_OBJECTSTORE_APP_ACCESS_KEY:?}
   SIJIL_OBJECTSTORE_APP_SECRET_KEY: ${SIJIL_OBJECTSTORE_APP_SECRET_KEY:?}
-  # The control plane's sealing credential (retention only), provisioned the same way.
+  # The seal worker's credential (retention only), provisioned the same way.
   SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY: ${SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY:?}
   SIJIL_OBJECTSTORE_SEAL_SECRET_KEY: ${SIJIL_OBJECTSTORE_SEAL_SECRET_KEY:?}
 
@@ -75,6 +75,17 @@ x-extraction-env: &extraction-env
   SIJIL_OLLAMA_URL: http://ollama:11434
   SIJIL_AI_ALLOWED_HOSTS: ollama
   SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+
+# The seal worker (`sijil_worker.settings.SealSettings`): the database as the app role, the
+# broker, and the object store through the sealing key (retention only: no bytes, no delete),
+# which no other running service holds. No master key, no provisioner role.
+x-seal-env: &seal-env
+  <<: *sijil-env
+  SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+  SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
+  SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_SEAL_SECRET_KEY:?}
+  SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
 
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
@@ -244,9 +255,6 @@ services:
       SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
       SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
       SIJIL_COOKIE_SECURE: "false" # dev runs over http on localhost
-      # Only the control plane seals (COMPLIANCE): retention only, no bytes, no delete.
-      SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY: ${SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY:?}
-      SIJIL_OBJECTSTORE_SEAL_SECRET_KEY: ${SIJIL_OBJECTSTORE_SEAL_SECRET_KEY:?}
     ports: ["127.0.0.1:8000:8000"]
     networks: [core, ai, tenant_t1, tenant_t2]
     healthcheck:
@@ -289,6 +297,22 @@ services:
     depends_on:
       redis: { condition: service_started }
       postgres: { condition: service_healthy }
+
+  worker-seal:
+    # The compliance lock (sijil.lock_sealed), after the control plane commits a seal. The only
+    # running service holding the sealing key; nothing else: no master key, no provisioner role,
+    # no tenant or AI network, no published port, no Docker socket.
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "sijil_worker.main_seal", "worker", "-Q", "seal", "--concurrency", "2", "-n", "seal@%h", "--loglevel", "INFO"]
+    environment: *seal-env
+    networks: [core]
+    depends_on:
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
 
   smtp:
     # Inbound email capture (CAP-1): archives mail per workspace address. No Docker socket and

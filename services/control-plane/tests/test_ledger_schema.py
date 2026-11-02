@@ -247,9 +247,71 @@ async def test_0008_upgrade_keeps_existing_unsealed_rows(
     try:
         names = await _constraint_names(owner_conn)
         assert "ck_document_ledger_seal_consistent" not in names
+        assert "ck_document_ledger_object_locked_after_seal" not in names
+        assert "object_locked_at" not in await _columns(owner_conn)
+        # 0006's function is back: a sealed row's hash may change again (0008 forbade it),
+        # while sealed_at stays frozen.
+        sealed = f"{1:064x}"
+        await owner_conn.execute(
+            text(
+                "UPDATE document_ledger SET state = 'sealed', fields_sha256 = repeat('f', 64), "
+                "sealed_at = now() WHERE sha256 = :sha"
+            ),
+            {"sha": sealed},
+        )
+        await owner_conn.execute(
+            text("UPDATE document_ledger SET fields_sha256 = repeat('e', 64) WHERE sha256 = :sha"),
+            {"sha": sealed},
+        )
+        with pytest.raises(DBAPIError, match="ledger.immutable"):
+            await owner_conn.execute(
+                text("UPDATE document_ledger SET sealed_at = NULL WHERE sha256 = :sha"),
+                {"sha": sealed},
+            )
     finally:
         _alembic(migrated_db.owner_url, "upgrade", "head")
-    assert "ck_document_ledger_seal_consistent" in await _constraint_names(owner_conn)
+    names = await _constraint_names(owner_conn)
+    assert {
+        "ck_document_ledger_seal_consistent",
+        "ck_document_ledger_object_locked_after_seal",
+    } <= names
+    assert "object_locked_at" in await _columns(owner_conn)
+
+
+async def _columns(conn: AsyncConnection) -> set[str]:
+    rows = await conn.execute(
+        text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'document_ledger'"
+        )
+    )
+    return {r[0] for r in rows}
+
+
+async def test_object_locked_at_set_once_then_frozen(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User
+) -> None:
+    """0009: the worker records the COMPLIANCE lock once; nobody moves or clears it."""
+    db.add(ledger(workspace.id))
+    await db.commit()
+    await owner_conn.execute(text(SEAL_SQL), {"u": user.id})
+    await owner_conn.execute(text("UPDATE document_ledger SET object_locked_at = now()"))
+    for assignment in (
+        "object_locked_at = object_locked_at + interval '1 second'",
+        "object_locked_at = NULL",
+    ):
+        with pytest.raises(DBAPIError, match="ledger.immutable"):
+            await owner_conn.execute(text(f"UPDATE document_ledger SET {assignment}"))  # noqa: S608
+    await owner_conn.execute(text("UPDATE document_ledger SET object_locked_at = object_locked_at"))
+
+
+async def test_object_locked_at_needs_a_sealed_row(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace
+) -> None:
+    db.add(ledger(workspace.id))
+    await db.commit()
+    with pytest.raises(IntegrityError, match="ck_document_ledger_object_locked_after_seal"):
+        await owner_conn.execute(text("UPDATE document_ledger SET object_locked_at = now()"))
 
 
 async def _constraint_names(conn: AsyncConnection) -> set[str]:

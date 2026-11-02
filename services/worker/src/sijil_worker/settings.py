@@ -5,13 +5,29 @@ from pydantic import RedisDsn, field_validator
 from pydantic_settings import NoDecode
 
 from sijil_core.crypto import KeySettings
+from sijil_core.settings import CoreSettings
+from sijil_core.storage import StorageSettings
 
 
-class ExtractionSettings(KeySettings):
+class BrokerSettings(CoreSettings):
+    """What every Celery worker needs: its region and the broker."""
+
+    redis_url: RedisDsn
+
+
+class SealSettings(StorageSettings, BrokerSettings):
+    """The seal worker (`-Q seal`): the control-plane database as the app role, the broker, and
+    the object store through the sealing key (SIJIL_OBJECTSTORE_ACCESS_KEY is that key in its
+    container). No master key, no provisioner role, no tenant or AI settings: it never reads a
+    credential or a document's content."""
+
+    database_url: str
+
+
+class ExtractionSettings(KeySettings, BrokerSettings):
     """What extraction and routing need, and nothing for provisioning: the extraction worker
     boots with this alone (least privilege: no provisioner role, no Docker settings)."""
 
-    redis_url: RedisDsn
     # Control-plane database, as the app role (DML only), same as the control plane.
     database_url: str
     # Extraction (M3): the in-region Ollama only. Its host must be on `ai_allowed_hosts`

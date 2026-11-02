@@ -6,7 +6,7 @@ could change it, one test per layer (architecture.md "Retention lock").
 | 1 API | control plane answers `409 retention.locked` | test_api_* |
 | 2 Paperless | the service user has no delete right | test_paperless_service_user_cannot_delete |
 | 3 database | ledger trigger (0006/0008), index row freeze trigger | test_ledger_*, test_index_* |
-| 4 object lock | COMPLIANCE once sealed, never shortened | test_object_lock_* |
+| 4 object lock | COMPLIANCE once sealed (the seal worker), never shortened | test_object_lock_* |
 
 Routing (Task 5) is a path that writes the ledger, the index row and the object lock, so it is
 here too: it only ever raises retention, extends the lock before the ledger and refuses a
@@ -47,11 +47,12 @@ from sijil_core.db.models import (
     TenantCredential,
     Workspace,
 )
-from sijil_core.fields import FIELD_NAMES
-from sijil_core.index import FieldsRow, IndexEngines, RetentionLocked
+from sijil_core.fields import FIELD_NAMES, fields_digest
+from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.paperless import SERVICE_PERMISSIONS
 from sijil_core.storage import ObjectRef, S3ObjectStore, StorageSettings
 from sijil_worker.extract import _route
+from sijil_worker.lock import lock_sealed
 from sijil_worker.settings import WorkerSettings
 from tests.support.index_db import throwaway_index_db
 from tests.support.memory_store import MemoryObjectStore, SealedObjectError
@@ -112,6 +113,9 @@ async def _sealed_via_api(
     row = await add_document(db, store, conn, ws)
     r = await member.client.post(f"/v1/workspaces/{ws.id}/documents/{row.id}/seal")
     assert r.status_code == 200, r.text
+    # What the seal worker does once `sijil.lock_sealed` arrives.
+    sessions = async_sessionmaker(db.bind, expire_on_commit=False)
+    assert await lock_sealed(row.id, sessions=sessions, store=store, settings=ROUTING, now=NOW)
     return row
 
 
@@ -181,7 +185,8 @@ async def test_index_update_after_seal_refused(index_conn: AsyncConnection) -> N
         updated_at=NOW,
     )
     await index.write_extraction(index_conn, row)
-    await index.seal_fields(index_conn, ledger_id, fields_sha256="a" * 64, sealed_at=NOW)
+    digest = fields_digest(values)
+    await index.seal_fields(index_conn, ledger_id, fields_sha256=digest, sealed_at=NOW)
 
     with pytest.raises(RetentionLocked):
         await index.update_fields(
@@ -202,7 +207,32 @@ async def test_index_update_after_seal_refused(index_conn: AsyncConnection) -> N
             await index_conn.execute(text(sql), {"id": ledger_id})
     frozen = await index.read_fields(index_conn, ledger_id)
     assert frozen is not None
-    assert (dict(frozen.values), frozen.fields_sha256) == (values, "a" * 64)
+    assert (dict(frozen.values), frozen.fields_sha256) == (values, digest)
+
+
+@pytest.mark.db
+async def test_index_seal_refuses_a_hash_of_values_that_changed(
+    index_conn: AsyncConnection,
+) -> None:
+    """The freeze recomputes the digest from the row it locks: a hash of values an edit has
+    since replaced is never stamped onto the new ones."""
+    ledger_id = uuid.uuid4()
+    values = {name: INVOICE.get(name) for name in FIELD_NAMES}
+    await index.write_extraction(
+        index_conn,
+        FieldsRow(
+            ledger_id=ledger_id, document_type="invoice", values=values,
+            source=dict.fromkeys(FIELD_NAMES, "extraction"), updated_at=NOW,
+        ),
+    )  # fmt: skip
+    stale = fields_digest(values)
+    await index.update_fields(
+        index_conn, ledger_id, {"total_ttc": "1.00"}, source="user", updated_by=None, now=NOW
+    )
+    with pytest.raises(FieldsChanged):
+        await index.seal_fields(index_conn, ledger_id, fields_sha256=stale, sealed_at=NOW)
+    current = await index.read_fields(index_conn, ledger_id)
+    assert current is not None and current.sealed_at is None
 
 
 @pytest.mark.db
@@ -257,6 +287,11 @@ async def test_object_lock_cannot_shorten_after_seal(
     row = await _sealed_via_api(member, ws, db, memory_store, index_conn)
     ref = ObjectRef(row.object_key, row.object_version_id)
     assert stored(memory_store, row).mode == "COMPLIANCE"
+    # A second lock run (a redelivery, the sweep) changes nothing.
+    sessions = async_sessionmaker(db.bind, expire_on_commit=False)
+    assert not await lock_sealed(
+        row.id, sessions=sessions, store=memory_store, settings=ROUTING, now=NOW
+    )
     with pytest.raises(ValueError):
         await memory_store.extend_retention(ref, PROVISIONAL - timedelta(days=1))
     await memory_store.seal(ref, date(2027, 12, 31))  # a later, shorter seal keeps the date
@@ -275,10 +310,48 @@ def _store(access: str, secret: str) -> S3ObjectStore:
     return S3ObjectStore(settings)
 
 
+@pytest.mark.db
+async def test_object_lock_follows_the_committed_ledger_seal(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """The API commits the seal and sends the lock; the original stays GOVERNANCE at its
+    provisional date until the seal worker switches it to COMPLIANCE at the ledger's committed
+    retention, and records `object_locked_at` once (frozen by the 0009 trigger)."""
+    row = await add_document(db, memory_store, index_conn, ws, retention_until=date(2035, 12, 31))
+    r = await member.client.post(f"/v1/workspaces/{ws.id}/documents/{row.id}/seal")
+    assert r.status_code == 200, r.text
+    assert enqueuer.locks == [(row.id, ws.id)]
+    assert (stored(memory_store, row).mode, stored(memory_store, row).retain_until) == (
+        "GOVERNANCE",
+        date(2035, 12, 31),
+    )
+    sessions = async_sessionmaker(db.bind, expire_on_commit=False)
+    assert await lock_sealed(
+        row.id, sessions=sessions, store=memory_store, settings=ROUTING, now=NOW
+    )
+    assert (stored(memory_store, row).mode, stored(memory_store, row).retain_until) == (
+        "COMPLIANCE",
+        date(2036, 12, 31),
+    )
+    locked = await db.scalar(
+        select(DocumentLedger)
+        .where(DocumentLedger.id == row.id)
+        .execution_options(populate_existing=True)
+    )
+    assert locked is not None and locked.object_locked_at == NOW
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await db.execute(
+            update(DocumentLedger).where(DocumentLedger.id == row.id).values(object_locked_at=None)
+        )
+    await db.rollback()
+
+
 @pytest.mark.integration
 async def test_object_lock_cannot_shorten_after_seal_rustfs(tmp_path: Path) -> None:
-    """RustFS, through the control plane's sealing credential: once COMPLIANCE, neither that key
-    nor the root key (with the bypass flag) can shorten the lock or delete the version."""
+    """RustFS, through the seal worker's credential: sealing twice at the same date is a no-op,
+    and once COMPLIANCE neither that key nor the root key (with the bypass flag) can shorten
+    the lock or delete the version."""
     from botocore.exceptions import ClientError
 
     root = S3ObjectStore(StorageSettings())  # type: ignore[call-arg]
@@ -292,6 +365,9 @@ async def test_object_lock_cannot_shorten_after_seal_rustfs(tmp_path: Path) -> N
     final = date.today() + timedelta(days=3)
     await sealer.seal(ref, final)
     assert sealer._current(ref)[0] == "COMPLIANCE"  # noqa: SLF001
+    await sealer.seal(ref, final)  # a retried lock task: idempotent at the same date
+    await sealer.seal(ref, final - timedelta(days=1))  # never shortens, never fails
+    assert root._current(ref)[1].date() == final  # noqa: SLF001
     sooner = datetime.now(UTC) + timedelta(hours=1)
     target = {"Bucket": root.bucket, "Key": ref.key, "VersionId": ref.version_id}
     for store in (sealer, root):
@@ -423,9 +499,10 @@ async def test_routing_never_moves_a_sealed_document(
     row, fields = await _received(
         db, memory_store, index_conn, workspace, PROVISIONAL, "2026-09-30"
     )
-    await index.seal_fields(index_conn, row.id, fields_sha256="c" * 64, sealed_at=NOW)
+    digest = fields_digest(fields.values)
+    await index.seal_fields(index_conn, row.id, fields_sha256=digest, sealed_at=NOW)
     row.state = DocumentState.sealed
-    row.fields_sha256 = "c" * 64
+    row.fields_sha256 = digest
     row.sealed_at = NOW
     row.sealed_by = user.id
     await db.commit()

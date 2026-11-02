@@ -31,15 +31,18 @@ from sijil_core.db.models import (
     DocumentSource,
     DocumentState,
     IngestState,
+    IntegrityAlert,
     TenantCredential,
     User,
     Workspace,
+    WorkspaceState,
 )
 from sijil_core.fields import DOCUMENT_TYPES, FIELD_NAMES, fields_digest
 from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
+from sijil_worker.ingest import WorkspaceNotActive
 from sijil_worker.mirror import CUSTOM_FIELDS, mirror_fields
 from sijil_worker.settings import WorkerSettings
 from tests.support.index_db import throwaway_index_db
@@ -120,9 +123,10 @@ async def _document(
     *,
     sealed: bool = True,
     values: dict[str, str | None] = VALUES,
+    ledger_digest: str | None = None,
 ) -> DocumentLedger:
     sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
-    digest = fields_digest(values, document_type=values.get("document_type"))
+    digest = fields_digest(values)
     row = DocumentLedger(
         workspace_id=ws.id,
         sha256=sha,
@@ -137,7 +141,7 @@ async def _document(
         paperless_doc_id=DOC_ID,
         retention_until=date(2036, 12, 31),
         ingested_at=NOW,
-        fields_sha256=digest if sealed else None,
+        fields_sha256=(ledger_digest or digest) if sealed else None,
         sealed_at=NOW if sealed else None,
         sealed_by=user.id if sealed else None,
     )
@@ -392,3 +396,45 @@ def test_mirror_task_retries_transient_errors_only(
     result = tasks.mirror_fields_task.apply(kwargs=ARGS)
     assert isinstance(result.result, type(error))
     assert len(calls) == attempts
+
+
+@pytest.mark.db
+async def test_mirror_refuses_values_that_do_not_hash_to_the_sealed_digest(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """The index row's values are recomputed into the digest: when they are not what the
+    ledger sealed, nothing reaches Paperless and an integrity alert says so."""
+    row = await _document(db, engines, ready, user, ledger_digest="e" * 64)
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        assert not await _mirror(row.id, sessions, keys, engines)
+    assert not router.calls
+    assert "mirror.hash_mismatch" in caplog.text
+    alerts = list(
+        await db.scalars(select(IntegrityAlert).where(IntegrityAlert.ledger_id == row.id))
+    )
+    assert [a.kind for a in alerts] == ["fields_hash_mismatch"]
+    # Deduplicated while open.
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        await _mirror(row.id, sessions, keys, engines)
+    again = list(await db.scalars(select(IntegrityAlert).where(IntegrityAlert.ledger_id == row.id)))
+    assert len(again) == 1
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", [WorkspaceState.hibernated, WorkspaceState.provisioning])
+async def test_mirror_waits_while_the_workspace_is_not_active(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User, state: WorkspaceState,
+) -> None:  # fmt: skip
+    row = await _document(db, engines, ready, user)
+    ready.state = state
+    await db.commit()
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        with pytest.raises(WorkspaceNotActive):
+            await _mirror(row.id, sessions, keys, engines)
+    assert not router.calls
+    assert tasks.is_mirror_transient(WorkspaceNotActive())

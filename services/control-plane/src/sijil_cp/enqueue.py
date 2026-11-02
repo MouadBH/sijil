@@ -12,6 +12,8 @@ _TASKS = {JobKind.provision_workspace: ("sijil.provision_workspace", "provisioni
 INGEST_TASK = ("sijil.ingest_document", "ingest")
 # The main worker: it holds the index database settings and the tenants' service tokens.
 MIRROR_TASK = ("sijil.mirror_fields", "default")
+# The seal worker: the only holder of the key that switches an original to COMPLIANCE.
+LOCK_TASK = ("sijil.lock_sealed", "seal")
 
 
 class Enqueuer(Protocol):
@@ -23,6 +25,10 @@ class Enqueuer(Protocol):
 
     def send_mirror(self, ledger_id: UUID, workspace_id: UUID) -> None:
         """Copy a sealed document's fields into its Paperless (worker, queue `default`)."""
+        ...
+
+    def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        """Switch a sealed original to COMPLIANCE (seal worker, queue `seal`)."""
         ...
 
 
@@ -45,6 +51,9 @@ class CeleryEnqueuer:
 
     def send_mirror(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self._send_document(MIRROR_TASK, ledger_id, workspace_id)
+
+    def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self._send_document(LOCK_TASK, ledger_id, workspace_id)
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task

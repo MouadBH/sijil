@@ -85,5 +85,9 @@ class MemoryObjectStore(ObjectStore):
         del self.objects[ref]
         self.removed.append(ref)
 
+    async def retention(self, ref: ObjectRef) -> tuple[str, date] | None:
+        stored = self.objects.get(ref)
+        return None if stored is None else (stored.mode, stored.retain_until)
+
     def versions(self, key: str) -> list[ObjectRef]:
         return [ref for ref in self.objects if ref.key == key]

@@ -90,3 +90,35 @@ def test_extraction_worker_consumes_only_extraction_one_at_a_time() -> None:
     # It provisions nothing: no Docker socket.
     assert "docker.sock" not in block
     assert "group_add" not in block
+
+
+def test_seal_worker_consumes_only_seal_off_the_internet_with_no_socket() -> None:
+    block = _block("worker-seal")
+    raw = _key(block, "command")
+    assert raw is not None
+    command = json.loads(raw)
+    assert _queues(command) == {"seal"}
+    assert command[command.index("--concurrency") + 1] == "2"
+    assert "sijil_worker.main_seal" in command
+    assert _key(block, "environment") == "*seal-env"
+    assert _key(block, "networks") == "[core]"  # no tenant, AI or published port
+    assert "ports" not in block
+    assert "docker.sock" not in block
+    assert "group_add" not in block
+
+
+def test_only_the_seal_worker_holds_the_seal_key() -> None:
+    """The product owner's ruling: the internet-facing control plane never holds the key that
+    can switch a lock; only `worker-seal` (and `migrate` and the test runner, through the
+    root-key anchor) do."""
+    env = _anchor("seal-env")
+    assert "SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY:?}" in env
+    assert "SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_SEAL_SECRET_KEY:?}" in env
+    for absent in ("SIJIL_PROVISIONER_DATABASE_URL", "SIJIL_MASTER_KEY", "*objectstore-env"):
+        assert absent not in env, absent
+    assert "SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:" in env
+    assert "SIJIL_OBJECTSTORE_SEAL" not in _block("control-plane")
+    for anchor in ("worker-env", "extraction-env", "sijil-env", "objectstore-env"):
+        assert "SIJIL_OBJECTSTORE_SEAL" not in _anchor(anchor), anchor
+    for service in ("worker", "worker-extraction", "smtp", "beat"):
+        assert "SIJIL_OBJECTSTORE_SEAL" not in _block(service), service

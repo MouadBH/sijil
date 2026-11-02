@@ -270,7 +270,7 @@ class DocumentLedger(Base):
 
     Immutable columns, retention monotonicity and the ban on DELETE are enforced by the
     document_ledger_immutable trigger (retention layer 3); once sealed, `fields_sha256`, `state`
-    and `retention_until` are frozen too (0008).
+    and `retention_until` are frozen too (0008), and `object_locked_at` is set once (0009).
     """
 
     __tablename__ = "document_ledger"
@@ -282,6 +282,10 @@ class DocumentLedger(Base):
             "AND (sealed_at IS NULL) = (fields_sha256 IS NULL) "
             "AND (sealed_by IS NULL OR sealed_at IS NOT NULL)",
             name="seal_consistent",
+        ),
+        # 0009: the COMPLIANCE lock is recorded only on a sealed row.
+        CheckConstraint(
+            "object_locked_at IS NULL OR sealed_at IS NOT NULL", name="object_locked_after_seal"
         ),
         Index("ix_document_ledger_workspace_ingested", "workspace_id", text("ingested_at DESC")),
         Index(
@@ -320,6 +324,8 @@ class DocumentLedger(Base):
     fields_sha256: Mapped[str | None] = mapped_column(String(64))
     sealed_at: Mapped[datetime | None] = _tstz()
     sealed_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user_account.id"))
+    # When the seal worker switched the original to COMPLIANCE (set once, 0009).
+    object_locked_at: Mapped[datetime | None] = _tstz()
 
 
 class AuditEvent(Base):

@@ -93,9 +93,33 @@ def test_running_services_hold_the_app_key_not_the_root_key(
     root_secret = os.environ["SIJIL_OBJECTSTORE_SECRET_KEY"]  # this runner holds the root key
     assert env["SIJIL_OBJECTSTORE_ACCESS_KEY"] == os.environ["SIJIL_OBJECTSTORE_APP_ACCESS_KEY"]
     assert root_secret not in env.values()
-    # The sealing key is the control plane's alone.
-    seal_secret = os.environ["SIJIL_OBJECTSTORE_SEAL_SECRET_KEY"]
-    assert (seal_secret in env.values()) is (service == "control-plane")
+    # The sealing key is the seal worker's alone (product-owner ruling): never the API's.
+    assert os.environ["SIJIL_OBJECTSTORE_SEAL_SECRET_KEY"] not in env.values()
+    assert not [name for name in env if name.startswith("SIJIL_OBJECTSTORE_SEAL_")]
+
+
+def test_seal_worker_holds_the_seal_key_and_nothing_more(
+    docker_client: docker.DockerClient, worker_settings: WorkerSettings
+) -> None:
+    (container,) = docker_client.containers.list(
+        filters={
+            "label": [
+                f"com.docker.compose.project={worker_settings.compose_project}",
+                "com.docker.compose.service=worker-seal",
+            ]
+        }
+    )
+    env = dict(e.split("=", 1) for e in container.attrs["Config"]["Env"])
+    assert env["SIJIL_OBJECTSTORE_ACCESS_KEY"] == os.environ["SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY"]
+    for secret in (
+        os.environ["SIJIL_OBJECTSTORE_SECRET_KEY"],  # root
+        os.environ["SIJIL_OBJECTSTORE_APP_SECRET_KEY"],
+    ):
+        assert secret not in env.values()
+    for absent in ("SIJIL_PROVISIONER_DATABASE_URL", "SIJIL_MASTER_KEY", "SIJIL_TENANT_IMAGE"):
+        assert absent not in env, absent
+    networks = set(container.attrs["NetworkSettings"]["Networks"])
+    assert networks == {f"{worker_settings.compose_project}_core"}
 
 
 @pytest.fixture
@@ -109,7 +133,7 @@ def sealer() -> S3ObjectStore:
 async def test_seal_credential_seals_but_never_reads_writes_or_destroys(
     app: S3ObjectStore, sealer: S3ObjectStore, root: S3ObjectStore, tmp_path: Path
 ) -> None:
-    """The control plane's sealing key switches an original to COMPLIANCE (the app key cannot,
+    """The seal worker's key switches an original to COMPLIANCE (the app key cannot,
     see above), and can do nothing else to it: no bytes in or out, no delete even with the
     bypass flag, no legal hold."""
     path = tmp_path / "original"

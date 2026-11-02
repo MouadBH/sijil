@@ -37,30 +37,13 @@ _CP_ENV = {
 }
 
 
-def test_the_sealing_key_is_required() -> None:
-    with pytest.raises(ValidationError) as missing:
-        CpSettings.model_validate(_CP_ENV)
-    assert {e["loc"][0] for e in missing.value.errors()} == {
-        "objectstore_seal_access_key",
-        "objectstore_seal_secret_key",
-    }
-
-
-def test_the_seal_store_is_the_same_bucket_through_the_sealing_key() -> None:
-    settings = CpSettings.model_validate(
-        _CP_ENV
-        | {"objectstore_seal_access_key": "seal-access", "objectstore_seal_secret_key": "seal-s"}
-    )
-    seal = settings.seal_storage()
-    assert seal.objectstore_access_key.get_secret_value() == "seal-access"
-    assert seal.objectstore_secret_key.get_secret_value() == "seal-s"
-    assert (seal.objectstore_endpoint, seal.objectstore_bucket, seal.region) == (
-        settings.objectstore_endpoint,
-        settings.objectstore_bucket,
-        "ma-cas",
-    )
-    # The app key is untouched.
-    assert settings.objectstore_access_key.get_secret_value() == "app-access"
+def test_the_control_plane_holds_no_sealing_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Product-owner ruling: only the seal worker can switch a lock. The control plane builds,
+    and `sijil-cp audit verify` runs, without any SIJIL_OBJECTSTORE_SEAL_* setting."""
+    monkeypatch.setenv("SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY", "seal-access")
+    settings = CpSettings.model_validate(_CP_ENV)
+    assert not [name for name in CpSettings.model_fields if "seal" in name]
+    assert not hasattr(settings, "seal_storage")
     app = create_app(settings)
-    assert app.state.seal_store is not app.state.store
-    assert app.state.store.client is not app.state.seal_store.client
+    assert not hasattr(app.state, "seal_store")
+    assert app.state.store.client is not None

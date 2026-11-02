@@ -35,8 +35,6 @@ def _settings(url: str) -> CpSettings:
             "objectstore_access_key": "test-access",
             "objectstore_secret_key": "test-secret",
             "objectstore_bucket": "sijil-originals-test",
-            "objectstore_seal_access_key": "test-seal-access",
-            "objectstore_seal_secret_key": "test-seal-secret",
         }
     )
 

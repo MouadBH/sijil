@@ -45,12 +45,13 @@ from sijil_worker.ingest import (
     is_transient_cause,
     requeue_stuck_ingest,
 )
+from sijil_worker.lock import lock_sealed, requeue_unlocked
 from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.runtime.docker import DockerRuntime
-from sijil_worker.settings import ExtractionSettings, WorkerSettings
+from sijil_worker.settings import ExtractionSettings, SealSettings, WorkerSettings
 
 log = logging.getLogger(__name__)
 
@@ -575,3 +576,123 @@ def mirror_fields_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str
             full_jitter=True,
         )
         raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+# The compliance lock (seal worker): 30 s, 1 min ... capped at 15 min, LOCK_MAX_RETRIES times.
+# A permanent refusal is logged by its code and left to the sweep and the drift check: the
+# original stays GOVERNANCE-locked meanwhile, so nothing is lost by waiting.
+LOCK_MAX_RETRIES = 8
+LOCK_BACKOFF_FACTOR_S = 30
+LOCK_BACKOFF_MAX_S = 900
+
+
+def is_lock_transient(exc: BaseException) -> bool:
+    """The object store or the database unreachable, throttling or failing (5xx)."""
+    if isinstance(exc, ClientError):
+        return _store_error_transient(exc)
+    if isinstance(exc, BotoCoreError):
+        return True
+    return is_transient(exc)
+
+
+def _store_code(exc: BaseException) -> str:
+    if isinstance(exc, ClientError):
+        return str(exc.response.get("Error", {}).get("Code", "")) or "ClientError"
+    return type(exc).__name__
+
+
+async def _with_lock_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(SealSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix="lock"))
+    finally:
+        await redis.aclose()
+
+
+def _pending_lock_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_lock_pending(op))
+    except Exception as exc:
+        log.warning("lock pending key update failed: %s", type(exc).__name__)
+
+
+async def _lock_sealed(ledger_id: str, workspace_id: str) -> None:
+    settings = SealSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await lock_sealed(
+            UUID(ledger_id),
+            sessions=make_sessionmaker(engine),
+            store=S3ObjectStore(settings),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.lock_sealed", queue="seal", max_retries=LOCK_MAX_RETRIES)
+def lock_sealed_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A sealed original switched to COMPLIANCE at its committed retention (sijil_worker.lock)."""
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_lock_sealed(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_lock_transient(exc) and retries < LOCK_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=LOCK_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=LOCK_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_lock_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        _pending_lock_quietly(clear)
+        if is_lock_transient(exc):
+            raise  # retries ran out: the sweep sends it again later
+        # Permanent (e.g. AccessDenied): logged by its code only, never retried in a loop.
+        log.error("compliance lock of document %s refused: %s", ledger_id, _store_code(exc))
+        return
+    _pending_lock_quietly(clear)
+
+
+async def _requeue_unlocked() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ledger_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.lock_sealed",
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            queue="seal",
+        )
+
+    try:
+        return await requeue_unlocked(
+            make_sessionmaker(engine),
+            send,
+            region=settings.region,
+            pending=PendingExtractions(redis, prefix="lock"),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unlocked")
+def requeue_unlocked_task() -> int:
+    """Re-send the compliance lock for sealed rows still unlocked (a lost message, a store
+    that was down). Runs on the main worker: it only reads the ledger and sends tasks."""
+    return asyncio.run(_requeue_unlocked())

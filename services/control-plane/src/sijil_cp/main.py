@@ -54,8 +54,6 @@ def create_app(settings: CpSettings) -> FastAPI:
     app.state.enqueuer = CeleryEnqueuer(str(settings.redis_url))
     # The original store (object lock); tests swap in an in-memory double.
     app.state.store = S3ObjectStore(settings)
-    # The same bucket through the sealing key (retention only): the seal path alone uses it.
-    app.state.seal_store = S3ObjectStore(settings.seal_storage())
     register_error_handlers(app)
     app.add_middleware(CsrfMiddleware)
 

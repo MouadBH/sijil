@@ -8,7 +8,11 @@ ledger and the index row: the sealed record stays ours, Paperless holds a copy.
 The values go only to the workspace's own Paperless (its service token, on its tenant network),
 never anywhere else, and the audit event names no value (ruling P5). A document that is not
 sealed, or of another region, is left alone. Paperless being down raises for the task to retry;
-every step is idempotent, so a retry or a second run sets the same values again.
+every step is idempotent, so a retry or a second run sets the same values again. A workspace
+that is not active (hibernated, provisioning) raises WorkspaceNotActive, retried later.
+
+Index values that do not hash to the ledger's `fields_sha256` are never copied: the mirror
+logs `mirror.hash_mismatch` and raises a `fields_hash_mismatch` integrity alert.
 """
 
 import logging
@@ -31,10 +35,13 @@ from sijil_core.db.models import (
     Organisation,
     TenantCredential,
     Workspace,
+    WorkspaceState,
 )
+from sijil_core.fields import fields_digest
 from sijil_core.index import IndexEngines
 from sijil_core.paperless import PaperlessClient
 from sijil_core.region import RegionMismatch, assert_region
+from sijil_worker.drift import FIELDS_HASH_MISMATCH, record_finding
 from sijil_worker.extract import _service_token
 from sijil_worker.ingest import WorkspaceNotActive
 from sijil_worker.settings import ExtractionSettings
@@ -104,8 +111,8 @@ async def mirror_fields(
             return False
         if ledger.state is not DocumentState.sealed or ledger.paperless_doc_id is None:
             return False
-        if not workspace.paperless_url:
-            raise WorkspaceNotActive
+        if workspace.state is not WorkspaceState.active or not workspace.paperless_url:
+            raise WorkspaceNotActive  # transient: hibernated or provisioning, retried later
         credential = await session.scalar(
             select(TenantCredential).where(
                 TenantCredential.workspace_id == workspace.id,
@@ -115,10 +122,15 @@ async def mirror_fields(
         token = _service_token(credential, keys, workspace)
     async with (await index.engine(workspace)).connect() as conn:
         row = await index_db.read_fields(conn, ledger_id)
-    if row is None or row.sealed_at is None or row.fields_sha256 != ledger.fields_sha256:
-        # The ledger is sealed, so the index row is too; anything else is for the drift
-        # check, never mirrored.
-        log.warning("mirror of document %s skipped: the index row is not the sealed one", ledger_id)
+    if row is None or row.sealed_at is None:
+        log.warning("mirror of document %s skipped: its index row is not sealed", ledger_id)
+        return False
+    # The values are recomputed into the digest: only what the ledger sealed is ever copied.
+    if fields_digest(row.values) != ledger.fields_sha256:
+        log.error("mirror.hash_mismatch: document %s", ledger_id)
+        await record_finding(
+            sessions, workspace.id, ledger_id, FIELDS_HASH_MISMATCH, {"source": "mirror"}, now=now
+        )
         return False
     async with paperless(workspace.paperless_url, token=token) as client:
         ids = {

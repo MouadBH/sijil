@@ -3,19 +3,26 @@
 Field values live only in the workspace's index database (`sijil_core.index`); the ledger
 gets `fields_sha256` at seal, and the audit log names fields, never values (ruling P5).
 
-Sealing (ruling P7), in this order, each step idempotent so a seal that failed half-way
+Sealing (ruling P7, as amended by the product owner: the control plane holds no key that can
+switch an object lock), in this order, each step idempotent so a seal that failed half-way
 completes exactly once when it is called again:
-1. `fields_sha256` of the index row's values (`sijil_core.fields.fields_digest`);
-2. the original's object lock switched to COMPLIANCE until `final`, the later of the ledger's
-   retention and the fiscal year of the document's date (ruling P1; never lowered);
-3. the index row frozen with that hash (same hash again: its stored `sealed_at` is reused);
-4. the ledger row sealed and `document.sealed` audited, in one transaction;
-5. after the commit, `sijil.mirror_fields` sent to the worker.
+1. the ledger row locked FOR UPDATE (before the audit chain's lock, as everywhere) and refused
+   unless `filed` or `needs_review`;
+2. the index row frozen by `index.seal_fields`, which recomputes `fields_sha256` from the row
+   it locks and refuses (`seal.fields_changed`) a digest of values that changed since they
+   were read; the same hash again returns the stored row and its `sealed_at`;
+3. the ledger sealed (`state`, `fields_sha256`, `sealed_at`, `sealed_by`, `retention_until =
+   final`, the later of its retention and the fiscal year of `retention_basis`, never lowered:
+   ruling P1) and `document.sealed` audited, in one transaction;
+4. after the commit, `sijil.lock_sealed` to the seal worker (queue `seal`), which switches the
+   original to COMPLIANCE at the committed `retention_until`, and `sijil.mirror_fields`.
 
-The whole seal runs under the ledger row's lock (`SELECT ... FOR UPDATE`, taken before the
-audit chain's lock, as everywhere else), and so does a field edit: an edit and a seal of the
-same document never interleave, the hash is always of the values that get frozen, and the
-object store's read-then-write in `seal` is serialised per object version as it requires.
+Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
+provisional date: no key a running service holds can delete or shorten it, and the
+`requeue_unlocked` sweep and the drift check bound that window.
+
+A field edit holds the same ledger lock and commits its index write before releasing it, so a
+seal never hashes the values an edit is replacing.
 """
 
 import asyncio
@@ -33,7 +40,8 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select, tuple_
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from sijil_core import audit
 from sijil_core import index as index_db
@@ -46,9 +54,8 @@ from sijil_core.db.models import (
     Workspace,
 )
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, parse_field
-from sijil_core.index import FieldsRow, IndexEngines, RetentionLocked
-from sijil_core.retention import REGION_TZ, fiscal_retain_until, region_local_date
-from sijil_core.storage import ObjectRef, ObjectStore
+from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
+from sijil_core.retention import REGION_TZ, fiscal_retain_until, retention_basis
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
@@ -68,6 +75,9 @@ Sealing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents
 LOCKED: Final = "retention.locked"
 NOT_REVIEWABLE: Final = "document.not_reviewable"
 INCOMPLETE: Final = "seal.fields_incomplete"
+CHANGED: Final = "seal.fields_changed"
+INDEX_UNAVAILABLE: Final = "seal.index_unavailable"
+SEAL_FAILED: Final = "seal.failed"
 REVIEWABLE: Final = frozenset({DocumentState.filed, DocumentState.needs_review})
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
@@ -109,6 +119,8 @@ class SealBatchIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     month: str = Field(pattern=r"^\d{4}-(0[1-9]|1[0-2])$")
+    # `next_cursor` of the previous call: continue after the last document it attempted.
+    cursor: str | None = None
 
 
 class Skipped(BaseModel):
@@ -120,6 +132,7 @@ class SealBatchOut(BaseModel):
     sealed: int
     skipped: list[Skipped]
     remaining: int
+    next_cursor: str | None
 
 
 # Shapes --------------------------------------------------------------------------------------
@@ -171,7 +184,9 @@ def _cursor(row: DocumentLedger) -> str:
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+def _decode_cursor(
+    cursor: str, loc: tuple[str, str] = ("query", "cursor")
+) -> tuple[datetime, UUID]:
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
         at_text, id_text = raw.split("|")
@@ -181,8 +196,12 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
         return at, UUID(id_text)
     except (binascii.Error, ValueError, UnicodeDecodeError):
         raise RequestValidationError(
-            [{"loc": ("query", "cursor"), "msg": "invalid cursor", "type": "value_error"}]
+            [{"loc": loc, "msg": "invalid cursor", "type": "value_error"}]
         ) from None
+
+
+def _decode_batch_cursor(cursor: str) -> tuple[datetime, UUID]:
+    return _decode_cursor(cursor, ("body", "cursor"))
 
 
 async def _read(engines: IndexEngines, workspace: Workspace, ledger_id: UUID) -> FieldsRow | None:
@@ -312,7 +331,6 @@ async def edit_fields(
     _refuse_unless_reviewable(ledger)
     values = _parsed(body.fields)
     names = sorted(values)
-    # The index transaction commits only after the audit: an edit is never left unaudited.
     async with (await _engines(request).engine(workspace)).begin() as conn:
         try:
             row = await index_db.update_fields(
@@ -323,6 +341,7 @@ async def edit_fields(
             raise ApiError(LOCKED, 409) from None
         except LookupError:
             raise ApiError(NOT_REVIEWABLE, 409) from None
+        # Flushed (in the ledger lock's transaction), committed below.
         await audit.append(
             db,
             workspace_id=workspace.id,
@@ -335,7 +354,9 @@ async def edit_fields(
             data={"fields": ",".join(names)},
             now=now,
         )
-        await db.commit()
+    # The index edit is committed while the ledger lock is still held; only then does this
+    # commit release it, so a seal can never start on, and hash, the values being replaced.
+    await db.commit()
     return _full(ledger, row)
 
 
@@ -346,9 +367,8 @@ async def edit_fields(
 class _Sealer:
     """What one seal needs, so the single seal and the batch run the same code."""
 
-    engines: IndexEngines
-    store: ObjectStore
-    workspace: Workspace
+    engine: AsyncEngine
+    workspace_id: UUID
     country: str
     region: str
     user_id: UUID
@@ -361,55 +381,50 @@ def _missing(row: FieldsRow) -> list[str]:
 
 
 def _final_retention(ledger: DocumentLedger, row: FieldsRow, sealer: _Sealer) -> date:
-    """The later of the ledger's retention and the fiscal year of the document's date (the
-    arrival date without one). A COMPLIANCE lock can never be shortened, so a date after
-    today (a mistyped year) counts as today."""
-    today = region_local_date(sealer.now, sealer.region)
-    value = row.values.get("date")
-    dated = date.fromisoformat(value) if value else None
-    basis = min(dated, today) if dated else region_local_date(ledger.ingested_at, sealer.region)
+    """The later of the ledger's retention and the fiscal year of the shared basis (a plausible
+    document date, else the arrival date, never after today): a COMPLIANCE lock can never be
+    shortened, so an implausible year never locks an original for longer."""
+    basis = retention_basis(row.values.get("date"), ledger.ingested_at, sealer.region, sealer.now)
     return max(ledger.retention_until, fiscal_retain_until(basis, sealer.country))
 
 
 async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger) -> FieldsOut:
-    """Seals the locked ledger row (see the module docstring); the caller commits nothing:
-    this commits. Raises ApiError for a document that cannot be sealed."""
+    """Seals the ledger row the caller locked FOR UPDATE (see the module docstring) and
+    commits. Raises ApiError for a document that cannot be sealed; nothing is committed then."""
     _refuse_unless_reviewable(ledger)
-    engine = await sealer.engines.engine(sealer.workspace)
-    async with engine.connect() as conn:
+    async with sealer.engine.connect() as conn:
         row = await index_db.read_fields(conn, ledger.id)
     if row is None:
         raise ApiError(NOT_REVIEWABLE, 409)
     missing = _missing(row)
     if missing:
         raise ApiError(INCOMPLETE, 422, {"fields": missing})
-    # 1. The hash of exactly the values that get frozen: every writer of an unsealed row (an
-    #    edit, routing) holds this ledger row's lock, which we hold until the end.
-    digest = fields_digest(row.values, document_type=row.document_type)
+    digest = fields_digest(row.values)
     if row.sealed_at is not None and row.fields_sha256 != digest:
         raise ApiError(LOCKED, 409)
     final = _final_retention(ledger, row, sealer)
-    # 2. The object lock: COMPLIANCE, only ever later.
-    await sealer.store.seal(ObjectRef(ledger.object_key, ledger.object_version_id), final)
-    # 3. The index row frozen, in its own committed transaction. On a retry it is already
-    #    sealed with this hash: its stored `sealed_at` is the one the ledger gets.
+    # The index row frozen, in its own committed transaction. The digest is recomputed from the
+    # row it locks, so values that changed since the read above are refused, never sealed
+    # under a stale hash. On a retry it is already sealed with this hash: its stored
+    # `sealed_at` is the one the ledger gets.
     try:
-        async with engine.begin() as conn:
+        async with sealer.engine.begin() as conn:
             frozen = await index_db.seal_fields(
                 conn, ledger.id, fields_sha256=digest, sealed_at=sealer.now
             )
+    except FieldsChanged:
+        raise ApiError(CHANGED, 409) from None
     except RetentionLocked:
         raise ApiError(LOCKED, 409) from None
-    sealed_at = frozen.sealed_at or sealer.now
-    # 4. The ledger, under the lock taken by the caller, and the audit, in one transaction.
+    # The ledger, under the lock taken by the caller, and the audit, in one transaction.
     ledger.state = DocumentState.sealed
     ledger.fields_sha256 = digest
-    ledger.sealed_at = sealed_at
+    ledger.sealed_at = frozen.sealed_at or sealer.now
     ledger.sealed_by = sealer.user_id
     ledger.retention_until = final
     await audit.append(
         db,
-        workspace_id=sealer.workspace.id,
+        workspace_id=sealer.workspace_id,
         action="document.sealed",
         actor_type=ActorType.user,
         actor_id=str(sealer.user_id),
@@ -423,24 +438,33 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
     return _full(ledger, frozen)
 
 
-async def _mirror(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
-    """5. After the commit: Paperless's copy of the fields. The seal stands if this fails."""
-    try:
-        await asyncio.to_thread(get_enqueuer(request).send_mirror, ledger_id, workspace_id)
-    except Exception as exc:  # noqa: BLE001 - the broker being down must not undo a seal
-        log.warning("mirror enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+async def _after_commit(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
+    """The seal stands whatever happens here. A lost lock message is re-sent by the
+    `requeue_unlocked` sweep (and flagged by the drift check after an hour); a lost mirror
+    only delays Paperless's copy."""
+    enqueuer = get_enqueuer(request)
+    for name, send in (("lock", enqueuer.send_lock), ("mirror", enqueuer.send_mirror)):
+        try:
+            await asyncio.to_thread(send, ledger_id, workspace_id)
+        except Exception as exc:  # noqa: BLE001 - the broker being down must not undo a seal
+            log.warning("%s enqueue of document %s failed: %s", name, ledger_id, type(exc).__name__)
 
 
 async def _sealer(
     request: Request, db: AsyncSession, workspace: Workspace, user: User, now: datetime
 ) -> _Sealer:
+    """Workspace-level: an index database that cannot be reached fails the whole request."""
     org = await db.get(Organisation, workspace.org_id)
     if org is None:  # authorize already checked; keeps the type narrow
         raise ApiError("not_found", 404)
+    try:
+        engine = await _engines(request).engine(workspace)
+    except (LookupError, SQLAlchemyError, OSError) as exc:
+        log.warning("index of workspace %s unavailable: %s", workspace.id, type(exc).__name__)
+        raise ApiError(INDEX_UNAVAILABLE, 503) from None
     return _Sealer(
-        engines=_engines(request),
-        store=request.app.state.seal_store,
-        workspace=workspace,
+        engine=engine,
+        workspace_id=workspace.id,
         country=org.country,
         region=org.region,
         user_id=user.id,
@@ -456,7 +480,7 @@ async def seal_document(
     sealer = await _sealer(request, db, ctx.workspace, user, now)
     ledger = await _locked_ledger(db, ctx.workspace, doc_id)
     out = await _seal_locked(db, sealer, ledger)
-    await _mirror(request, ledger.id, ctx.workspace.id)
+    await _after_commit(request, ledger.id, sealer.workspace_id)
     return out
 
 
@@ -469,44 +493,78 @@ def _month_bounds(month: str, region: str) -> tuple[datetime, datetime]:
     return start, end
 
 
+def _batch_cursor(at: datetime, ledger_id: UUID) -> str:
+    raw = f"{at.isoformat()}|{ledger_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _failure_code(exc: Exception) -> str:
+    if isinstance(exc, ApiError):
+        return exc.code
+    if isinstance(exc, SQLAlchemyError | OSError):
+        return INDEX_UNAVAILABLE
+    return SEAL_FAILED
+
+
 @router.post("/workspaces/{workspace_id}/seal-batch", response_model=SealBatchOut)
 async def seal_batch(
     body: SealBatchIn, request: Request, ctx: Sealing, user: CurrentUser, db: Db, now: Now
 ) -> SealBatchOut:
     """Seals the month's `filed` documents (region-local arrival), oldest first, at most
     SEAL_BATCH_LIMIT per call, each in its own transaction through the single seal's code.
-    `remaining` counts the month's filed documents this call did not reach."""
+
+    A document that fails is rolled back and reported in `skipped` with its machine code; the
+    others go on. `next_cursor` (the last attempted document) lets the client continue past
+    documents that keep failing, and `remaining` counts the month's filed documents after it.
+    """
     workspace = ctx.workspace
     sealer = await _sealer(request, db, workspace, user, now)
     # Detached, so the rollback after a skipped document does not expire what it holds.
     db.expunge(workspace)
     start, end = _month_bounds(body.month, sealer.region)
-    in_month = (
+    in_month = [
         DocumentLedger.workspace_id == workspace.id,
         DocumentLedger.state == DocumentState.filed,
         DocumentLedger.ingested_at >= start,
         DocumentLedger.ingested_at < end,
-    )
-    total = int(await db.scalar(select(func.count()).where(*in_month)) or 0)
-    ids = list(
-        await db.scalars(
-            select(DocumentLedger.id)
-            .where(*in_month)
-            .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
-            .limit(SEAL_BATCH_LIMIT)
-        )
+    ]
+    if body.cursor is not None:
+        at, last_id = _decode_batch_cursor(body.cursor)
+        in_month.append(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (at, last_id))
+    rows = list(
+        (
+            await db.execute(
+                select(DocumentLedger.id, DocumentLedger.ingested_at)
+                .where(*in_month)
+                .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
+                .limit(SEAL_BATCH_LIMIT)
+            )
+        ).all()
     )
     await db.commit()
     sealed = 0
     skipped: list[Skipped] = []
-    for doc_id in ids:
+    for doc_id, _ in rows:
         try:
             ledger = await _locked_ledger(db, workspace, doc_id)
             await _seal_locked(db, sealer, ledger)
-        except ApiError as exc:
+        except Exception as exc:  # noqa: BLE001 - one document never aborts the batch
             await db.rollback()
-            skipped.append(Skipped(id=doc_id, code=exc.code))
+            code = _failure_code(exc)
+            if not isinstance(exc, ApiError):
+                log.warning("seal of document %s failed: %s", doc_id, type(exc).__name__)
+            skipped.append(Skipped(id=doc_id, code=code))
             continue
         sealed += 1
-        await _mirror(request, doc_id, workspace.id)
-    return SealBatchOut(sealed=sealed, skipped=skipped, remaining=max(0, total - len(ids)))
+        await _after_commit(request, doc_id, workspace.id)
+    remaining = 0
+    next_cursor: str | None = None
+    if rows:
+        last_id, last_at = rows[-1]
+        after = tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (last_at, last_id)
+        remaining = int(await db.scalar(select(func.count()).where(*in_month, after)) or 0)
+        if remaining:
+            next_cursor = _batch_cursor(last_at, last_id)
+    return SealBatchOut(
+        sealed=sealed, skipped=skipped, remaining=remaining, next_cursor=next_cursor
+    )

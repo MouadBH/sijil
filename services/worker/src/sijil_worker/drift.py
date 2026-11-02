@@ -5,6 +5,11 @@ the size the ledger recorded, and for every `consumed` one also that the origina
 tenant's Paperless-ngx and unchanged (Paperless 3.4.1 reports the SHA-256 of the original as
 `original_checksum`; it must equal the ledger's `sha256`).
 
+For a sealed row it also checks the compliance lock the seal worker applies: still unlocked an
+hour after the seal is `object_lock_pending`; recorded as locked but not COMPLIANCE, or retained
+for less than `retention_until`, is `object_lock_mismatch` (read with `GetObjectRetention`, which
+the services' app key holds).
+
 Every problem becomes an `IntegrityAlert` (never a second open one for the same document and
 kind) plus an `integrity.drift` audit event; the run ends with `integrity.check_ok` or
 `integrity.drift_summary`. Paperless being unreachable is transient: the error propagates so the
@@ -27,7 +32,7 @@ hashes only, never a filename or content.
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import select, text
@@ -39,6 +44,7 @@ from sijil_core.db.models import (
     ActorType,
     CredentialKind,
     DocumentLedger,
+    DocumentState,
     IngestState,
     IntegrityAlert,
     Organisation,
@@ -66,6 +72,11 @@ PAPERLESS_MODIFIED = "paperless_modified"
 OBJECT_MISSING = "object_missing"
 OBJECT_SIZE_MISMATCH = "object_size_mismatch"
 PAPERLESS_BAD_METADATA = "paperless_bad_metadata"
+OBJECT_LOCK_PENDING = "object_lock_pending"
+OBJECT_LOCK_MISMATCH = "object_lock_mismatch"
+FIELDS_HASH_MISMATCH = "fields_hash_mismatch"
+# The sweep re-sends a lock after 2 minutes; still unlocked after this is a finding.
+LOCK_PENDING_AFTER = timedelta(hours=1)
 # Workspace-level: the check could not run.
 ENGINE_FORBIDDEN = "engine_forbidden"
 ENGINE_CREDENTIAL_MISSING = "engine_credential_missing"
@@ -94,6 +105,9 @@ class _Doc:
     size_bytes: int
     ref: ObjectRef
     paperless_doc_id: int | None
+    sealed_at: datetime | None = None
+    object_locked_at: datetime | None = None
+    retention_until: date | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +167,10 @@ async def _page(
             DocumentLedger.object_version_id,
             DocumentLedger.paperless_doc_id,
             DocumentLedger.ingest_state,
+            DocumentLedger.state,
+            DocumentLedger.sealed_at,
+            DocumentLedger.object_locked_at,
+            DocumentLedger.retention_until,
         )
         .where(DocumentLedger.workspace_id == workspace_id)
         .order_by(DocumentLedger.id)
@@ -170,6 +188,9 @@ async def _page(
             ObjectRef(r.object_key, r.object_version_id),
             # Paperless is asked only about what it consumed; the object, about every row.
             r.paperless_doc_id if r.ingest_state == IngestState.consumed else None,
+            r.sealed_at if r.state == DocumentState.sealed else None,
+            r.object_locked_at,
+            r.retention_until,
         )
         for r in rows
     ]
@@ -187,7 +208,32 @@ async def _metadata(client: PaperlessClient, doc_id: int) -> dict[str, object] |
         raise _CheckFailed(ENGINE_BAD_RESPONSE) from None
 
 
-async def _check(doc: _Doc, client: PaperlessClient, store: ObjectStore) -> list[_Finding]:
+async def _check_lock(doc: _Doc, store: ObjectStore, now: datetime) -> list[_Finding]:
+    """The compliance lock of a sealed row (see the module docstring)."""
+    if doc.sealed_at is None:
+        return []
+    if doc.object_locked_at is None:
+        if doc.sealed_at < now - LOCK_PENDING_AFTER:
+            return [_Finding(doc.id, OBJECT_LOCK_PENDING, {"sealed_at": doc.sealed_at.isoformat()})]
+        return []
+    retention = await store.retention(doc.ref)
+    expected = doc.retention_until
+    if retention is None or expected is None:
+        return []  # a missing object is OBJECT_MISSING already
+    mode, until = retention
+    if mode != "COMPLIANCE" or until < expected:
+        detail: dict[str, int | str] = {
+            "mode": mode,
+            "retain_until": until.isoformat(),
+            "retention_until": expected.isoformat(),
+        }
+        return [_Finding(doc.id, OBJECT_LOCK_MISMATCH, detail)]
+    return []
+
+
+async def _check(
+    doc: _Doc, client: PaperlessClient, store: ObjectStore, now: datetime
+) -> list[_Finding]:
     found: list[_Finding] = []
     if doc.paperless_doc_id is not None:
         detail: dict[str, int | str] = {"paperless_doc_id": doc.paperless_doc_id}
@@ -215,6 +261,8 @@ async def _check(doc: _Doc, client: PaperlessClient, store: ObjectStore) -> list
                 {"expected_size": doc.size_bytes, "observed_size": size},
             )
         )
+    else:
+        found += await _check_lock(doc, store, now)
     return found
 
 
@@ -313,6 +361,20 @@ async def _record(
     return new
 
 
+async def record_finding(
+    sessions: async_sessionmaker[AsyncSession],
+    workspace_id: UUID,
+    ledger_id: UUID,
+    kind: str,
+    detail: dict[str, int | str],
+    *,
+    now: datetime,
+) -> bool:
+    """One document's finding found outside the nightly run (e.g. by the mirror): an alert
+    unless one is open for it and the kind, with `integrity.drift`. True when new."""
+    return bool(await _record(sessions, workspace_id, [_Finding(ledger_id, kind, detail)], now))
+
+
 async def _summarise(
     sessions: async_sessionmaker[AsyncSession],
     workspace_id: UUID,
@@ -364,7 +426,7 @@ async def drift_check(
             failed: str | None = None
             for doc in page:
                 try:
-                    findings += await _check(doc, client, store)
+                    findings += await _check(doc, client, store, now)
                 except _CheckFailed as exc:
                     failed = exc.code
                     break
