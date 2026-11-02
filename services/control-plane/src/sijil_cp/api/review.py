@@ -76,6 +76,7 @@ Reviewing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documen
 Sealing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_seal))]
 
 LOCKED: Final = "retention.locked"
+SEAL_UNFINISHED: Final = "seal.incomplete"
 NOT_REVIEWABLE: Final = "document.not_reviewable"
 INCOMPLETE: Final = "seal.fields_incomplete"
 CHANGED: Final = "seal.fields_changed"
@@ -102,6 +103,9 @@ class ReviewItem(BaseModel):
     fields: dict[str, FieldOut]
     flags: list[str]
     required: list[str]
+    # The index row is frozen but the ledger is not: a seal that failed half-way, which
+    # sealing again completes. Edits answer `seal.incomplete` meanwhile.
+    seal_incomplete: bool
 
 
 class FieldsOut(ReviewItem):
@@ -164,6 +168,7 @@ def _item(ledger: DocumentLedger, row: FieldsRow | None) -> ReviewItem:
         },
         flags=list(row.flags) if row else [],
         required=sorted(_required(document_type)),
+        seal_incomplete=row is not None and row.sealed_at is not None and ledger.sealed_at is None,
     )
 
 
@@ -343,8 +348,9 @@ async def edit_fields(
                 conn, ledger.id, values, source="user", updated_by=user.id, now=now
             )
         except RetentionLocked:
-            # The index row is frozen although the ledger is not yet: a seal half-way done.
-            raise ApiError(LOCKED, 409) from None
+            # The index row is frozen although the ledger is not yet: a seal half-way done,
+            # which sealing again completes.
+            raise ApiError(SEAL_UNFINISHED, 409) from None
         except LookupError:
             raise ApiError(NOT_REVIEWABLE, 409) from None
         await audit.append(

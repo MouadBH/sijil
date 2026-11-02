@@ -149,7 +149,10 @@ async def test_review_lists_needs_review_only(
     assert rest["next_cursor"] is None
 
     item = rest["items"][0]
-    assert set(item) == {"id", "state", "document_type", "fields", "flags", "required"}
+    assert set(item) == {
+        "id", "state", "document_type", "fields", "flags", "required", "seal_incomplete"
+    }  # fmt: skip
+    assert item["seal_incomplete"] is False
     assert item["state"] == "needs_review"
     assert item["document_type"] == "invoice"
     assert item["flags"] == ["low_confidence"]
@@ -291,12 +294,13 @@ async def test_patch_after_seal_409_retention_locked(
     assert await _events(db, ws, "document.fields_edited") == []
 
 
-async def test_patch_refused_by_the_index_trigger_is_409(
+async def test_patch_of_a_half_sealed_document_is_seal_incomplete(
     member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
     index_conn: AsyncConnection,
 ) -> None:  # fmt: skip
-    """The index row is frozen but the ledger not yet (a seal that failed half-way): the
-    trigger's refusal is answered as `retention.locked` too."""
+    """The index row is frozen but the ledger not yet (a seal that failed half-way): the edit
+    is refused with `seal.incomplete`, which tells the client to seal again, not that the
+    document is sealed."""
     row = await add_document(db, memory_store, index_conn, ws)
     await index.seal_fields(
         index_conn, row.id, fields_sha256=fields_digest(INVOICE), sealed_at=ARRIVAL
@@ -304,7 +308,30 @@ async def test_patch_refused_by_the_index_trigger_is_409(
     r = await member.client.patch(
         _url(ws, f"/documents/{row.id}/fields"), json={"fields": {"number": "F-2"}}
     )
-    assert (r.status_code, _code(r)) == (409, "retention.locked")
+    assert (r.status_code, _code(r)) == (409, "seal.incomplete")
+    assert await _events(db, ws, "document.fields_edited") == []
+
+
+async def test_half_sealed_document_is_flagged_until_sealed(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """A half-done seal is visible in the queue and on the document (`seal_incomplete`), and
+    sealing again completes it."""
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    other = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    await index.seal_fields(
+        index_conn, row.id, fields_sha256=fields_digest(INVOICE), sealed_at=ARRIVAL
+    )
+    page = (await member.client.get(_url(ws, "/review"))).json()
+    flagged = {item["id"]: item["seal_incomplete"] for item in page["items"]}
+    assert flagged == {str(row.id): True, str(other.id): False}
+    fields = (await member.client.get(_url(ws, f"/documents/{row.id}/fields"))).json()
+    assert fields["seal_incomplete"] is True
+
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert r.json()["seal_incomplete"] is False
 
 
 # Sealing -------------------------------------------------------------------------------------
