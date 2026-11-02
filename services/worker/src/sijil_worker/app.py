@@ -5,7 +5,7 @@ from celery.schedules import crontab
 from celery.signals import worker_ready
 from kombu import Queue
 
-from sijil_worker.settings import WorkerSettings
+from sijil_worker.settings import ExtractionSettings
 
 RECONCILE_INTERVAL_S = 300
 REQUEUE_INGEST_INTERVAL_S = 300
@@ -13,7 +13,7 @@ REQUEUE_EXTRACT_INTERVAL_S = 600
 QUEUES = ("default", "provisioning", "ingest", "extraction")
 
 
-def make_celery(settings: WorkerSettings) -> Celery:
+def make_celery(settings: ExtractionSettings) -> Celery:
     app = Celery("sijil", include=["sijil_worker.tasks"])
     app.conf.update(
         broker_url=str(settings.redis_url),

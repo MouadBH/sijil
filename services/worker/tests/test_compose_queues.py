@@ -37,6 +37,37 @@ def test_ollama_is_capped_and_fails_fast_when_busy() -> None:
     assert re.search(r'^      OLLAMA_MAX_QUEUE: "8"$', block, re.MULTILINE)
 
 
+def _anchor(name: str) -> str:
+    match = re.search(rf"^x-{name}: &{name}\n((?:  .*\n)+)", COMPOSE, re.MULTILINE)
+    assert match is not None, name
+    return match[1]
+
+
+def test_extraction_worker_env_is_least_privilege() -> None:
+    """No provisioner role, no Docker or tenant-provisioning settings; only what extraction and
+    routing use."""
+    env = _anchor("extraction-env")
+    for absent in (
+        "SIJIL_PROVISIONER_DATABASE_URL",
+        "SIJIL_TENANT_IMAGE",
+        "SIJIL_TESSDATA_VOLUME",
+        "SIJIL_TENANT_SUBNET_POOL",
+        "SIJIL_COMPOSE_PROJECT",
+        "OBJECTSTORE_ACCESS_KEY:",  # the root key
+    ):
+        assert absent not in env, absent
+    assert "<<: [*sijil-env, *objectstore-env]" in env  # region, environment, broker, app key
+    for present in (
+        "SIJIL_MASTER_KEY",
+        "SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:",
+        "SIJIL_OLLAMA_URL",
+        "SIJIL_AI_ALLOWED_HOSTS",
+        "SIJIL_EXTRACTION_MODEL",
+    ):
+        assert present in env, present
+    assert "SIJIL_PROVISIONER_DATABASE_URL" in _anchor("worker-env")
+
+
 def test_main_worker_does_not_consume_extraction() -> None:
     worker = _block("worker")
     assert _key(worker, "command") is None  # the Dockerfile CMD applies
@@ -52,7 +83,8 @@ def test_extraction_worker_consumes_only_extraction_one_at_a_time() -> None:
     command = json.loads(raw)
     assert _queues(command) == {"extraction"}
     assert command[command.index("--concurrency") + 1] == "1"
-    assert _key(block, "environment") == _key(_block("worker"), "environment") == "*worker-env"
+    assert _key(block, "environment") == "*extraction-env"
+    assert "sijil_worker.main_extraction" in command
     # The database, store and broker; Ollama; and the tenants' Paperless content.
     assert _key(block, "networks") == "[core, ai, tenant_t1, tenant_t2]"
     # It provisions nothing: no Docker socket.

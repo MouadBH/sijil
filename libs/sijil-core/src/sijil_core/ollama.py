@@ -75,6 +75,16 @@ def _load_failed(response: httpx.Response) -> bool:
     return isinstance(error, str) and any(m in error.lower() for m in _LOAD_FAILURE_MARKERS)
 
 
+def _model_missing(response: httpx.Response) -> bool:
+    """Ollama's 404 for an unpulled model: `{"error": "model '<name>' not found"}`."""
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    return isinstance(error, str) and "model" in error.lower() and "not found" in error.lower()
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -118,6 +128,9 @@ class OllamaClient:
             raise OllamaUnavailable(
                 f"ai.unavailable: HTTP {status}", status, model_load_failed=_load_failed(response)
             )
+        if status == 404 and _model_missing(response):
+            # Pulled late, or a wiped volume: wait for `make models` like for a down server.
+            raise OllamaUnavailable("ai.unavailable: model not found", status)
         if status >= 400:
             raise OllamaError(f"ai.error: HTTP {status}", status)
         return response

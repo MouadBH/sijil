@@ -89,6 +89,30 @@ async def test_connect_error_and_timeout_are_unavailable() -> None:
                 await ai.chat_json("m", "s", "u", SCHEMA, seed=1)
 
 
+async def test_missing_model_is_transient_other_4xx_final() -> None:
+    """A model pulled late (or a wiped volume) is waited for, not sent straight to review."""
+
+    def missing(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "model 'qwen3:4b' not found"})
+
+    async with client(missing) as ai:
+        with pytest.raises(OllamaUnavailable) as exc:
+            await ai.chat_json("qwen3:4b", "s", "u", SCHEMA, seed=1)
+    assert exc.value.status == 404
+
+    def other_404(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="404 page not found")
+
+    def bad_request(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "invalid format"})
+
+    for handler in (other_404, bad_request):
+        async with client(handler) as ai:
+            with pytest.raises(OllamaError) as final:
+                await ai.chat_json("m", "s", "u", SCHEMA, seed=1)
+        assert not isinstance(final.value, OllamaUnavailable)
+
+
 async def test_one_request_may_take_180_seconds() -> None:
     """One CPU-bound generation at a time (the extraction worker runs with concurrency 1)."""
     async with OllamaClient("http://ollama:11434", {"ollama"}) as ai:
@@ -108,13 +132,6 @@ async def test_model_load_failure_is_recognised() -> None:
     assert exc.value.model_load_failed
     # The message is a machine code and status only, never Ollama's text.
     assert "memory" not in str(exc.value)
-
-
-async def test_missing_model_is_a_final_error() -> None:
-    async with client(lambda _r: httpx.Response(404, json={"error": "model not found"})) as ai:
-        with pytest.raises(OllamaError) as exc:
-            await ai.chat_json("m", "s", "u", SCHEMA, seed=1)
-    assert not isinstance(exc.value, OllamaUnavailable | OllamaBadOutput)
 
 
 @pytest.mark.parametrize(

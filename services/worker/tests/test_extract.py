@@ -408,6 +408,40 @@ def test_settings_defaults_and_hosts_from_env(monkeypatch: pytest.MonkeyPatch) -
     assert WorkerSettings().ai_allowed_hosts == frozenset({"ollama", "ollama-2"})
 
 
+def test_extraction_worker_boots_without_provisioning_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The extraction worker gets no provisioner role or Docker settings; the main worker still
+    refuses to boot without them."""
+    from pydantic import ValidationError
+
+    from sijil_worker.settings import ExtractionSettings
+
+    for key in (
+        "SIJIL_PROVISIONER_DATABASE_URL",
+        "SIJIL_TENANT_IMAGE",
+        "SIJIL_COMPOSE_PROJECT",
+        "SIJIL_TESSDATA_VOLUME",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in {
+        "SIJIL_REGION": "ma-cas",
+        "SIJIL_ENVIRONMENT": "test",
+        "SIJIL_REDIS_URL": "redis://127.0.0.1:1/0",
+        "SIJIL_MASTER_KEY": "a" * 43 + "=",
+        "SIJIL_DATABASE_URL": "postgresql+asyncpg://x:y@h/z",
+    }.items():
+        monkeypatch.setenv(key, value)
+    s = ExtractionSettings()
+    assert (s.region, s.extraction_model) == ("ma-cas", "qwen3:4b")
+    assert not hasattr(s, "provisioner_database_url")
+    with pytest.raises(ValidationError):
+        WorkerSettings()
+    from sijil_worker import main_extraction
+
+    assert main_extraction.celery_app.conf.broker_url == "redis://127.0.0.1:1/0"
+
+
 # Taxonomy ---------------------------------------------------------------------------------
 
 

@@ -86,7 +86,7 @@ from sijil_core.storage import ObjectRef
 from sijil_core.text import normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
 from sijil_worker.pending import PendingExtractions
-from sijil_worker.settings import WorkerSettings
+from sijil_worker.settings import ExtractionSettings
 from sijil_worker.taxonomy import ensure_taxonomy
 
 log = logging.getLogger(__name__)
@@ -262,7 +262,7 @@ def _service_token(credential: TenantCredential | None, keys: KeyService, ws: Wo
 async def _load(
     sessions: async_sessionmaker[AsyncSession],
     keys: KeyService,
-    settings: WorkerSettings,
+    settings: ExtractionSettings,
     ledger_id: UUID,
     workspace_id: UUID | None,
 ) -> _Job | None:
@@ -625,7 +625,7 @@ async def extract_document(
     paperless: Callable[..., PaperlessClient],
     ollama: OllamaClient,
     store: RetentionStore,
-    settings: WorkerSettings,
+    settings: ExtractionSettings,
     now: datetime,
     workspace_id: UUID | None = None,
 ) -> None:
@@ -662,7 +662,7 @@ async def record_extraction_failed(
     sessions: async_sessionmaker[AsyncSession],
     index: IndexEngines,
     store: RetentionStore,
-    settings: WorkerSettings,
+    settings: ExtractionSettings,
     now: datetime,
     workspace_id: UUID | None = None,
 ) -> None:

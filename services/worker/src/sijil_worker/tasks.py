@@ -49,7 +49,7 @@ from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.runtime.docker import DockerRuntime
-from sijil_worker.settings import WorkerSettings
+from sijil_worker.settings import ExtractionSettings, WorkerSettings
 
 log = logging.getLogger(__name__)
 
@@ -174,7 +174,7 @@ async def _send_raw_extract(ledger_id: UUID, workspace_id: UUID) -> None:
 
 async def _with_pending(op: PendingOp) -> None:
     """Runs `op` on the broker Redis's set of extractions in flight."""
-    redis = Redis.from_url(str(WorkerSettings().redis_url))
+    redis = Redis.from_url(str(ExtractionSettings().redis_url))
     try:
         await op(PendingExtractions(redis))
     finally:
@@ -337,7 +337,8 @@ def extraction_error_code(exc: BaseException) -> str:
 
 
 async def _extract(ledger_id: str, workspace_id: str | None) -> None:
-    settings = WorkerSettings()
+    # Runs in the extraction worker, which has extraction settings only.
+    settings = ExtractionSettings()
     engine = make_engine(settings.database_url)
     keys = LocalKeyService(settings.master_key_bytes())
     sessions = make_sessionmaker(engine)
@@ -362,7 +363,7 @@ async def _extract(ledger_id: str, workspace_id: str | None) -> None:
 
 
 async def _extract_failed(ledger_id: str, workspace_id: str | None, code: str) -> None:
-    settings = WorkerSettings()
+    settings = ExtractionSettings()
     engine = make_engine(settings.database_url)
     sessions = make_sessionmaker(engine)
     engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
@@ -421,7 +422,7 @@ def extract_document_task(
 
 
 async def _requeue_extract() -> int:
-    settings = WorkerSettings()
+    settings = ExtractionSettings()
     engine = make_engine(settings.database_url)
     redis = Redis.from_url(str(settings.redis_url))
     try:

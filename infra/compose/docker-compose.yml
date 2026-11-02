@@ -63,6 +63,16 @@ x-worker-env: &worker-env
   SIJIL_AI_ALLOWED_HOSTS: ollama
   SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
 
+# The extraction worker's least privilege: extraction and routing only. No provisioner role and
+# no Docker or tenant-provisioning settings (`sijil_worker.settings.ExtractionSettings`).
+x-extraction-env: &extraction-env
+  <<: [*sijil-env, *objectstore-env]
+  SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
+  SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+  SIJIL_OLLAMA_URL: http://ollama:11434
+  SIJIL_AI_ALLOWED_HOSTS: ollama
+  SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
 services:
@@ -267,8 +277,8 @@ services:
       context: ../..
       dockerfile: services/worker/Dockerfile
     restart: unless-stopped
-    command: ["celery", "-A", "sijil_worker.main", "worker", "-Q", "extraction", "--concurrency", "1", "-n", "extraction@%h", "--loglevel", "INFO"]
-    environment: *worker-env
+    command: ["celery", "-A", "sijil_worker.main_extraction", "worker", "-Q", "extraction", "--concurrency", "1", "-n", "extraction@%h", "--loglevel", "INFO"]
+    environment: *extraction-env
     networks: [core, ai, tenant_t1, tenant_t2]
     depends_on:
       redis: { condition: service_started }
