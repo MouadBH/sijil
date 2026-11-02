@@ -45,10 +45,10 @@ AttachRunner = Callable[[str], AbstractContextManager[None]]
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 CONSUME_BUDGET_S = 600  # OCR shares the host with the model
-EXTRACT_BUDGET_S = 75 * 60  # 18 documents x 2 runs x ~60-130 s, one at a time
+EXTRACT_BUDGET_S = 45 * 60  # 18 documents x 2 runs, one at a time (measured: ~15 min)
 POLL_S = 15
 LOCK_BUDGET_S = 120
-MIRROR_BUDGET_S = 120
+MIRROR_BUDGET_S = 60  # the brief: within 60 s (measured: 4 s)
 REVIEW_THRESHOLD = 0.90
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
 MANIFEST_PATH = FIXTURES / "invoices" / "manifest.json"

@@ -27,7 +27,7 @@ test:
 itest:
 	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m "integration and not slow"
 
-# The slow acceptance (M3: 18 documents through the model, up to 75 min), its log printed (-s).
+# The slow acceptance (M3: 18 documents through the model, up to 45 min), its log printed (-s).
 acceptance:
 	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m "integration and slow" -s -v
 

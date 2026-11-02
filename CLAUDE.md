@@ -52,7 +52,7 @@ make seed       # 12 SAMPLE invoices (6 via the API, 6 by email) into the SAMPLE
                 # prints the workspace id, then waits until all are routed and prints filed/review counts
 make eval WS=…  # per-field extraction accuracy (fr, ar, all) on the SAMPLE set in workspace WS; read-only
 make itest      # integration tests in the compose `tests` runner, except `slow` (includes the M1/M2 acceptance)
-make acceptance # the `slow` integration tests: the M3 acceptance (18 documents through the model, up to 75 min)
+make acceptance # the `slow` integration tests: the M3 acceptance (18 documents through the model, up to 45 min)
 make down ARGS=-v
 ```
 
