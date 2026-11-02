@@ -426,7 +426,7 @@ async def _ensure_audited(
         await session.commit()
 
 
-async def _extract(
+async def _compute(
     job: _Job,
     *,
     index: IndexEngines,
@@ -434,8 +434,9 @@ async def _extract(
     ollama: OllamaClient,
     model: str,
     now: datetime,
-) -> FieldsRow:
-    """Reads the content, runs the model twice and writes the row; returns the stored row."""
+) -> tuple[FieldsRow, list[tuple[RunName, _Run]]]:
+    """Reads the content and runs the model twice; returns the row and the runs to record.
+    Writes nothing (the index is only read, for the known supplier): see `_write_once`."""
     if job.doc_id is None or job.paperless_url is None:
         raise ValueError("no Paperless document to extract")
     async with paperless(job.paperless_url, token=job.token) as client:
@@ -456,29 +457,46 @@ async def _extract(
         flags = (NO_TEXT,)
     elif values_a is None and values_b is None:
         flags = (EXTRACTION_FAILED, BAD_OUTPUT)
-    async with (await index.engine(job.workspace)).begin() as conn:
+    async with (await index.engine(job.workspace)).connect() as conn:
         ice = values["supplier_ice"]
         known = None if ice is None else await index_db.known_supplier(conn, ice)
-        signals = compute_signals(
-            values_a,
-            values_b,
-            content,
-            paperless_type=paperless_type,
-            known_supplier=known,
-            today=region_local_date(now, job.region),
-        )
-        row = FieldsRow(
-            ledger_id=job.ledger_id,
-            document_type=values["document_type"],
-            values=values,
-            confidence=scores(signals),
-            signals=signals,
-            flags=flags,
-            source=dict.fromkeys(FIELD_NAMES, "extraction"),
-            model=model,
-            extracted_at=now,
-            updated_at=now,
-        )
+    signals = compute_signals(
+        values_a,
+        values_b,
+        content,
+        paperless_type=paperless_type,
+        known_supplier=known,
+        today=region_local_date(now, job.region),
+    )
+    row = FieldsRow(
+        ledger_id=job.ledger_id,
+        document_type=values["document_type"],
+        values=values,
+        confidence=scores(signals),
+        signals=signals,
+        flags=flags,
+        source=dict.fromkeys(FIELD_NAMES, "extraction"),
+        model=model,
+        extracted_at=now,
+        updated_at=now,
+    )
+    return row, runs
+
+
+async def _extract(
+    job: _Job,
+    *,
+    index: IndexEngines,
+    paperless: Callable[..., PaperlessClient],
+    ollama: OllamaClient,
+    model: str,
+    now: datetime,
+) -> FieldsRow:
+    """Computes the row (`_compute`) and writes it; returns the stored row."""
+    row, runs = await _compute(
+        job, index=index, paperless=paperless, ollama=ollama, model=model, now=now
+    )
+    async with (await index.engine(job.workspace)).begin() as conn:
         return await _write_once(conn, row, runs)
 
 

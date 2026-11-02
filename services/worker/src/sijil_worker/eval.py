@@ -2,10 +2,11 @@
 
 For each manifest entry the ledger row is found by the SHA-256 of the fixture file within the
 workspace (the ledger holds it, unique per workspace), and its stored `document_fields` are
-compared with the manifest. A row without fields is extracted now with the same step
-`extract_document` uses (`_extract`: two model runs, the index row written) but is neither
-routed nor audited, and the ledger is not touched. Accuracy is reported, never gated: the exit
-code is 0 whatever it is, and 2 when the set or the workspace is not found.
+compared with the manifest. A row without fields is computed now with the same step
+`extract_document` uses (`_compute`: the two model runs, nothing written) and is marked
+"computed": the index, the audit log and the ledger are never written, and nothing is routed.
+Accuracy is reported, never gated: the exit code is 0 whatever it is, and 2 when the set or the
+workspace is not found (or the set is malformed).
 
 Only the table and the JSON are printed, never the content of a document.
 """
@@ -14,27 +15,35 @@ import argparse
 import asyncio
 import hashlib
 import json
+import logging
 import sys
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import index as index_db
-from sijil_core.crypto import LocalKeyService
+from sijil_core.crypto import KeyService, LocalKeyService
 from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
-from sijil_core.db.models import DocumentLedger, Organisation, Workspace
+from sijil_core.db.models import (
+    DocumentLedger,
+    DocumentState,
+    IngestState,
+    Organisation,
+    Workspace,
+)
 from sijil_core.index import IndexEngines
 from sijil_core.ollama import OllamaClient
 from sijil_core.paperless import PaperlessClient
 from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.text import normalise
-from sijil_worker.extract import _extract, _load
+from sijil_worker.extract import _compute, _load
 from sijil_worker.settings import ExtractionSettings
 
 EVAL_FIELDS: Final = (
@@ -47,24 +56,28 @@ EVAL_FIELDS: Final = (
     "total_ttc",
 )
 LANGS: Final = ("fr", "ar")
-SOURCES: Final = ("stored", "extracted_now", "missing")
+SOURCES: Final = ("stored", "computed", "missing")
+ENTRY_KEYS: Final = ("file", "lang", "supplier_ice", "number", "date", "ht", "tva", "ttc")
+log = logging.getLogger(__name__)
 # CLI output for developers, not a UI string: the i18n rule (CLAUDE.md rule 6) does not apply.
 TARGETS_LINE: Final = (
     "Targets (reported, not gated): fr ≥ 95%, ar ≥ 90% on supplier, date and total"
 )
 NOT_FOUND: Final = 2
 
-Tally = dict[str, dict[str, dict[str, int]]]
+Tally = dict[str, Any]  # {"fields": {...}, "documents": {...}, "missing": [...]}
 
 
 @dataclass(frozen=True)
 class EvalResult:
-    """One field of one document: whether the stored value equals the expected one."""
+    """One field of one document: whether the stored or computed value equals the expected."""
 
     lang: str
     field: str
     correct: bool
-    source: str  # "stored" | "extracted_now" | "missing"
+    source: str  # "stored" | "computed" | "missing"
+    doc: str = ""  # the fixture file
+    reason: str | None = None  # why a document is "missing"
 
 
 def _fold(s: str) -> str:
@@ -74,16 +87,15 @@ def _fold(s: str) -> str:
 def expected_values(
     entry: Mapping[str, Any], suppliers: Sequence[Mapping[str, Any]]
 ) -> dict[str, tuple[str, ...]]:
-    """The accepted canonical values per field. The supplier's name is accepted in either
-    language (the French or the Arabic one listed for its ICE), whatever the document's;
-    `total_ttc` is the printed one when the manifest has it (it is what the document shows)."""
-    names = [
-        n
-        for s in suppliers
-        if s.get("ice") == entry["supplier_ice"]
-        for n in (s.get("name"), s.get("name_ar"))
-        if n
-    ]
+    """The accepted canonical values per field. The supplier's name is the one listed for its
+    ICE in the document's language (`name` for fr, `name_ar` for ar); either is accepted only
+    when that language's name is absent. `total_ttc` is the printed one when the manifest has
+    it (it is what the document shows)."""
+    key = "name_ar" if entry["lang"] == "ar" else "name"
+    listed = [s for s in suppliers if s.get("ice") == entry["supplier_ice"]]
+    names = [n for s in listed if (n := s.get(key))]
+    if not names:
+        names = [n for s in listed for n in (s.get("name"), s.get("name_ar")) if n]
     return {
         "supplier_name": tuple(names),
         "supplier_ice": (entry["supplier_ice"],),
@@ -116,31 +128,42 @@ def score_entry(
 
 
 def tally(results: Sequence[EvalResult]) -> Tally:
-    """`{field: {lang: {"correct", "total"}}}`, in field order, for the languages seen."""
-    out: Tally = {}
+    """Per field and language `{"correct", "total"}`, the documents by source, and the missing
+    ones with their reason."""
+    fields: dict[str, dict[str, dict[str, int]]] = {}
     for field in EVAL_FIELDS:
         rows = [r for r in results if r.field == field]
-        if not rows:
-            continue
-        out[field] = {
-            lang: {
-                "correct": sum(1 for r in rows if r.lang == lang and r.correct),
-                "total": sum(1 for r in rows if r.lang == lang),
+        if rows:
+            fields[field] = {
+                lang: {
+                    "correct": sum(1 for r in rows if r.lang == lang and r.correct),
+                    "total": sum(1 for r in rows if r.lang == lang),
+                }
+                for lang in LANGS
             }
-            for lang in LANGS
-        }
-    return out
+    docs = {(r.doc, r.lang): r for r in results}  # one result stands for each document
+    counts = Counter(r.source for r in docs.values())
+    return {
+        "fields": fields,
+        "documents": {s: counts.get(s, 0) for s in SOURCES},
+        "missing": [
+            {"file": r.doc, "missing_reason": r.reason}
+            for r in docs.values()
+            if r.source == "missing"
+        ],
+    }
 
 
 def _cell(correct: int, total: int) -> str:
-    pct = 0 if total == 0 else correct * 100 // total  # integer, floor
+    pct = 0 if total == 0 else correct * 100 // total  # integer, floor; 0/0 reads 0%
     return f"{correct}/{total} ({pct}%)"
 
 
 def report(tallied: Tally, model: str) -> str:
-    """The table: a row per field, columns `fr`, `ar` and `all`, then the targets line."""
+    """The table (a row per field; columns `fr`, `ar`, `all`), the documents line, then the
+    targets line."""
     rows: list[tuple[str, ...]] = [("field", "fr", "ar", "all")]
-    for field, langs in tallied.items():
+    for field, langs in tallied["fields"].items():
         cells = [_cell(langs[lang]["correct"], langs[lang]["total"]) for lang in LANGS]
         total = sum(langs[lang]["total"] for lang in LANGS)
         correct = sum(langs[lang]["correct"] for lang in LANGS)
@@ -149,23 +172,32 @@ def report(tallied: Tally, model: str) -> str:
     lines = [f"Extraction accuracy (model: {model})"]
     for r in rows:
         lines.append("".join(r[i].ljust(widths[i]) for i in range(3)) + r[3])
+    d = tallied["documents"]
+    lines.append(
+        f"Documents: {d['stored']} stored, {d['computed']} computed, "
+        f"{d['missing']} missing (counted incorrect)"
+    )
     lines.append(TARGETS_LINE)
     return "\n".join(lines)
 
 
-def to_json(tallied: Tally, model: str, results: Sequence[EvalResult]) -> str:
-    # One count per document (not per field): each document yields one result per field.
-    per_doc = Counter(r.source for r in results if r.field == EVAL_FIELDS[0])
-    if not per_doc:
-        per_doc = Counter(r.source for r in results)
-    return json.dumps(
-        {
-            "fields": tallied,
-            "model": model,
-            "sources": {s: per_doc.get(s, 0) for s in SOURCES},
-        },
-        ensure_ascii=False,
-    )
+def to_json(tallied: Tally, model: str) -> str:
+    return json.dumps({**tallied, "model": model}, ensure_ascii=False)
+
+
+def validate_manifest(manifest: Any) -> str | None:
+    """A message when the set is malformed (or has a language other than fr or ar), else None."""
+    if not isinstance(manifest, list):
+        return "the set must be a list of entries"
+    for i, entry in enumerate(manifest):
+        if not isinstance(entry, dict):
+            return f"entry {i} is not an object"
+        missing = [k for k in ENTRY_KEYS if not isinstance(entry.get(k), str)]
+        if missing:
+            return f"entry {i} lacks {', '.join(missing)}"
+        if entry["lang"] not in LANGS:
+            return f"entry {i} has an unknown language"
+    return None
 
 
 async def _workspace_of(
@@ -189,7 +221,75 @@ async def _workspace_of(
     return cast(Workspace, workspace)
 
 
-async def _evaluate(
+async def evaluate(
+    *,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: KeyService,
+    settings: ExtractionSettings,
+    engines: IndexEngines,
+    ollama: OllamaClient,
+    paperless: Callable[..., PaperlessClient],
+    workspace: Workspace,
+    entries: Sequence[Mapping[str, Any]],
+    suppliers: Sequence[Mapping[str, Any]],
+    base: Path,
+) -> list[EvalResult]:
+    """Stored values where the index has them, else computed now (`_compute`). Reads only: the
+    index, the audit log and the ledger are never written, nothing is routed."""
+    results: list[EvalResult] = []
+    for entry in entries:
+        digest = hashlib.sha256((base / entry["file"]).read_bytes()).hexdigest()
+        values: Mapping[str, str | None] = {}
+        source, reason = "missing", None
+        async with sessions() as session:
+            ledger = (
+                await session.execute(
+                    select(
+                        DocumentLedger.id, DocumentLedger.state, DocumentLedger.ingest_state
+                    ).where(
+                        DocumentLedger.workspace_id == workspace.id,
+                        DocumentLedger.sha256 == digest,
+                    )
+                )
+            ).first()
+        if ledger is None:
+            reason = "not_in_ledger"
+        else:
+            async with (await engines.engine(workspace)).connect() as conn:
+                stored = await index_db.read_fields(conn, ledger.id)
+            if stored is not None:
+                values, source = stored.values, "stored"
+            elif ledger.state is not DocumentState.received:
+                reason = "not_received"
+            elif ledger.ingest_state is not IngestState.consumed:
+                reason = "not_consumed"
+            else:
+                try:
+                    job = await _load(sessions, keys, settings, ledger.id, workspace.id)
+                    if job is None:
+                        reason = "not_received"
+                    else:
+                        row, _ = await _compute(
+                            job,
+                            index=engines,
+                            paperless=paperless,
+                            ollama=ollama,
+                            model=settings.extraction_model,
+                            now=utcnow(),
+                        )
+                        values, source = row.values, "computed"
+                except Exception as exc:
+                    log.warning("%s: extraction failed (%s)", entry["file"], type(exc).__name__)
+                    reason = "extraction_failed"
+        scored = score_entry(entry, suppliers, values)
+        results.extend(
+            EvalResult(entry["lang"], f, ok, source, entry["file"], reason)
+            for f, ok in scored.items()
+        )
+    return results
+
+
+async def _run(
     settings: ExtractionSettings,
     workspace_id: UUID,
     entries: Sequence[Mapping[str, Any]],
@@ -200,49 +300,23 @@ async def _evaluate(
     keys = LocalKeyService(settings.master_key_bytes())
     sessions = make_sessionmaker(engine)
     engines = IndexEngines(settings, keys, sessions)
-    results: list[EvalResult] = []
     try:
         workspace = await _workspace_of(sessions, settings, workspace_id)
         if workspace is None:
             return None
         async with OllamaClient(settings.ollama_url, settings.ai_allowed_hosts) as ollama:
-            for entry in entries:
-                digest = hashlib.sha256((base / entry["file"]).read_bytes()).hexdigest()
-                async with sessions() as session:
-                    ledger_id = await session.scalar(
-                        select(DocumentLedger.id).where(
-                            DocumentLedger.workspace_id == workspace.id,
-                            DocumentLedger.sha256 == digest,
-                        )
-                    )
-                values: Mapping[str, str | None] = {}
-                source = "missing"
-                if ledger_id is not None:
-                    async with (await engines.engine(workspace)).connect() as conn:
-                        row = await index_db.read_fields(conn, ledger_id)
-                    if row is not None:
-                        values, source = row.values, "stored"
-                    else:
-                        try:
-                            job = await _load(sessions, keys, settings, ledger_id, workspace.id)
-                            if job is not None:
-                                fresh = await _extract(
-                                    job,
-                                    index=engines,
-                                    paperless=PaperlessClient,
-                                    ollama=ollama,
-                                    model=settings.extraction_model,
-                                    now=utcnow(),
-                                )
-                                values, source = fresh.values, "extracted_now"
-                        except Exception as exc:
-                            print(
-                                f"{entry['file']}: extraction failed ({type(exc).__name__})",
-                                file=sys.stderr,
-                            )
-                scored = score_entry(entry, suppliers, values)
-                results.extend(EvalResult(entry["lang"], f, ok, source) for f, ok in scored.items())
-        return results
+            return await evaluate(
+                sessions=sessions,
+                keys=keys,
+                settings=settings,
+                engines=engines,
+                ollama=ollama,
+                paperless=PaperlessClient,
+                workspace=workspace,
+                entries=entries,
+                suppliers=suppliers,
+                base=base,
+            )
     finally:
         await engines.aclose()
         await engine.dispose()
@@ -267,8 +341,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     manifest = _load_json(args.set)
     suppliers = _load_json(args.suppliers or args.set.parent.parent / "suppliers.json")
-    if not isinstance(manifest, list) or not isinstance(suppliers, list):
+    if manifest is None or not isinstance(suppliers, list):
         print("set not found", file=sys.stderr)
+        return NOT_FOUND
+    problem = validate_manifest(manifest)
+    if problem is not None:
+        print(f"malformed set: {problem}", file=sys.stderr)
         return NOT_FOUND
     if not all((args.set.parent / e["file"]).is_file() for e in manifest):
         print("set not found: a fixture file is missing", file=sys.stderr)
@@ -280,13 +358,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return NOT_FOUND
 
     settings = ExtractionSettings()
-    results = asyncio.run(_evaluate(settings, workspace_id, manifest, suppliers, args.set.parent))
+    results = asyncio.run(_run(settings, workspace_id, manifest, suppliers, args.set.parent))
     if results is None:
         print("workspace not found", file=sys.stderr)
         return NOT_FOUND
     tallied = tally(results)
     model = settings.extraction_model
-    print(to_json(tallied, model, results) if args.json else report(tallied, model))
+    print(to_json(tallied, model) if args.json else report(tallied, model))
     return 0
 
 

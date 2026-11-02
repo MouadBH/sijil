@@ -51,8 +51,9 @@ models:
 seed:
 	infra/scripts/seed.sh
 
-# Extraction accuracy on the SAMPLE invoices ingested in workspace WS (reported, not gated).
-# Runs in worker-extraction (index, Ollama and Paperless access); fixtures are mounted read-only.
+# Extraction accuracy on the SAMPLE invoices ingested in workspace WS (reported, not gated;
+# read-only: nothing is written to the archive). A one-off worker-extraction container (same
+# networks and settings) with the fixtures mounted read-only; no permanent mount.
 eval:
 	$(if $(WS),,$(error usage: make eval WS=<workspace id>))
-	$(COMPOSE) exec worker-extraction sijil-eval extraction --set /src/fixtures/invoices/manifest.json --workspace $(WS) $(ARGS)
+	$(COMPOSE) run --rm --no-deps -T -v "$(CURDIR)/fixtures:/src/fixtures:ro" --entrypoint sijil-eval worker-extraction extraction --set /src/fixtures/invoices/manifest.json --workspace $(WS) $(ARGS)

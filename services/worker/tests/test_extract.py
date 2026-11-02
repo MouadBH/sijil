@@ -191,8 +191,9 @@ async def make_ledger(
     age: timedelta = timedelta(0),
     ingested_at: datetime | None = None,
     retention_until: date = PROVISIONAL,
+    sha: str | None = None,
 ) -> DocumentLedger:
-    sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
+    sha = sha or hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     row = DocumentLedger(
         workspace_id=workspace.id,
         sha256=sha,
@@ -1564,3 +1565,57 @@ async def test_requeue_unextracted_survives_a_failed_enqueue(
 
     assert await requeue_unextracted(sessions, flaky, region="ma-cas", now=NOW) == 1
     assert len(calls) == 2
+
+
+async def test_eval_computes_without_writing_anything(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    from sijil_worker import eval as ev
+
+    pdf = tmp_path / "f.pdf"
+    pdf.write_bytes(b"SAMPLE bytes")
+    ledger = await make_ledger(db, ready, sha=hashlib.sha256(pdf.read_bytes()).hexdigest())
+    absent = {**SAMPLE_01, "file": "absent.pdf"}
+    (tmp_path / "absent.pdf").write_bytes(b"not archived")
+
+    async def counts() -> tuple[Any, ...]:
+        async with (await engines.engine(ready)).connect() as conn:
+            n = [
+                (await conn.execute(text(q))).scalar_one()
+                for q in (
+                    "SELECT count(*) FROM document_fields",
+                    "SELECT count(*) FROM extraction_run",
+                )
+            ]
+        return (*n, await actions(db, ready), (await reload(db, ledger)).state)
+
+    before = await counts()
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        async with ollama.client() as client:
+            results = await ev.evaluate(
+                sessions=sessions,
+                keys=keys,
+                settings=SETTINGS,
+                engines=engines,
+                ollama=client,
+                paperless=paperless,
+                workspace=ready,
+                entries=[{**SAMPLE_01, "file": "f.pdf"}, absent],
+                suppliers=list(SUPPLIERS.values()),
+                base=tmp_path,
+            )
+        assert not _patches(router)
+    assert await counts() == before
+    assert {(r.doc, r.source) for r in results} == {
+        ("f.pdf", "computed"),
+        ("absent.pdf", "missing"),
+    }
+    assert {r.reason for r in results if r.doc == "absent.pdf"} == {"not_in_ledger"}
+    assert all(r.correct for r in results if r.doc == "f.pdf")

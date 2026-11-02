@@ -293,9 +293,6 @@ services:
     restart: unless-stopped
     command: ["celery", "-A", "sijil_worker.main_extraction", "worker", "-Q", "extraction", "--concurrency", "1", "-n", "extraction@%h", "--loglevel", "INFO"]
     environment: *extraction-env
-    # SAMPLE fixtures only, read-only, for `make eval` (sijil-eval hashes them to find the rows).
-    volumes:
-      - ../../fixtures:/src/fixtures:ro
     networks: [core, ai, tenant_t1, tenant_t2]
     depends_on:
       redis: { condition: service_started }
