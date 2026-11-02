@@ -85,6 +85,7 @@ from sijil_core.retention import fiscal_retain_until, region_local_date
 from sijil_core.storage import ObjectRef
 from sijil_core.text import normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
+from sijil_worker.pending import PendingExtractions
 from sijil_worker.settings import WorkerSettings
 from sijil_worker.taxonomy import ensure_taxonomy
 
@@ -100,7 +101,8 @@ POSSIBLE_DUPLICATE: Final = "possible_duplicate"
 RETENTION_EXTEND_FAILED: Final = "retention.extend_failed"
 _RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
 REQUEUE_AFTER: Final = timedelta(minutes=15)
-REQUEUE_BATCH: Final = 500
+REQUEUE_BATCH: Final = 50  # sends per sweep run
+REQUEUE_SCAN: Final = 500  # rows looked at per sweep run (in-flight ones are skipped)
 # Serialises the write of one document's row across concurrent runs (index database).
 _WRITE_LOCK_SQL: Final = "SELECT pg_advisory_xact_lock(hashtextextended(CAST(:id AS text), 7))"
 
@@ -718,11 +720,17 @@ async def requeue_unextracted(
     now: datetime | None = None,
     older_than: timedelta = REQUEUE_AFTER,
     limit: int = REQUEUE_BATCH,
+    pending: PendingExtractions | None = None,
+    scan: int = REQUEUE_SCAN,
 ) -> int:
     """Send `extract_document` again for this region's rows still `received` and `consumed` or
     `unsupported` that arrived over `older_than` ago (a lost message, a failed enqueue, or a
-    run that failed before routing). Safe to repeat: an extracted document is not extracted
-    again, and a routed one is no longer `received`. Returns how many were sent.
+    run that failed before routing), oldest first. Safe to repeat: an extracted document is
+    not extracted again, and a routed one is no longer `received`.
+
+    With `pending`, a document whose extraction is still in flight is skipped, and at most
+    `limit` are sent (one model at a time cannot take more in one period); skipped rows do not
+    count. Returns how many were sent.
     """
     cutoff = (now or utcnow()) - older_than
     async with sessions() as session:
@@ -741,14 +749,19 @@ async def requeue_unextracted(
                         DocumentLedger.ingested_at < cutoff,
                     )
                 )
-                .order_by(DocumentLedger.ingested_at)
-                .limit(limit)
+                .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
+                .limit(scan if pending is not None else limit)
             )
         ).all()
     sent = 0
     for ledger_id, ws_id in rows:
+        if sent >= limit:
+            break
         try:
-            await enqueue(ledger_id, ws_id)
+            if pending is None:
+                await enqueue(ledger_id, ws_id)
+            elif not await pending.send(enqueue, ledger_id, ws_id):
+                continue  # in flight
         except Exception:
             log.exception("requeue of extraction for document %s failed", ledger_id)
             continue

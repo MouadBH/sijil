@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import random
 from collections.abc import Callable
 from typing import Any
@@ -10,6 +11,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from celery import Task, current_app, shared_task
 from celery.utils.time import get_exponential_backoff_interval
 from docker.errors import APIError
+from redis.asyncio import Redis
 from sqlalchemy.exc import OperationalError
 
 from sijil_core.crypto import LocalKeyService
@@ -43,10 +45,13 @@ from sijil_worker.ingest import (
     is_transient_cause,
     requeue_stuck_ingest,
 )
+from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
+
+log = logging.getLogger(__name__)
 
 PROVISION_MAX_RETRIES = 3
 RETRY_BACKOFF_MAX_S = 600
@@ -158,13 +163,39 @@ def reconcile_tenants_task() -> list[str]:
 EXTRACT_TASK = ("sijil.extract_document", "extraction")
 
 
-async def _send_extract(ledger_id: UUID, workspace_id: UUID) -> None:
+async def _send_raw_extract(ledger_id: UUID, workspace_id: UUID) -> None:
     name, queue = EXTRACT_TASK
     current_app.send_task(
         name,
         kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
         queue=queue,
     )
+
+
+async def _with_pending(op: PendingOp) -> None:
+    """Runs `op` on the broker Redis's set of extractions in flight."""
+    redis = Redis.from_url(str(WorkerSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis))
+    finally:
+        await redis.aclose()
+
+
+def _pending_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_pending(op))
+    except Exception as exc:
+        log.warning("extraction pending key update failed: %s", type(exc).__name__)
+
+
+async def _send_extract(ledger_id: UUID, workspace_id: UUID) -> None:
+    """Sends the extraction unless one is already in flight for the document."""
+
+    async def op(pending: PendingExtractions) -> None:
+        await pending.send(_send_raw_extract, ledger_id, workspace_id)
+
+    await _with_pending(op)
 
 
 async def _ingest(
@@ -250,6 +281,8 @@ def requeue_stuck_ingest_task() -> int:
 # span at least ~30 min. After that the document is flagged `extraction_failed` (audited) so that
 # it goes to review instead of waiting for ever.
 EXTRACT_MAX_RETRIES = 8
+# A retry's pending key lives for its countdown plus this, so it outlasts the wait.
+PENDING_MARGIN_S = 900
 EXTRACT_BACKOFF_FACTOR_S = 30
 EXTRACT_BACKOFF_MAX_S = 900
 
@@ -360,25 +393,46 @@ def extract_document_task(
 ) -> None:
     """Fields of one consumed document by the in-region model (see sijil_worker.extract)."""
     retries = int(self.request.retries or 0)
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
     try:
         asyncio.run(_extract(ledger_id, workspace_id))
     except Exception as exc:
         if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
-            raise self.retry(exc=exc, countdown=extract_countdown(retries)) from exc
+            countdown = extract_countdown(retries)
+
+            # The retry is still this document's message in flight: keep (and stretch) the key.
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
         # Retries ran out, or a final error: the document must reach review, never wait for
         # ever in `received`.
-        asyncio.run(_extract_failed(ledger_id, workspace_id, extraction_error_code(exc)))
+        try:
+            asyncio.run(_extract_failed(ledger_id, workspace_id, extraction_error_code(exc)))
+        finally:
+            _pending_quietly(clear)
         raise
+    _pending_quietly(clear)  # routed, or nothing to do
 
 
 async def _requeue_extract() -> int:
     settings = WorkerSettings()
     engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
     try:
         return await requeue_unextracted(
-            make_sessionmaker(engine), _send_extract, region=settings.region
+            make_sessionmaker(engine),
+            _send_raw_extract,
+            region=settings.region,
+            pending=PendingExtractions(redis),
         )
     finally:
+        await redis.aclose()
         await engine.dispose()
 
 

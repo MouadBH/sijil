@@ -28,6 +28,15 @@ def _queues(command: list[str]) -> set[str]:
     return set(command[command.index("-Q") + 1].split(","))
 
 
+def test_ollama_is_capped_and_fails_fast_when_busy() -> None:
+    """Half the CPUs at most (tenants' OCR keeps headroom), one generation at a time, and a
+    short queue: excess requests get 503 (transient) instead of piling up."""
+    block = _block("ollama")
+    assert _key(block, "cpus") == '"4"'
+    assert re.search(r'^      OLLAMA_NUM_PARALLEL: "1"$', block, re.MULTILINE)
+    assert re.search(r'^      OLLAMA_MAX_QUEUE: "8"$', block, re.MULTILINE)
+
+
 def test_main_worker_does_not_consume_extraction() -> None:
     worker = _block("worker")
     assert _key(worker, "command") is None  # the Dockerfile CMD applies
