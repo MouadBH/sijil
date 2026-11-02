@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import arabic_reshaper
+import pypdfium2 as pdfium
 from bidi.algorithm import get_display
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
@@ -148,11 +149,30 @@ def render(inv: dict[str, Any], supplier: dict[str, Any]) -> None:
     c.save()
 
 
+# The OCR path: a raster "scan" of an Arabic invoice, with no text layer at all.
+SCANS = {"scan-02-ar.png": "sample-02-ar.pdf"}
+SCAN_DPI = 200
+
+
+def render_scan(name: str, source: str) -> None:
+    """Page 1 of `source`, rasterised at SCAN_DPI in greyscale."""
+    pdf = pdfium.PdfDocument(str(ROOT / "invoices" / source))
+    try:
+        page = pdf[0]
+        image = page.render(scale=SCAN_DPI / 72, grayscale=True).to_pil()
+        image.save(ROOT / "invoices" / name, format="PNG", dpi=(SCAN_DPI, SCAN_DPI))
+    finally:
+        pdf.close()
+
+
 def main() -> None:
     suppliers = {s["ice"]: s for s in json.loads((ROOT / "suppliers.json").read_text())}
     for inv in json.loads((ROOT / "invoices" / "manifest.json").read_text()):
         render(inv, suppliers[inv["supplier_ice"]])
         print(f"wrote invoices/{inv['file']}")
+    for name, source in SCANS.items():
+        render_scan(name, source)
+        print(f"wrote invoices/{name}")
 
 
 if __name__ == "__main__":

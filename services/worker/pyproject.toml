@@ -23,3 +23,4 @@ packages = ["src/sijil_worker"]
 
 [project.scripts]
 sijil-smtp = "sijil_worker.smtp:main"
+sijil-eval = "sijil_worker.eval:main"

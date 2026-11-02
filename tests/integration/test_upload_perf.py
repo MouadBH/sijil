@@ -106,8 +106,11 @@ async def _remove_originals(workspace_id: uuid.UUID) -> None:
         await store.governance_remove(ref)
 
 
-async def test_upload_p95_under_2s(http: httpx.AsyncClient) -> None:
+async def test_upload_p95_under_2s(
+    http: httpx.AsyncClient, created_workspaces: list[uuid.UUID]
+) -> None:
     workspace_id = await _member_workspace(http)
+    created_workspaces.append(workspace_id)
     durations: list[float] = []
     try:
         for _ in range(UPLOADS):

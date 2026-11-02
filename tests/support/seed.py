@@ -5,9 +5,14 @@ service name). Idempotent: it signs in as the fixed SAMPLE user (signing up only
 so the signup rate limit and the three-organisation cap are never touched again), reuses the
 SAMPLE organisation, and skips what is already archived. Prints the workspace id.
 
-    python -m tests.support.seed
+    python -m tests.support.seed [--wait-routed SECONDS]
+
+With `--wait-routed`, it then waits (printing progress) until no seeded document is still
+`received`, i.e. every one was extracted and routed, and prints how many were filed and how
+many wait in review. Exit 1 when that takes longer than SECONDS.
 """
 
+import argparse
 import asyncio
 import hashlib
 import os
@@ -26,6 +31,7 @@ from sqlalchemy import select
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.db.models import (
     DocumentLedger,
+    DocumentState,
     IngestState,
     Membership,
     Organisation,
@@ -202,14 +208,68 @@ async def seed(
         await engine.dispose()
 
 
+ROUTED_POLL_S = 15
+
+
+async def wait_routed(workspace_id: UUID, budget_s: float) -> dict[DocumentState, int] | None:
+    """Waits until no document of the workspace is `received` (extracted and routed), printing
+    progress; the count per state, or None after `budget_s`."""
+    engine = make_engine(os.environ["SIJIL_DATABASE_URL"])
+    sessions = make_sessionmaker(engine)
+    started = time.monotonic()
+    last = -1
+    try:
+        while True:
+            async with sessions() as db:
+                states = list(
+                    await db.scalars(
+                        select(DocumentLedger.state).where(
+                            DocumentLedger.workspace_id == workspace_id,
+                            # Only rows that can be routed: a failed ingest stays received.
+                            DocumentLedger.ingest_state.in_(
+                                (IngestState.consumed, IngestState.unsupported)
+                            ),
+                        )
+                    )
+                )
+            waiting = states.count(DocumentState.received)
+            if waiting != last:
+                print(  # noqa: T201
+                    f"routed {len(states) - waiting}/{len(states)} "
+                    f"after {time.monotonic() - started:.0f} s",
+                    flush=True,
+                )
+                last = waiting
+            if not waiting:
+                return {state: states.count(state) for state in DocumentState}
+            if time.monotonic() - started > budget_s:
+                return None
+            await asyncio.sleep(ROUTED_POLL_S)
+    finally:
+        await engine.dispose()
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(prog="python -m tests.support.seed")
+    parser.add_argument("--wait-routed", type=float, metavar="SECONDS")
+    args = parser.parse_args()
     started = time.monotonic()
     result = asyncio.run(seed())
     print(  # noqa: T201
         f"uploaded={result.uploaded} emailed={result.emailed} "
         f"already_present={result.already_present} in {time.monotonic() - started:.0f} s\n"
         f"user: {result.email}\ninbound address: {result.inbound_email}\n"
-        f"workspace id: {result.workspace_id}"
+        f"workspace id: {result.workspace_id}",
+        flush=True,
+    )
+    if args.wait_routed is None:
+        return
+    counts = asyncio.run(wait_routed(result.workspace_id, args.wait_routed))
+    if counts is None:
+        raise SystemExit(f"documents still received after {args.wait_routed:.0f} s")
+    print(  # noqa: T201
+        f"filed={counts[DocumentState.filed]} review={counts[DocumentState.needs_review]} "
+        f"sealed={counts[DocumentState.sealed]}"
     )
 
 

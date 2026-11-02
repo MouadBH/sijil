@@ -5,9 +5,10 @@ from fastapi import APIRouter, FastAPI
 from redis.asyncio import Redis
 
 from sijil_core.crypto import LocalKeyService
+from sijil_core.index import IndexEngines
 from sijil_core.storage import S3ObjectStore
 from sijil_cp import __version__
-from sijil_cp.api import auth, documents, health, jobs, members, orgs, workspaces
+from sijil_cp.api import auth, documents, health, jobs, members, orgs, review, workspaces
 from sijil_cp.auth import csrf
 from sijil_cp.auth.csrf import CsrfMiddleware
 from sijil_cp.db import make_engine, make_sessionmaker
@@ -19,12 +20,20 @@ from sijil_cp.settings import CpSettings
 def create_app(settings: CpSettings) -> FastAPI:
     engine = make_engine(settings)
     redis = Redis.from_url(str(settings.redis_url))
+    sessionmaker = make_sessionmaker(engine)
+    keys = LocalKeyService(settings.master_key_bytes())
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        await redis.aclose()
-        await engine.dispose()
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            try:
+                index: IndexEngines = app.state.index
+                await index.aclose()
+            finally:
+                await redis.aclose()
+                await engine.dispose()
 
     app = FastAPI(
         title="Sijil control plane",
@@ -36,9 +45,11 @@ def create_app(settings: CpSettings) -> FastAPI:
     )
     app.state.settings = settings
     app.state.engine = engine
-    app.state.sessionmaker = make_sessionmaker(engine)
+    app.state.sessionmaker = sessionmaker
     app.state.redis = redis
-    app.state.keys = LocalKeyService(settings.master_key_bytes())
+    app.state.keys = keys
+    # Engines to the workspaces' index databases (field values); built per workspace on use.
+    app.state.index = IndexEngines(settings, keys, sessionmaker)
     # Tests replace this with a recording stand-in; production sends tasks to the worker.
     app.state.enqueuer = CeleryEnqueuer(str(settings.redis_url))
     # The original store (object lock); tests swap in an in-memory double.
@@ -55,6 +66,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(members.router)
     v1.include_router(jobs.router)
     v1.include_router(documents.router)
+    v1.include_router(review.router)
     app.include_router(v1)
     return app
 

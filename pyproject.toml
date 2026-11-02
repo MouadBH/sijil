@@ -25,6 +25,7 @@ dev = [
   "arabic-reshaper>=3.0",
   "python-bidi>=0.6",
   "pypdf>=5.1",
+  "pypdfium2>=4.30",
 ]
 
 [tool.ruff]
@@ -49,7 +50,7 @@ python_version = "3.13"
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["reportlab.*", "arabic_reshaper", "bidi.*", "asyncpg", "asyncpg.*"]
+module = ["reportlab.*", "arabic_reshaper", "bidi.*", "asyncpg", "asyncpg.*", "pypdfium2", "pypdfium2.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -61,4 +62,5 @@ pythonpath = ["."]
 markers = [
   "db: needs Postgres (set SIJIL_TEST_DATABASE_URL)",
   "integration: needs the compose stack; run with `make itest`",
+  "slow: long-running (the model, one document at a time); `make acceptance`, not `make itest`",
 ]

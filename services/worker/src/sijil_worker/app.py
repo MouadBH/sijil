@@ -5,14 +5,16 @@ from celery.schedules import crontab
 from celery.signals import worker_ready
 from kombu import Queue
 
-from sijil_worker.settings import WorkerSettings
+from sijil_worker.settings import BrokerSettings
 
 RECONCILE_INTERVAL_S = 300
 REQUEUE_INGEST_INTERVAL_S = 300
-QUEUES = ("default", "provisioning", "ingest", "extraction")
+REQUEUE_EXTRACT_INTERVAL_S = 600
+REQUEUE_UNLOCKED_INTERVAL_S = 300
+QUEUES = ("default", "provisioning", "ingest", "extraction", "seal")
 
 
-def make_celery(settings: WorkerSettings) -> Celery:
+def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -> Celery:
     app = Celery("sijil", include=["sijil_worker.tasks"])
     app.conf.update(
         broker_url=str(settings.redis_url),
@@ -34,6 +36,14 @@ def make_celery(settings: WorkerSettings) -> Celery:
                 "task": "sijil.requeue_stuck_ingest",
                 "schedule": REQUEUE_INGEST_INTERVAL_S,
             },
+            "requeue-unextracted": {
+                "task": "sijil.requeue_unextracted",
+                "schedule": REQUEUE_EXTRACT_INTERVAL_S,
+            },
+            "requeue-unlocked": {
+                "task": "sijil.requeue_unlocked",
+                "schedule": REQUEUE_UNLOCKED_INTERVAL_S,
+            },
             "drift-check-nightly": {
                 "task": "sijil.drift_check_all",
                 "schedule": crontab(hour=2, minute=30),
@@ -41,8 +51,11 @@ def make_celery(settings: WorkerSettings) -> Celery:
         },
     )
 
-    @worker_ready.connect(weak=False)
-    def _reconcile_on_start(**_: Any) -> None:
-        app.send_task("sijil.reconcile_tenants")
+    if reconcile_on_start:
+        # The main worker only (it has the Docker socket): the extraction and seal workers
+        # never ask for a reconcile.
+        @worker_ready.connect(weak=False)
+        def _reconcile_on_start(**_: Any) -> None:
+            app.send_task("sijil.reconcile_tenants")
 
     return app

@@ -129,7 +129,6 @@ Minor findings from the M2 per-task reviews and the final review, deferred by th
 - Seed: `KeyError` when `SIJIL_DATABASE_URL` is unset, unguarded `SIJIL_IT_CP_URL` override, a wrong password's 401 falls through to signup, no pytest timeout, the engine is not disposed on failure.
 
 ### From the M2 fix-wave re-review
-- **Paperless HTTP 500 is final.** Ingest treats a 500 as non-transient (`ingest.paperless_error`) → `failed`, and re-upload is refused 409; a tenant whose own DB is down answers 500. Treat 500 as transient (bounded by the 24 h delay cap) — do this early in M3.
 - `delay_after` assumes one attempt per Celery retry; sweep restarts can advance the doubling by one cycle (bounded, cosmetic).
 - `bootstrap-storage` does not retry admin-API 503s while RustFS starts (`migrate` fails once; re-run works).
 - `ensure_app_user` closes a caller-supplied httpx client.

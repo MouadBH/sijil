@@ -1,14 +1,55 @@
 from ipaddress import IPv4Network
+from typing import Annotated, Any
 
-from pydantic import RedisDsn
+from pydantic import RedisDsn, field_validator
+from pydantic_settings import NoDecode
 
 from sijil_core.crypto import KeySettings
+from sijil_core.settings import CoreSettings
+from sijil_core.storage import StorageSettings
 
 
-class WorkerSettings(KeySettings):
+class BrokerSettings(CoreSettings):
+    """What every Celery worker needs: its region and the broker."""
+
     redis_url: RedisDsn
+
+
+class SealSettings(StorageSettings, BrokerSettings):
+    """The seal worker (`-Q seal`): the control-plane database as the app role, the broker, and
+    the object store through the sealing key (SIJIL_OBJECTSTORE_ACCESS_KEY is that key in its
+    container). No master key, no provisioner role, no tenant or AI settings: it never reads a
+    credential or a document's content."""
+
+    database_url: str
+
+
+class ExtractionSettings(KeySettings, BrokerSettings):
+    """What extraction and routing need, and nothing for provisioning: the extraction worker
+    boots with this alone (least privilege: no provisioner role, no Docker settings)."""
+
     # Control-plane database, as the app role (DML only), same as the control plane.
     database_url: str
+    # Extraction (M3): the in-region Ollama only. Its host must be on `ai_allowed_hosts`
+    # (comma-separated in SIJIL_AI_ALLOWED_HOSTS), or the client refuses to start.
+    extraction_model: str = "qwen3:4b"
+    ollama_url: str = "http://ollama:11434"
+    ai_allowed_hosts: Annotated[frozenset[str], NoDecode] = frozenset({"ollama"})
+    # The model's threads (SIJIL_OLLAMA_NUM_THREAD): as many as Ollama's CPU quota, since it
+    # otherwise starts one per host CPU and gets throttled. None: Ollama's own choice.
+    ollama_num_thread: int | None = None
+
+    @field_validator("ai_allowed_hosts", mode="before")
+    @classmethod
+    def _split_hosts(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return frozenset(h.strip().lower() for h in v.split(",") if h.strip())
+        return v
+
+
+class WorkerSettings(ExtractionSettings):
+    """The main worker: everything, provisioning included (all required)."""
+
     # Role allowed to CREATE ROLE/DATABASE for tenants; used only by the tenant runtime.
     provisioner_database_url: str
     tenant_image: str

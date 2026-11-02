@@ -12,4 +12,4 @@ RUN uv sync --frozen --no-dev --package sijil-worker
 RUN useradd --system --uid 10001 sijil
 USER sijil
 ENV PATH="/opt/venv/bin:$PATH"
-CMD ["celery", "-A", "sijil_worker.main", "worker", "-Q", "default,provisioning,ingest,extraction", "--loglevel", "INFO"]
+CMD ["celery", "-A", "sijil_worker.main", "worker", "-Q", "default,provisioning,ingest", "--loglevel", "INFO"]

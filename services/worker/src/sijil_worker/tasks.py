@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import random
 from collections.abc import Callable
 from typing import Any
 from uuid import UUID
@@ -9,16 +11,20 @@ from botocore.exceptions import BotoCoreError, ClientError
 from celery import Task, current_app, shared_task
 from celery.utils.time import get_exponential_backoff_interval
 from docker.errors import APIError
+from redis.asyncio import Redis
 from sqlalchemy.exc import OperationalError
 
 from sijil_core.crypto import LocalKeyService
 from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
+from sijil_core.index import IndexEngines
+from sijil_core.ollama import OllamaClient, OllamaError, OllamaUnavailable
 from sijil_core.paperless import (
     PaperlessClient,
     PaperlessError,
     PaperlessUnavailable,
 )
+from sijil_core.region import RegionMismatch
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
@@ -26,17 +32,29 @@ from sijil_worker.drift import (
     enqueue_drift_checks,
     record_check_failed,
 )
+from sijil_worker.extract import (
+    IngestInProgress,
+    extract_document,
+    record_extraction_failed,
+    requeue_unextracted,
+)
 from sijil_worker.ingest import (
     INGEST_MAX_RETRIES,
     ConsumeFailed,
+    WorkspaceNotActive,
     ingest_document,
     is_transient_cause,
     requeue_stuck_ingest,
 )
+from sijil_worker.lock import lock_sealed, requeue_unlocked
+from sijil_worker.mirror import mirror_fields
+from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.runtime.docker import DockerRuntime
-from sijil_worker.settings import WorkerSettings
+from sijil_worker.settings import ExtractionSettings, SealSettings, WorkerSettings
+
+log = logging.getLogger(__name__)
 
 PROVISION_MAX_RETRIES = 3
 RETRY_BACKOFF_MAX_S = 600
@@ -145,6 +163,44 @@ def reconcile_tenants_task() -> list[str]:
         client.close()
 
 
+EXTRACT_TASK = ("sijil.extract_document", "extraction")
+
+
+async def _send_raw_extract(ledger_id: UUID, workspace_id: UUID) -> None:
+    name, queue = EXTRACT_TASK
+    current_app.send_task(
+        name,
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue=queue,
+    )
+
+
+async def _with_pending(op: PendingOp) -> None:
+    """Runs `op` on the broker Redis's set of extractions in flight."""
+    redis = Redis.from_url(str(ExtractionSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis))
+    finally:
+        await redis.aclose()
+
+
+def _pending_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_pending(op))
+    except Exception as exc:
+        log.warning("extraction pending key update failed: %s", type(exc).__name__)
+
+
+async def _send_extract(ledger_id: UUID, workspace_id: UUID) -> None:
+    """Sends the extraction unless one is already in flight for the document."""
+
+    async def op(pending: PendingExtractions) -> None:
+        await pending.send(_send_raw_extract, ledger_id, workspace_id)
+
+    await _with_pending(op)
+
+
 async def _ingest(
     ledger_id: str,
     workspace_id: str,
@@ -164,6 +220,7 @@ async def _ingest(
             workspace_id=UUID(workspace_id),
             will_retry=will_retry,
             retry_after_s=retry_after_s,
+            enqueue_extract=_send_extract,
         )
     finally:
         await engine.dispose()
@@ -220,6 +277,198 @@ async def _requeue() -> int:
 def requeue_stuck_ingest_task() -> int:
     """Re-send ingest for rows nothing is working on (lost message, delay over, dead worker)."""
     return asyncio.run(_requeue())
+
+
+# Extraction outlasts an Ollama or Paperless that is down for a while: 30 s, 1 min, 2 min ...
+# capped at 15 min, 8 times, with equal jitter (half fixed, half random), so the retries always
+# span at least ~30 min. After that the document is flagged `extraction_failed` (audited) so that
+# it goes to review instead of waiting for ever.
+EXTRACT_MAX_RETRIES = 8
+# A retry's pending key lives for its countdown plus this, so it outlasts the wait.
+PENDING_MARGIN_S = 900
+# While the workspace is still ingesting, extraction is sent again this much later.
+INGEST_DEFER_S = 30
+EXTRACT_BACKOFF_FACTOR_S = 30
+EXTRACT_BACKOFF_MAX_S = 900
+
+
+def extract_countdown(retries: int, rand: Callable[[], float] = random.random) -> float:  # noqa: S311
+    """Seconds before retry number `retries + 1`: in [base / 2, base], base = 30 s * 2^retries
+    capped at 900 s. Unlike full jitter it never picks a near-zero wait."""
+    base = float(min(EXTRACT_BACKOFF_FACTOR_S * 2 ** min(retries, 16), EXTRACT_BACKOFF_MAX_S))
+    return base / 2 + rand() * base / 2
+
+
+def is_extract_transient(exc: BaseException) -> bool:
+    """Ollama or Paperless down, slow or 5xx, the workspace paused, the database or the object
+    store (extending the lock at filing) unreachable."""
+    if isinstance(exc, OllamaError):
+        return isinstance(exc, OllamaUnavailable)
+    if isinstance(exc, ClientError):
+        return _store_error_transient(exc)
+    if isinstance(exc, BotoCoreError):
+        return True  # connection, timeout, endpoint: the store is unreachable
+    return isinstance(exc, WorkspaceNotActive) or is_transient(exc)
+
+
+_STORE_TRANSIENT_CODES = frozenset(
+    {"SlowDown", "RequestTimeout", "InternalError", "ServiceUnavailable"}
+)
+
+
+def _store_error_transient(exc: ClientError) -> bool:
+    """Throttling and server errors pass; a refusal (NoSuchKey, AccessDenied, InvalidRequest
+    ...) does not, so the document goes to review instead of retrying for ever."""
+    code = str(exc.response.get("Error", {}).get("Code", ""))
+    status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+    return code in _STORE_TRANSIENT_CODES or code.startswith("Throttling") or status >= 500
+
+
+def extraction_error_code(exc: BaseException) -> str:
+    """The machine code audited with `document.extraction_failed`."""
+    if isinstance(exc, OllamaUnavailable):
+        return "extraction.ai_unavailable"
+    if isinstance(exc, OllamaError):
+        return "extraction.ai_error"
+    if isinstance(exc, PaperlessUnavailable):
+        return "extraction.paperless_unavailable"
+    if isinstance(exc, PaperlessError):
+        return "extraction.paperless_error"
+    if isinstance(exc, WorkspaceNotActive):
+        return "extraction.workspace_not_active"
+    if isinstance(exc, RegionMismatch):
+        return "extraction.region_mismatch"
+    return "extraction.error"
+
+
+async def _extract(ledger_id: str, workspace_id: str | None) -> None:
+    # Runs in the extraction worker, which has extraction settings only.
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
+            await extract_document(
+                UUID(ledger_id),
+                sessions=sessions,
+                keys=keys,
+                index=engines,
+                paperless=PaperlessClient,
+                ollama=ollama,
+                store=S3ObjectStore(StorageSettings()),
+                settings=settings,
+                now=utcnow(),
+                workspace_id=UUID(workspace_id) if workspace_id else None,
+            )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _extract_failed(ledger_id: str, workspace_id: str | None, code: str) -> None:
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        await record_extraction_failed(
+            UUID(ledger_id),
+            code,
+            sessions=sessions,
+            index=engines,
+            store=S3ObjectStore(StorageSettings()),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id) if workspace_id else None,
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True,
+    name="sijil.extract_document",
+    queue="extraction",
+    max_retries=EXTRACT_MAX_RETRIES,
+)
+def extract_document_task(
+    self: "Task[Any, Any]", ledger_id: str, workspace_id: str | None = None
+) -> None:
+    """Fields of one consumed document by the in-region model (see sijil_worker.extract)."""
+    retries = int(self.request.retries or 0)
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_extract(ledger_id, workspace_id))
+    except IngestInProgress:
+        # OCR first. The deferred message is still this document's one in flight: keep the key.
+        async def keep(pending: PendingExtractions) -> None:
+            await pending.refresh(lid, INGEST_DEFER_S + PENDING_MARGIN_S)
+
+        _pending_quietly(keep)
+        _defer_extract(ledger_id, workspace_id, INGEST_DEFER_S)
+        return
+    except Exception as exc:
+        if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
+            countdown = extract_countdown(retries)
+
+            # The retry is still this document's message in flight: keep (and stretch) the key.
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        # Retries ran out, or a final error: the document must reach review, never wait for
+        # ever in `received`.
+        # If recording the failure fails too (its index database gone, say), the row stays
+        # `received`: its key is left to expire, so the sweep skips it for the key's TTL
+        # instead of resending it every run ahead of newer rows.
+        asyncio.run(_extract_failed(ledger_id, workspace_id, extraction_error_code(exc)))
+        _pending_quietly(clear)
+        raise
+    _pending_quietly(clear)  # routed, or nothing to do
+
+
+def _defer_extract(ledger_id: str, workspace_id: str | None, countdown: int) -> None:
+    """The same extraction as a fresh message `countdown` s later: a deferral is not a retry,
+    so it never spends the retry budget."""
+    name, queue = EXTRACT_TASK
+    current_app.send_task(
+        name,
+        kwargs={"ledger_id": ledger_id, "workspace_id": workspace_id},
+        queue=queue,
+        countdown=countdown,
+    )
+
+
+async def _requeue_extract() -> int:
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+    try:
+        return await requeue_unextracted(
+            make_sessionmaker(engine),
+            _send_raw_extract,
+            region=settings.region,
+            pending=PendingExtractions(redis),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unextracted")
+def requeue_unextracted_task() -> int:
+    """Re-send extraction for consumed rows still `received` (a lost message)."""
+    return asyncio.run(_requeue_extract())
 
 
 DRIFT_MAX_RETRIES = 5
@@ -300,3 +549,179 @@ async def _drift_all() -> int:
 def drift_check_all_task() -> int:
     """Nightly: fan out one drift check per active workspace of this region."""
     return asyncio.run(_drift_all())
+
+
+# Mirror of a sealed document's fields into its Paperless: 30 s, 1 min ... capped at 15 min,
+# MIRROR_MAX_RETRIES times. Paperless keeps a copy only; the sealed record is ours already.
+MIRROR_MAX_RETRIES = 8
+MIRROR_BACKOFF_FACTOR_S = 30
+MIRROR_BACKOFF_MAX_S = 900
+
+
+def is_mirror_transient(exc: BaseException) -> bool:
+    """Paperless or a database down or slow, or the workspace paused."""
+    return isinstance(exc, WorkspaceNotActive) or is_transient(exc)
+
+
+async def _mirror(ledger_id: str, workspace_id: str) -> None:
+    # The main worker: its settings carry the index database's host and the master key.
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        await mirror_fields(
+            UUID(ledger_id),
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.mirror_fields", queue="default", max_retries=MIRROR_MAX_RETRIES)
+def mirror_fields_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A sealed document's fields as custom fields in its Paperless (see sijil_worker.mirror)."""
+    try:
+        asyncio.run(_mirror(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if not is_mirror_transient(exc) or retries >= MIRROR_MAX_RETRIES:
+            raise
+        countdown = get_exponential_backoff_interval(
+            factor=MIRROR_BACKOFF_FACTOR_S,
+            retries=retries,
+            maximum=MIRROR_BACKOFF_MAX_S,
+            full_jitter=True,
+        )
+        raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+# The compliance lock (seal worker): 30 s, 1 min ... capped at 15 min, LOCK_MAX_RETRIES times.
+# A permanent refusal is logged by its code and its `lock:pending` key is left to expire (1 h):
+# the sweep re-sends that row at most hourly, and rows that keep failing can never fill the
+# sweep's batch ahead of newer rows. The drift check flags it after an hour; the original stays
+# GOVERNANCE-locked meanwhile, so nothing is lost by waiting.
+LOCK_MAX_RETRIES = 8
+LOCK_BACKOFF_FACTOR_S = 30
+LOCK_BACKOFF_MAX_S = 900
+
+
+def is_lock_transient(exc: BaseException) -> bool:
+    """The object store or the database unreachable, throttling or failing (5xx)."""
+    if isinstance(exc, ClientError):
+        return _store_error_transient(exc)
+    if isinstance(exc, BotoCoreError):
+        return True
+    return is_transient(exc)
+
+
+def _store_code(exc: BaseException) -> str:
+    if isinstance(exc, ClientError):
+        return str(exc.response.get("Error", {}).get("Code", "")) or "ClientError"
+    return type(exc).__name__
+
+
+async def _with_lock_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(SealSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix="lock"))
+    finally:
+        await redis.aclose()
+
+
+def _pending_lock_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_lock_pending(op))
+    except Exception as exc:
+        log.warning("lock pending key update failed: %s", type(exc).__name__)
+
+
+async def _lock_sealed(ledger_id: str, workspace_id: str) -> None:
+    settings = SealSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await lock_sealed(
+            UUID(ledger_id),
+            sessions=make_sessionmaker(engine),
+            store=S3ObjectStore(settings),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.lock_sealed", queue="seal", max_retries=LOCK_MAX_RETRIES)
+def lock_sealed_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A sealed original switched to COMPLIANCE at its committed retention (sijil_worker.lock)."""
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_lock_sealed(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_lock_transient(exc) and retries < LOCK_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=LOCK_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=LOCK_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_lock_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        if is_lock_transient(exc):
+            _pending_lock_quietly(clear)
+            raise  # retries ran out: the next sweep may send it again
+        # Permanent (e.g. AccessDenied): logged by its code only. The pending key is kept until
+        # it expires, so the sweep does not re-send this row every five minutes.
+        log.error("compliance lock of document %s refused: %s", ledger_id, _store_code(exc))
+        return
+    _pending_lock_quietly(clear)
+
+
+async def _requeue_unlocked() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ledger_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.lock_sealed",
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            queue="seal",
+        )
+
+    try:
+        return await requeue_unlocked(
+            make_sessionmaker(engine),
+            send,
+            region=settings.region,
+            pending=PendingExtractions(redis, prefix="lock"),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unlocked")
+def requeue_unlocked_task() -> int:
+    """Re-send the compliance lock for sealed rows still unlocked (a lost message, a store
+    that was down). Runs on the main worker: it only reads the ledger and sends tasks."""
+    return asyncio.run(_requeue_unlocked())

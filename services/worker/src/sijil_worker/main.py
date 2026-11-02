@@ -3,4 +3,4 @@
 from sijil_worker.app import make_celery
 from sijil_worker.settings import WorkerSettings
 
-celery_app = make_celery(WorkerSettings())
+celery_app = make_celery(WorkerSettings(), reconcile_on_start=True)

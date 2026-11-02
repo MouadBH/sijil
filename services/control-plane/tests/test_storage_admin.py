@@ -12,8 +12,11 @@ from sijil_cp import cli
 from sijil_cp.storage_admin import (
     AdminError,
     AppCredentialSettings,
+    SealCredentialSettings,
     app_policy,
     ensure_app_user,
+    ensure_seal_user,
+    seal_policy,
 )
 
 ENDPOINT = "http://objectstore:9000"
@@ -27,6 +30,9 @@ ROOT = StorageSettings.model_construct(
 )
 APP = AppCredentialSettings.model_construct(
     access_key=SecretStr("sijil-app"), secret_key=SecretStr("app-secret-123")
+)
+SEAL = SealCredentialSettings.model_construct(
+    access_key=SecretStr("sijil-seal"), secret_key=SecretStr("seal-secret-456")
 )
 FORBIDDEN = {
     "s3:BypassGovernanceRetention",
@@ -124,11 +130,17 @@ def test_bootstrap_storage_provisions_the_app_user(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(cli, "S3ObjectStore", FakeStore)
     monkeypatch.setattr(cli, "StorageSettings", lambda: ROOT)
     monkeypatch.setattr(cli, "AppCredentialSettings", lambda: APP)
+    monkeypatch.setattr(cli, "SealCredentialSettings", lambda: SEAL)
     monkeypatch.setattr(
         cli, "ensure_app_user", lambda root, app: calls.append(f"user {app.access_key}")
     )
+    monkeypatch.setattr(
+        cli,
+        "ensure_seal_user",
+        lambda root, seal, app: calls.append(f"seal {seal.access_key.get_secret_value()}"),
+    )
     cli.bootstrap_storage()
-    assert calls == ["bucket", "user **********"]
+    assert calls == ["bucket", "user **********", "seal sijil-seal"]
 
 
 def test_bootstrap_storage_retries_while_the_admin_api_starts(
@@ -152,6 +164,69 @@ def test_bootstrap_storage_retries_while_the_admin_api_starts(
     monkeypatch.setattr(cli, "StorageSettings", lambda: ROOT)
     monkeypatch.setattr(cli, "AppCredentialSettings", lambda: APP)
     monkeypatch.setattr(cli, "ensure_app_user", flaky)
+    monkeypatch.setattr(cli, "SealCredentialSettings", lambda: SEAL)
+    monkeypatch.setattr(cli, "ensure_seal_user", lambda root, seal, app: None)
     monkeypatch.setattr("sijil_cp.cli.time.sleep", lambda _s: None)
     cli.bootstrap_storage()
     assert len(attempts) == 2
+
+
+def _actions(policy: dict[str, object], effect: str) -> set[str]:
+    return {
+        action
+        for statement in policy["Statement"]  # type: ignore[attr-defined]
+        if statement["Effect"] == effect
+        for action in statement["Action"]
+    }
+
+
+def test_seal_policy_grants_retention_only() -> None:
+    """The sealing key reads and sets retention (with the GOVERNANCE bypass that switching to
+    COMPLIANCE needs), and nothing else: no bytes in or out, no delete, no legal hold."""
+    policy = seal_policy("sijil-originals-ma-cas")
+    allowed = _actions(policy, "Allow")
+    denied = _actions(policy, "Deny")
+    assert allowed == {
+        "s3:GetObjectRetention",
+        "s3:PutObjectRetention",
+        "s3:BypassGovernanceRetention",
+    }
+    assert {
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:PutObjectLegalHold",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutBucketObjectLockConfiguration",
+    } <= denied
+    assert not allowed & denied
+    resources = {r for s in policy["Statement"] for r in s["Resource"]}
+    assert resources <= {
+        "arn:aws:s3:::sijil-originals-ma-cas",
+        "arn:aws:s3:::sijil-originals-ma-cas/*",
+    }
+
+
+def test_ensure_seal_user_creates_its_own_policy_user_and_binding() -> None:
+    with respx.mock(assert_all_called=True) as router:
+        policy = router.put(f"{ENDPOINT}/rustfs/admin/v3/add-canned-policy").respond(200)
+        user = router.put(f"{ENDPOINT}/rustfs/admin/v3/add-user").respond(200)
+        bind = router.put(f"{ENDPOINT}/rustfs/admin/v3/set-user-or-group-policy").respond(200)
+        ensure_seal_user(ROOT, SEAL, APP)
+    sent = policy.calls.last.request
+    assert sent.url.params["name"] == "sijil-seal"
+    assert json.loads(sent.content) == seal_policy("sijil-originals-ma-cas")
+    assert user.calls.last.request.url.params["accessKey"] == "sijil-seal"
+    bound = bind.calls.last.request.url.params
+    assert (bound["policyName"], bound["userOrGroup"]) == ("sijil-seal", "sijil-seal")
+
+
+@pytest.mark.parametrize("access", ["root-key", "sijil-app"])
+def test_seal_credential_must_differ_from_root_and_app(access: str) -> None:
+    same = SealCredentialSettings.model_construct(
+        access_key=SecretStr(access), secret_key=SecretStr("x")
+    )
+    with respx.mock(assert_all_called=False) as router, pytest.raises(ValueError):
+        ensure_seal_user(ROOT, same, APP)
+    assert router.calls.call_count == 0

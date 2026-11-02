@@ -28,6 +28,7 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
+from sijil_core.index import credential_context
 from sijil_core.paperless import SERVICE_PERMISSIONS, SUPPORT_PERMISSIONS, PaperlessClient
 from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.settings import CoreSettings
@@ -44,7 +45,7 @@ _GENERATED = tuple(k for k in CredentialKind if k is not CredentialKind.service_
 
 
 def _context(workspace_id: UUID, kind: CredentialKind) -> str:
-    return f"{workspace_id}:{kind}"
+    return credential_context(workspace_id, kind)
 
 
 def _new_secret(kind: CredentialKind) -> str:
@@ -194,6 +195,9 @@ async def provision_workspace(
 
         step = "ensure_databases"
         await runtime.ensure_databases(spec)
+
+        step = "ensure_index_schema"
+        await runtime.ensure_index_schema(spec)
 
         step = "ensure_running"
         handle = await runtime.ensure_running(spec)

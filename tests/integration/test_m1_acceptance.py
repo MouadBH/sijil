@@ -87,7 +87,10 @@ async def _service_token(settings: WorkerSettings, workspace_id: uuid.UUID) -> t
 
 
 async def test_m1_acceptance(
-    docker_runtime: DockerRuntime, worker_settings: WorkerSettings, attach_runner: AttachRunner
+    docker_runtime: DockerRuntime,
+    worker_settings: WorkerSettings,
+    attach_runner: AttachRunner,
+    created_workspaces: list[uuid.UUID],
 ) -> None:
     ref: str | None = None
     try:
@@ -101,6 +104,7 @@ async def test_m1_acceptance(
             assert r.status_code == 202, r.text
             created = r.json()
             workspace_id = uuid.UUID(created["workspace"]["id"])
+            created_workspaces.append(workspace_id)
             ref = tenant_ref(workspace_id)
 
             job: dict[str, object] = {}

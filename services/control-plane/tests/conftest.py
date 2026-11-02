@@ -126,12 +126,20 @@ class RecordingEnqueuer:
     def __init__(self) -> None:
         self.calls: list[tuple[JobKind, UUID, UUID]] = []
         self.ingests: list[tuple[UUID, UUID]] = []
+        self.mirrors: list[tuple[UUID, UUID]] = []
+        self.locks: list[tuple[UUID, UUID]] = []
 
     def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None:
         self.calls.append((kind, job_id, workspace_id))
 
     def send_ingest(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self.ingests.append((ledger_id, workspace_id))
+
+    def send_mirror(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self.mirrors.append((ledger_id, workspace_id))
+
+    def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self.locks.append((ledger_id, workspace_id))
 
 
 @pytest.fixture

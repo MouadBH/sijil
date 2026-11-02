@@ -2,7 +2,7 @@
 export DOCKER_SOCKET_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo 0)
 COMPOSE := docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env
 
-.PHONY: install lint typecheck test check itest e2e up down smoke seed models
+.PHONY: install lint typecheck test check itest acceptance e2e up down smoke seed models eval
 
 install:
 	uv sync --all-packages
@@ -23,8 +23,13 @@ test:
 	uv run pytest
 	pnpm test
 
+# Day to day: everything but the slow (model-bound) acceptance.
 itest:
-	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m integration
+	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m "integration and not slow"
+
+# The slow acceptance (M3: 18 documents through the model, up to 45 min), its log printed (-s).
+acceptance:
+	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m "integration and slow" -s -v
 
 e2e:
 	pnpm e2e
@@ -44,8 +49,16 @@ down:
 smoke:
 	infra/scripts/smoke.sh
 
+# Pulls SIJIL_EXTRACTION_MODEL (from the environment or infra/compose/.env; qwen3:4b by default).
 models:
 	$(COMPOSE) --profile models run --rm ollama-pull
 
 seed:
 	infra/scripts/seed.sh
+
+# Extraction accuracy on the SAMPLE invoices ingested in workspace WS (reported, not gated;
+# read-only: nothing is written to the archive). A one-off worker-extraction container (same
+# networks and settings) with the fixtures mounted read-only; no permanent mount.
+eval:
+	$(if $(WS),,$(error usage: make eval WS=<workspace id>))
+	$(COMPOSE) run --rm --no-deps -T -v "$(CURDIR)/fixtures:/src/fixtures:ro" --entrypoint sijil-eval worker-extraction extraction --set /src/fixtures/invoices/manifest.json --workspace $(WS) $(ARGS)

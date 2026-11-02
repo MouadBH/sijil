@@ -12,7 +12,12 @@ import httpx
 from botocore.exceptions import BotoCoreError, ClientError
 
 from sijil_core.storage import S3ObjectStore, StorageSettings
-from sijil_cp.storage_admin import AppCredentialSettings, ensure_app_user
+from sijil_cp.storage_admin import (
+    AppCredentialSettings,
+    SealCredentialSettings,
+    ensure_app_user,
+    ensure_seal_user,
+)
 
 if TYPE_CHECKING:
     from sijil_cp.settings import CpSettings
@@ -27,7 +32,8 @@ def serve() -> None:
 
 
 def bootstrap_storage() -> None:
-    """Create the object-locked bucket and the services' least-privilege user if missing.
+    """Create the object-locked bucket, the services' least-privilege user and the control
+    plane's sealing user if missing.
 
     Runs with the root key (only `migrate` holds it). Safe to run repeatedly. The store may
     still be starting when the one-shot `migrate` service reaches this point, so connection
@@ -35,11 +41,13 @@ def bootstrap_storage() -> None:
     """
     settings = StorageSettings()
     app = AppCredentialSettings()
+    sealer = SealCredentialSettings()
     store = S3ObjectStore(settings)
     for attempt in range(1, _BOOTSTRAP_ATTEMPTS + 1):
         try:
             asyncio.run(store.ensure_bucket())
             ensure_app_user(settings, app)
+            ensure_seal_user(settings, sealer, app)
         except (BotoCoreError, ClientError, httpx.TransportError) as exc:
             if attempt == _BOOTSTRAP_ATTEMPTS:
                 raise
@@ -48,7 +56,7 @@ def bootstrap_storage() -> None:
             )
             time.sleep(2)
         else:
-            print(f"bucket {settings.objectstore_bucket} and app user ready")  # noqa: T201
+            print(f"bucket {settings.objectstore_bucket}, app and seal users ready")  # noqa: T201
             return
 
 

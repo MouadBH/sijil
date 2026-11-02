@@ -20,16 +20,19 @@ from sijil_core.db.models import (
     CredentialKind,
     DocumentLedger,
     DocumentSource,
+    DocumentState,
     IngestState,
     IntegrityAlert,
     Organisation,
     TenantCredential,
+    User,
     Workspace,
     WorkspaceState,
 )
 from sijil_core.paperless import PaperlessClient, PaperlessUnavailable
 from sijil_core.region import RegionMismatch
 from sijil_core.settings import CoreSettings
+from sijil_core.storage import ObjectRef
 from sijil_core.tenancy import tenant_ref
 from sijil_worker import drift
 from sijil_worker.drift import DriftReport, drift_check, enqueue_drift_checks
@@ -556,3 +559,63 @@ async def test_exhausted_retries_record_the_check_as_failed(
     assert (alert.ledger_id, alert.kind, alert.detected_at) == (None, "engine_unreachable", NOW)
     actions = [(e.action, e.data) for e in await events(db, ready)]
     assert actions == [("integrity.check_failed", {"code": "engine_unreachable"})] * 2
+
+
+async def _seal_row(
+    db: AsyncSession, row: DocumentLedger, user_id: uuid.UUID, *, sealed_at: datetime,
+    locked_at: datetime | None,
+) -> None:  # fmt: skip
+    row.state = DocumentState.sealed
+    row.fields_sha256 = "f" * 64
+    row.sealed_at = sealed_at
+    row.sealed_by = user_id
+    row.object_locked_at = locked_at
+    await db.commit()
+
+
+async def test_sealed_but_unlocked_after_an_hour_is_object_lock_pending(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    memory_store: MemoryObjectStore, ready: Workspace, tmp_path: Path, user: User,
+) -> None:  # fmt: skip
+    """Between the seal commit and the seal worker's lock the original stays GOVERNANCE; the
+    sweep resends the lock, and an hour on the drift check says so."""
+    late = await make_doc(db, memory_store, ready, tmp_path, 1)
+    recent = await make_doc(db, memory_store, ready, tmp_path, 2)
+    await _seal_row(db, late, user.id, sealed_at=NOW - timedelta(hours=2), locked_at=None)
+    await _seal_row(db, recent, user.id, sealed_at=NOW - timedelta(minutes=5), locked_at=None)
+    with respx.mock(assert_all_called=False) as router:
+        metadata(router, 1, late.sha256)
+        metadata(router, 2, recent.sha256)
+        await run(ready, sessions, keys, memory_store)
+        await run(ready, sessions, keys, memory_store)  # deduplicated while open
+    found = [(a.ledger_id, a.kind) for a in await alerts(db)]
+    assert found == [(late.id, drift.OBJECT_LOCK_PENDING)]
+
+
+async def test_locked_row_whose_object_is_not_compliance_is_a_mismatch(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    memory_store: MemoryObjectStore, ready: Workspace, tmp_path: Path, user: User,
+) -> None:  # fmt: skip
+    governance = await make_doc(db, memory_store, ready, tmp_path, 1)
+    short = await make_doc(db, memory_store, ready, tmp_path, 2)
+    fine = await make_doc(db, memory_store, ready, tmp_path, 3)
+    for row in (governance, short, fine):
+        await _seal_row(db, row, user.id, sealed_at=NOW - timedelta(hours=2), locked_at=NOW)
+
+    def ref(r: DocumentLedger) -> ObjectRef:
+        return ObjectRef(r.object_key, r.object_version_id)
+
+    await memory_store.seal(ref(fine), fine.retention_until)
+    await memory_store.seal(ref(short), short.retention_until)
+    memory_store.objects[ref(short)].retain_until = short.retention_until - timedelta(days=1)
+    with respx.mock(assert_all_called=False) as router:
+        for i, row in enumerate((governance, short, fine), start=1):
+            metadata(router, i, row.sha256)
+        await run(ready, sessions, keys, memory_store)
+    found = sorted((str(a.ledger_id), a.kind) for a in await alerts(db))
+    assert found == sorted(
+        [
+            (str(governance.id), drift.OBJECT_LOCK_MISMATCH),
+            (str(short.id), drift.OBJECT_LOCK_MISMATCH),
+        ]
+    )

@@ -21,7 +21,8 @@ from sijil_core.filetypes import FileKind
 from sijil_core.paperless import PaperlessClient
 from sijil_worker.drift import DriftReport, drift_check
 from sijil_worker.runtime.base import ADMIN_USERNAME
-from tests.integration.test_ingest_formats import FORMATS, T1_URL, Harness, harness  # noqa: F401
+from tests.integration.test_ingest_formats import FORMATS
+from tests.support.t1 import T1_URL, Harness
 
 pytestmark = pytest.mark.integration
 

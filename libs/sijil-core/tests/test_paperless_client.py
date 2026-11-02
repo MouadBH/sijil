@@ -8,6 +8,7 @@ import respx
 from sijil_core.paperless import (
     SERVICE_PERMISSIONS,
     SUPPORT_PERMISSIONS,
+    PaperlessBadResponse,
     PaperlessClient,
     PaperlessDoc,
     PaperlessError,
@@ -254,3 +255,284 @@ async def test_documents_by_ids_bad_body_is_paperless_error() -> None:
     async with PaperlessClient(BASE, token="t") as client:
         with pytest.raises(PaperlessError):
             await client.documents_by_ids([1])
+
+
+@respx.mock
+async def test_500_raises_unavailable() -> None:
+    route = respx.get(f"{BASE}/api/documents/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable) as exc:
+            await client._request("GET", "/api/documents/")
+    assert exc.value.status == 500
+    assert route.call_count == 1  # 500 is mapped, not retried inside the client
+
+
+# M3: content, suggestions, document types, title/type ------------------------------------
+
+
+@respx.mock
+async def test_document_content_reads_only_the_content_field() -> None:
+    route = respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "content": "FACTURE N° F-1"})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.document_content(7) == "FACTURE N° F-1"
+    assert route.calls.last.request.url.params["fields"] == "id,content"
+
+
+@respx.mock
+async def test_document_content_absent_is_empty() -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "content": None})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.document_content(7) == ""
+
+
+@respx.mock
+async def test_document_content_bad_body_is_bad_response() -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(return_value=httpx.Response(200, json=[1]))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessBadResponse):
+            await client.document_content(7)
+
+
+@respx.mock
+async def test_document_suggestions_keeps_id_lists_only() -> None:
+    respx.get(f"{BASE}/api/documents/7/suggestions/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "correspondents": [],
+                "tags": [3],
+                "document_types": [5, 2],
+                "storage_paths": [],
+                "dates": ["2026-09-30"],
+            },
+        )
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        suggestions = await client.document_suggestions(7)
+    assert suggestions["document_types"] == [5, 2]
+    assert suggestions["tags"] == [3]
+    assert "dates" not in suggestions
+
+
+@respx.mock
+async def test_ensure_document_type_creates_when_missing() -> None:
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    post = respx.post(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(201, json={"id": 11})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_document_type("invoice", r"\bfacture\b", 4) == 11
+    assert json.loads(post.calls.last.request.content) == {
+        "name": "invoice",
+        "match": r"\bfacture\b",
+        "matching_algorithm": 4,
+        "is_insensitive": True,
+    }
+
+
+def _type_row(**row: object) -> httpx.Response:
+    return httpx.Response(200, json={"results": [{"is_insensitive": True, **row}]})
+
+
+@respx.mock
+async def test_ensure_document_type_reuses_by_name_and_never_changes_its_rule() -> None:
+    """A tenant admin may have edited the rule: an existing type is reused as it is."""
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=_type_row(id=4, name="Invoice", match="", matching_algorithm=0)
+    )
+    patch = respx.patch(f"{BASE}/api/document_types/4/")
+    post = respx.post(f"{BASE}/api/document_types/")
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_document_type("invoice", "x", 4) == 4
+    assert not post.called
+    assert not patch.called
+
+
+@respx.mock
+async def test_ensure_document_type_lost_create_race_returns_the_winner() -> None:
+    """Two first extractions: the other one created the type between our GET and POST."""
+    respx.get(f"{BASE}/api/document_types/").mock(
+        side_effect=[
+            httpx.Response(200, json={"results": []}),
+            _type_row(id=9, name="invoice", match="x", matching_algorithm=4),
+        ]
+    )
+    respx.post(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(400, json={"name": ["already exists"]})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_document_type("invoice", "x", 4) == 9
+
+
+@respx.mock
+async def test_ensure_document_type_create_refused_and_still_absent_raises() -> None:
+    respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/document_types/").mock(return_value=httpx.Response(400, json={}))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessError):
+            await client.ensure_document_type("invoice", "x", 4)
+
+
+@respx.mock
+async def test_ensure_document_type_create_unavailable_is_not_swallowed() -> None:
+    listing = respx.get(f"{BASE}/api/document_types/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/document_types/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.ensure_document_type("invoice", "x", 4)
+    assert listing.call_count == 1
+
+
+def test_environment_proxies_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Document content must never go through a proxy taken from the environment."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:3128")
+    client = PaperlessClient(BASE, token="t")
+    assert client._http._trust_env is False
+    assert not client._http._mounts
+
+
+@respx.mock
+async def test_set_title_and_type_patches_the_document() -> None:
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_title_and_type(7, "2026-09-30 Atlas F-1", 11)
+    assert json.loads(patch.calls.last.request.content) == {
+        "title": "2026-09-30 Atlas F-1",
+        "document_type": 11,
+    }
+
+
+@respx.mock
+async def test_download_archive_or_original() -> None:
+    route = respx.get(f"{BASE}/api/documents/7/download/").mock(
+        return_value=httpx.Response(200, content=b"%PDF-1.7")
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.download(7) == b"%PDF-1.7"
+        assert "original" not in route.calls.last.request.url.params
+        await client.download(7, original=True)
+        assert route.calls.last.request.url.params["original"] == "true"
+
+
+@respx.mock
+async def test_ensure_custom_field_creates_when_missing() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    post = respx.post(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(201, json={"id": 21})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_custom_field("sijil_total_ttc", "monetary") == 21
+    assert json.loads(post.calls.last.request.content) == {
+        "name": "sijil_total_ttc",
+        "data_type": "monetary",
+    }
+
+
+@respx.mock
+async def test_ensure_custom_field_reuses_by_exact_name() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"id": 3, "name": "sijil_ice_old", "data_type": "string"},
+                    {"id": 4, "name": "SIJIL_ICE", "data_type": "string"},
+                ]
+            },
+        )
+    )
+    post = respx.post(f"{BASE}/api/custom_fields/")
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_custom_field("sijil_ice", "string") == 4
+    assert not post.called
+
+
+@respx.mock
+async def test_ensure_custom_field_lost_create_race_returns_the_winner() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(
+        side_effect=[
+            httpx.Response(200, json={"results": []}),
+            httpx.Response(200, json={"results": [{"id": 8, "name": "sijil_sealed"}]}),
+        ]
+    )
+    respx.post(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(400, json={"name": ["already exists"]})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_custom_field("sijil_sealed", "boolean") == 8
+
+
+@respx.mock
+async def test_ensure_custom_field_create_unavailable_is_not_swallowed() -> None:
+    listing = respx.get(f"{BASE}/api/custom_fields/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/custom_fields/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.ensure_custom_field("sijil_date", "date")
+    assert listing.call_count == 1
+
+
+@respx.mock
+async def test_ensure_custom_field_bad_body_is_bad_response() -> None:
+    respx.get(f"{BASE}/api/custom_fields/").mock(return_value=httpx.Response(200, json=["x"]))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessBadResponse):
+            await client.ensure_custom_field("sijil_date", "date")
+
+
+@respx.mock
+async def test_set_custom_fields_merges_with_the_documents_other_fields() -> None:
+    """A PATCH of `custom_fields` replaces the document's whole list: others are kept."""
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": 7,
+                "custom_fields": [{"field": 1, "value": "theirs"}, {"field": 21, "value": "old"}],
+            },
+        )
+    )
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_custom_fields(7, {21: "MAD1500.00", 22: True}, document_type=11)
+    sent = json.loads(patch.calls.last.request.content)
+    assert sent["document_type"] == 11
+    assert sorted(sent["custom_fields"], key=lambda f: f["field"]) == [
+        {"field": 1, "value": "theirs"},
+        {"field": 21, "value": "MAD1500.00"},
+        {"field": 22, "value": True},
+    ]
+
+
+@respx.mock
+async def test_set_custom_fields_without_type_sends_fields_only() -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "custom_fields": []})
+    )
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_custom_fields(7, {5: "2026-09-30"})
+    assert json.loads(patch.calls.last.request.content) == {
+        "custom_fields": [{"field": 5, "value": "2026-09-30"}]
+    }

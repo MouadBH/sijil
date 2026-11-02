@@ -58,3 +58,14 @@ def test_only_this_projects_networks_are_reconciled() -> None:
     assert {f.split("@")[1] for f in fixed} == {"sijil_tenant_taaaa", "sijil_tenant_tbbbb"}
     assert other.connected == [] and spoof.connected == []
     assert mine.connected and legacy.connected
+
+
+def test_extraction_worker_is_reattached_to_tenant_networks() -> None:
+    """It reads each tenant's Paperless content, so it must stay on every tenant network."""
+    from sijil_worker.runtime.docker import ATTACHED_SERVICES
+
+    assert "worker-extraction" in ATTACHED_SERVICES
+    mine = Net("sijil_tenant_taaaa", {"sijil.tenant": "taaaa", "sijil.project": "sijil"})
+    fixed = reconcile_tenants(Client([mine]), _settings())  # type: ignore[arg-type]
+    assert "worker-extraction@sijil_tenant_taaaa" in fixed
+    assert "worker-extraction" in mine.connected

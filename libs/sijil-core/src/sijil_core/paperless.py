@@ -5,7 +5,7 @@ Errors never carry credentials or response bodies: only the method, path and sta
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Any, Self
@@ -46,7 +46,7 @@ class PaperlessForbidden(PaperlessError):  # noqa: N818
 
 class PaperlessUnavailable(PaperlessError):  # noqa: N818
     """Paperless could not be reached, timed out or dropped the connection, or kept answering
-    502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
+    500/502/503/504. Transient: worth retrying the whole (idempotent) operation later."""
 
 
 class PaperlessBadResponse(PaperlessError):  # noqa: N818
@@ -125,6 +125,8 @@ class PaperlessClient:
             headers=headers,
             auth=httpx.BasicAuth(*basic) if basic else None,
             timeout=timeout,
+            # Never an environment proxy: document content goes to the tenant only.
+            trust_env=False,
         )
 
     async def __aenter__(self) -> Self:
@@ -170,6 +172,10 @@ class PaperlessClient:
         status = response.status_code
         if status == 403:
             raise PaperlessForbidden(f"{where}: HTTP 403", 403)
+        if status == 500:
+            # Transient: a tenant whose own database is down answers 500. Not retried in
+            # `_request` (only 502-504 are); the caller's backoff handles it.
+            raise PaperlessUnavailable(f"{where}: HTTP 500", 500)
         if status >= 400:
             raise PaperlessError(f"{where}: HTTP {status}", status)
         return response
@@ -364,3 +370,158 @@ class PaperlessClient:
 
     async def delete_document(self, doc_id: int) -> None:
         await self._request("DELETE", f"/api/documents/{doc_id}/")
+
+    async def document_content(self, doc_id: int) -> str:
+        """The document's text as Paperless extracted it (OCR or text layer), or ""."""
+        response = await self._request(
+            "GET", f"/api/documents/{doc_id}/", params={"fields": "id,content"}
+        )
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/documents/{id}/: not JSON") from None
+        if not isinstance(body, dict):
+            raise PaperlessBadResponse("GET /api/documents/{id}/: unexpected body")
+        content = body.get("content")
+        return content if isinstance(content, str) else ""
+
+    async def document_suggestions(self, doc_id: int) -> dict[str, list[int]]:
+        """Paperless's matching suggestions (`document_types`, `tags`, ...): id lists only."""
+        response = await self._request("GET", f"/api/documents/{doc_id}/suggestions/")
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/documents/{id}/suggestions/: not JSON") from None
+        if not isinstance(body, dict):
+            raise PaperlessBadResponse("GET /api/documents/{id}/suggestions/: unexpected body")
+        return {
+            str(key): [int(v) for v in value]
+            for key, value in body.items()
+            if isinstance(value, list)
+            and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        }
+
+    async def _document_type_id(self, name: str) -> int | None:
+        response = await self._request(
+            "GET", "/api/document_types/", params={"name__iexact": name, "page_size": 100}
+        )
+        try:
+            ids = [
+                int(r["id"])
+                for r in response.json()["results"]
+                if str(r["name"]).casefold() == name.casefold()
+            ]
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("GET /api/document_types/: unexpected body") from None
+        return min(ids) if ids else None
+
+    async def ensure_document_type(self, name: str, match: str, algorithm: int) -> int:
+        """The id of the document type called `name` (case-insensitive), created if missing.
+
+        An existing type is reused exactly as it is: its matching rule is never changed (a
+        tenant admin may have edited it). Race-safe: if another caller created the type between
+        our lookup and our create (Paperless refuses the duplicate name), theirs is returned.
+        """
+        existing = await self._document_type_id(name)
+        if existing is not None:
+            return existing
+        rule = {"match": match, "matching_algorithm": algorithm, "is_insensitive": True}
+        try:
+            created = await self._request(
+                "POST", "/api/document_types/", json={"name": name, **rule}
+            )
+        except PaperlessError as exc:
+            if isinstance(exc, PaperlessUnavailable):
+                raise
+            winner = await self._document_type_id(name)
+            if winner is None:
+                raise
+            return winner
+        try:
+            return int(created.json()["id"])
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("POST /api/document_types/: unexpected body") from None
+
+    async def _custom_field_id(self, name: str) -> int | None:
+        response = await self._request(
+            "GET", "/api/custom_fields/", params={"name__iexact": name, "page_size": 100}
+        )
+        try:
+            ids = [
+                int(r["id"])
+                for r in response.json()["results"]
+                if str(r["name"]).casefold() == name.casefold()
+            ]
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("GET /api/custom_fields/: unexpected body") from None
+        return min(ids) if ids else None
+
+    async def ensure_custom_field(self, name: str, data_type: str) -> int:
+        """The id of the custom field called `name` (case-insensitive), created with `data_type`
+        (`string`, `date`, `monetary`, `boolean` ...) if missing. An existing field is reused
+        as it is. Race-safe like `ensure_document_type`."""
+        existing = await self._custom_field_id(name)
+        if existing is not None:
+            return existing
+        try:
+            created = await self._request(
+                "POST", "/api/custom_fields/", json={"name": name, "data_type": data_type}
+            )
+        except PaperlessError as exc:
+            if isinstance(exc, PaperlessUnavailable):
+                raise
+            winner = await self._custom_field_id(name)
+            if winner is None:
+                raise
+            return winner
+        try:
+            return int(created.json()["id"])
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("POST /api/custom_fields/: unexpected body") from None
+
+    async def set_custom_fields(
+        self,
+        doc_id: int,
+        values: Mapping[int, str | bool | None],
+        *,
+        document_type: int | None = None,
+    ) -> None:
+        """Sets these custom field values (`{field id: value}`) on the document, and its type if
+        given. A PATCH of `custom_fields` replaces the document's whole list, so the document's
+        other custom fields are read first and sent back unchanged.
+
+        Lost update: the read and the PATCH are two requests, so a custom field someone sets or
+        changes on this document in Paperless between them is overwritten by its earlier value
+        (or dropped, if added in between). Paperless 3.4.1 offers no conditional update; the
+        window is one round trip, and our own `sijil_*` values are re-set on every mirror."""
+        response = await self._request(
+            "GET", f"/api/documents/{doc_id}/", params={"fields": "id,custom_fields"}
+        )
+        try:
+            current = {
+                int(f["field"]): f.get("value") for f in response.json().get("custom_fields") or []
+            }
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise PaperlessBadResponse("GET /api/documents/{id}/: unexpected body") from None
+        merged = {**current, **values}
+        body: dict[str, Any] = {
+            "custom_fields": [{"field": field, "value": value} for field, value in merged.items()]
+        }
+        if document_type is not None:
+            body["document_type"] = document_type
+        await self._request("PATCH", f"/api/documents/{doc_id}/", json=body)
+
+    async def set_title_and_type(self, doc_id: int, title: str, document_type_id: int) -> None:
+        await self._request(
+            "PATCH",
+            f"/api/documents/{doc_id}/",
+            json={"title": title, "document_type": document_type_id},
+        )
+
+    async def download(self, doc_id: int, *, original: bool = False) -> bytes:
+        """The archived (PDF/A) version, or the original with `original=True`."""
+        params = {"original": "true"} if original else None
+        response = await self._request(
+            "GET", f"/api/documents/{doc_id}/download/", params=params, headers={"Accept": "*/*"}
+        )
+        return response.content
