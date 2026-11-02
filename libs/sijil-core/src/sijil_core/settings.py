@@ -18,3 +18,7 @@ class CoreSettings(BaseSettings):
 
     region: RegionId
     environment: Literal["dev", "test", "prod"]
+
+    # Where the per-workspace index databases live (the shared Postgres on the core network).
+    index_db_host: str = "postgres"
+    index_db_port: int = 5432

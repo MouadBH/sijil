@@ -1,0 +1,371 @@
+import asyncio
+import os
+import uuid
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime
+from typing import Any, cast
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+
+from sijil_core import index
+from sijil_core.crypto import LocalKeyService, seal
+from sijil_core.db.models import CredentialKind, TenantCredential, Workspace
+from sijil_core.index import FieldsRow, IndexEngines, RetentionLocked
+from sijil_core.settings import CoreSettings
+
+pytestmark = pytest.mark.db
+
+NOW = datetime(2027, 3, 1, 10, 0, tzinfo=UTC)
+SHA = "a" * 64
+
+
+@pytest.fixture(scope="module")
+def index_db_url() -> Iterator[str]:
+    raw = os.environ.get("SIJIL_TEST_DATABASE_URL")
+    if not raw:
+        pytest.skip("set SIJIL_TEST_DATABASE_URL")
+    name = f"sijil_idx_{uuid.uuid4().hex[:12]}"
+
+    async def admin(statement: str) -> None:
+        engine = create_async_engine(raw, isolation_level="AUTOCOMMIT")
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(admin(f"CREATE DATABASE {name}"))
+    try:
+        yield make_url(raw).set(database=name).render_as_string(hide_password=False)
+    finally:
+        asyncio.run(admin(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+
+
+@pytest.fixture
+async def conn(index_db_url: str) -> AsyncIterator[AsyncConnection]:
+    engine = create_async_engine(index_db_url, isolation_level="AUTOCOMMIT")
+    async with engine.connect() as connection:
+        await index.ensure_schema(connection)
+        # Triggers forbid DELETE; TRUNCATE is forbidden too, so each test uses fresh ledger ids.
+        yield connection
+    await engine.dispose()
+
+
+def row(ledger_id: uuid.UUID | None = None, /, **values: str | None) -> FieldsRow:
+    return FieldsRow(
+        ledger_id=ledger_id or uuid.uuid4(),
+        document_type="invoice",
+        values=values,
+        confidence=dict.fromkeys(values, 0.9),
+        signals={name: {"found": True} for name in values},
+        flags=("low_confidence",),
+        source=dict.fromkeys(values, "extraction"),
+        model="m",
+        extracted_at=NOW,
+        updated_at=NOW,
+    )
+
+
+async def refused(conn: AsyncConnection, sql: str, **params: Any) -> str:
+    with pytest.raises(DBAPIError) as exc:
+        await conn.execute(text(sql), params)
+    return str(exc.value)
+
+
+async def test_ensure_schema_idempotent(conn: AsyncConnection) -> None:
+    await index.ensure_schema(conn)
+    await index.ensure_schema(conn)
+    versions = (await conn.execute(text("SELECT version FROM index_schema"))).scalars().all()
+    assert versions == [index.SCHEMA_VERSION]
+
+
+async def test_concurrent_first_runs_apply_once(index_db_url: str) -> None:
+    engine = create_async_engine(index_db_url)
+    try:
+        async with engine.begin() as c1:
+            await index.ensure_schema(c1)
+        results = await asyncio.gather(
+            *(_run_ensure(engine) for _ in range(4)), return_exceptions=True
+        )
+        assert results == [None] * 4
+    finally:
+        await engine.dispose()
+
+
+async def _run_ensure(engine: AsyncEngine) -> None:
+    async with engine.begin() as c:
+        await index.ensure_schema(c)
+
+
+async def test_write_and_read_roundtrip(conn: AsyncConnection) -> None:
+    original = row(number="F-1", total_ttc="120.00")
+    await index.write_extraction(conn, original)
+    assert await index.read_fields(conn, original.ledger_id) == original
+    assert await index.read_fields(conn, uuid.uuid4()) is None
+
+
+async def test_write_extraction_upserts(conn: AsyncConnection) -> None:
+    first = row(number="F-1")
+    await index.write_extraction(conn, first)
+    second = row(first.ledger_id, number="F-2")
+    await index.write_extraction(conn, second)
+    assert await index.read_fields(conn, first.ledger_id) == second
+
+
+async def test_sealed_row_update_refused(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    message = await refused(
+        conn,
+        "UPDATE document_fields SET \"values\" = '{}'::jsonb WHERE ledger_id = :id",
+        id=fields.ledger_id,
+    )
+    assert "retention.locked" in message
+    with pytest.raises(RetentionLocked):
+        await index.write_extraction(conn, row(fields.ledger_id, number="F-2"))
+    with pytest.raises(RetentionLocked):
+        await index.update_fields(
+            conn, fields.ledger_id, {"number": "X"}, source="user", updated_by=None, now=NOW
+        )
+
+
+async def test_sealed_columns_only_set_together(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    message = await refused(
+        conn,
+        "UPDATE document_fields SET sealed_at = now() WHERE ledger_id = :id",
+        id=fields.ledger_id,
+    )
+    assert "document_fields_sealed_together" in message
+
+
+async def test_fields_row_delete_refused(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    assert "retention.locked" in await refused(
+        conn, "DELETE FROM document_fields WHERE ledger_id = :id", id=fields.ledger_id
+    )
+    assert "retention.locked" in await refused(conn, "TRUNCATE document_fields")
+
+
+async def test_extraction_run_append_only(conn: AsyncConnection) -> None:
+    ledger_id = uuid.uuid4()
+    await conn.execute(
+        text(
+            "INSERT INTO extraction_run (ledger_id, run, model, raw) "
+            "VALUES (:id, 'a', 'm', CAST('{}' AS jsonb))"
+        ),
+        {"id": ledger_id},
+    )
+    assert "index.append_only" in await refused(conn, "UPDATE extraction_run SET model = 'x'")
+    assert "index.append_only" in await refused(conn, "DELETE FROM extraction_run")
+    assert "index.append_only" in await refused(conn, "TRUNCATE extraction_run")
+
+
+async def test_update_fields_merges_and_marks_user(conn: AsyncConnection) -> None:
+    fields = row(number="F-1", total_ttc="120.00")
+    await index.write_extraction(conn, fields)
+    later = datetime(2027, 3, 2, tzinfo=UTC)
+    editor = uuid.uuid4()
+    updated = await index.update_fields(
+        conn, fields.ledger_id, {"number": "F-9", "supplier_ice": None},
+        source="user", updated_by=editor, now=later,
+    )  # fmt: skip
+    assert updated.values == {"number": "F-9", "total_ttc": "120.00", "supplier_ice": None}
+    assert updated.source == {"number": "user", "total_ttc": "extraction", "supplier_ice": "user"}
+    assert updated.confidence["number"] == 1.0
+    assert updated.confidence["supplier_ice"] == 1.0
+    assert updated.confidence["total_ttc"] == 0.9
+    assert (updated.updated_at, updated.updated_by) == (later, editor)
+    assert await index.read_fields(conn, fields.ledger_id) == updated
+
+
+async def test_update_fields_extraction_source_keeps_confidence(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    updated = await index.update_fields(
+        conn, fields.ledger_id, {"number": "F-2"}, source="extraction", updated_by=None, now=NOW
+    )
+    assert updated.confidence == {"number": 0.9}
+    assert updated.source == {"number": "extraction"}
+
+
+async def test_update_fields_unknown_ledger(conn: AsyncConnection) -> None:
+    with pytest.raises(LookupError):
+        await index.update_fields(
+            conn, uuid.uuid4(), {"a": "b"}, source="user", updated_by=None, now=NOW
+        )
+
+
+async def test_seal_fields_idempotent_same_hash_different_refused(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    sealed = await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    assert (sealed.sealed_at, sealed.fields_sha256) == (NOW, SHA)
+    later = datetime(2027, 4, 1, tzinfo=UTC)
+    again = await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=later)
+    assert again == sealed
+    with pytest.raises(RetentionLocked):
+        await index.seal_fields(conn, fields.ledger_id, fields_sha256="b" * 64, sealed_at=later)
+    with pytest.raises(LookupError):
+        await index.seal_fields(conn, uuid.uuid4(), fields_sha256=SHA, sealed_at=NOW)
+
+
+async def test_find_possible_duplicates_matches_number_ice_ttc(conn: AsyncConnection) -> None:
+    ice = f"{uuid.uuid4().int % 10**15:015d}"
+    base = {"number": "F-77", "supplier_ice": ice, "total_ttc": "120.00"}
+    me, twin = row(**base), row(**base)
+    other_number = row(**{**base, "number": "F-78"})
+    other_total = row(**{**base, "total_ttc": "121.00"})
+    other_ice = row(**{**base, "supplier_ice": "0" + ice[1:]})
+    for r in (me, twin, other_number, other_total, other_ice):
+        await index.write_extraction(conn, r)
+    found = await index.find_possible_duplicates(conn, me.ledger_id, "F-77", ice, "120.00")
+    assert found == [twin.ledger_id]
+
+
+async def test_known_supplier_is_name_on_latest_sealed_row(conn: AsyncConnection) -> None:
+    ice = f"{uuid.uuid4().int % 10**15:015d}"
+    old, new, unsealed = (
+        row(supplier_ice=ice, supplier_name=n) for n in ("Old SARL", "New SARL", "Draft SARL")
+    )
+    for r in (old, new, unsealed):
+        await index.write_extraction(conn, r)
+    await index.seal_fields(conn, old.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    await index.seal_fields(
+        conn, new.ledger_id, fields_sha256=SHA, sealed_at=datetime(2027, 5, 1, tzinfo=UTC)
+    )
+    assert await index.known_supplier(conn, ice) == "New SARL"
+    assert await index.known_supplier(conn, "999999999999999") is None
+
+
+# Engines ------------------------------------------------------------------------------------
+
+
+class FakeEngine:
+    def __init__(self, url: URL) -> None:
+        self.url = url
+        self.disposed = False
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
+class FakeSessions:
+    """Stands in for the control-plane sessionmaker: one credential row."""
+
+    def __init__(self, credential: TenantCredential | None) -> None:
+        self._credential = credential
+
+    def __call__(self) -> "FakeSessions":
+        return self
+
+    async def __aenter__(self) -> "FakeSessions":
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def scalar(self, _statement: object) -> TenantCredential | None:
+        return self._credential
+
+
+def workspace_named(slug: str) -> Workspace:
+    return Workspace(
+        id=uuid.uuid4(),
+        name="A",
+        slug=slug,
+        db_name=f"paperless_{slug}",
+        index_db_name=f"index_{slug}",
+        kms_key_id=f"kek-{slug}",
+    )
+
+
+def credential_for(ws: Workspace, keys: LocalKeyService, password: str) -> TenantCredential:
+    kind = CredentialKind.index_db_password
+    envelope = seal(password.encode(), keys, ws.kms_key_id, f"{ws.id}:{kind}")
+    return TenantCredential(workspace_id=ws.id, kind=kind, envelope=envelope.to_bytes())
+
+
+SETTINGS = CoreSettings.model_construct(
+    region="ma-cas", environment="test", index_db_host="pg.internal", index_db_port=6543
+)
+
+
+def engines_for(
+    ws: Workspace, keys: LocalKeyService, created: list[FakeEngine], ensured: list[Any], **kw: Any
+) -> IndexEngines:
+    def factory(url: URL) -> Any:
+        engine = FakeEngine(url)
+        created.append(engine)
+        return engine
+
+    async def ensure(engine: Any) -> None:
+        ensured.append(engine)
+
+    return IndexEngines(
+        SETTINGS,
+        keys,
+        FakeSessions(credential_for(ws, keys, "s3cret/pw:@")),  # type: ignore[arg-type]
+        engine_factory=factory,
+        ensure=ensure,
+        **kw,
+    )
+
+
+async def test_index_db_password_from_credential() -> None:
+    keys = LocalKeyService(b"k" * 32)
+    ws = workspace_named("a")
+    created: list[FakeEngine] = []
+    ensured: list[Any] = []
+    engines = engines_for(ws, keys, created, ensured)
+    engine = await engines.engine(ws)
+    assert engine is cast(Any, created[0])
+    url = created[0].url
+    assert (url.drivername, url.username, url.password) == (
+        "postgresql+asyncpg", "index_a", "s3cret/pw:@",
+    )  # fmt: skip
+    assert (url.host, url.port, url.database) == ("pg.internal", 6543, "index_a")
+    assert await engines.engine(ws) is engine
+    assert len(created) == 1
+    assert ensured == [engine]  # schema ensured once per engine
+
+
+async def test_credential_bound_to_workspace_context() -> None:
+    keys = LocalKeyService(b"k" * 32)
+    ws, other = workspace_named("a"), workspace_named("b")
+    created: list[FakeEngine] = []
+    engines = engines_for(ws, keys, created, [])
+    from sijil_core.crypto import DecryptionError
+
+    with pytest.raises(DecryptionError):
+        await engines.engine(other)
+    assert created == []
+
+
+async def test_engines_lru_disposes_evicted() -> None:
+    keys = LocalKeyService(b"k" * 32)
+    created: list[FakeEngine] = []
+    ws = [workspace_named(f"w{i}") for i in range(3)]
+    # One credential row serves every workspace here, so give each its own context.
+    engines = engines_for(ws[0], keys, created, [], max_engines=2)
+
+    async def password(w: Workspace) -> str:
+        return "pw"
+
+    engines._password = password  # type: ignore[method-assign,assignment]
+    e0 = await engines.engine(ws[0])
+    e1 = await engines.engine(ws[1])
+    await engines.engine(ws[0])  # w0 is now most recently used
+    await engines.engine(ws[2])  # evicts w1
+    assert [e.disposed for e in created] == [False, True, False]
+    assert cast(Any, created[1]) is e1
+    assert e0 is cast(Any, created[0])
+    await engines.aclose()
+    assert all(e.disposed for e in created)

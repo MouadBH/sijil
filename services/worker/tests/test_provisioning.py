@@ -43,6 +43,9 @@ class FakeRuntime:
         self.calls.append("ensure_databases")
         self.specs.append(spec)
 
+    async def ensure_index_schema(self, spec: TenantSpec) -> None:
+        self.calls.append("ensure_index_schema")
+
     async def ensure_running(self, spec: TenantSpec) -> TenantHandle:
         self.calls.append("ensure_running")
         if self.fail_running_once:
@@ -140,7 +143,7 @@ async def test_provision_happy_path_activates_workspace(
     assert ws.state == WorkspaceState.active
     assert ws.paperless_url == URL
     assert jb.status == JobStatus.succeeded
-    assert runtime.calls == ["ensure_databases", "ensure_running"]
+    assert runtime.calls == ["ensure_databases", "ensure_index_schema", "ensure_running"]
     assert set(await creds(db, workspace.id)) == set(CredentialKind)
     spec = runtime.specs[0]
     assert len(spec.secret_key) == 50
@@ -455,3 +458,18 @@ def test_provision_task_routes_to_provisioning_queue() -> None:
 
     # celery-types does not declare the option attributes set by the decorator.
     assert provision_workspace_task.queue == "provisioning"  # type: ignore[attr-defined]
+
+
+async def test_provisioning_ensures_index_schema(
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    workspace: Workspace,
+    job: Job,
+) -> None:
+    """The schema step runs right after the databases exist, before Paperless starts."""
+    runtime = FakeRuntime()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(sessions, keys, runtime, workspace, job)
+    assert runtime.calls.index("ensure_index_schema") == runtime.calls.index("ensure_databases") + 1
+    assert runtime.calls.index("ensure_index_schema") < runtime.calls.index("ensure_running")

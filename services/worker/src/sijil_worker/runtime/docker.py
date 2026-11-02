@@ -26,6 +26,7 @@ from docker.models.containers import Container
 from docker.models.networks import Network
 from docker.types import IPAMConfig, IPAMPool
 
+from sijil_core.index import apply_schema
 from sijil_core.tenancy import tenant_db_names
 from sijil_worker.runtime.base import ADMIN_USERNAME, TenantHandle, TenantSpec, TenantStatus
 from sijil_worker.runtime.postgres import drop_tenant_databases, ensure_tenant_databases
@@ -155,6 +156,10 @@ class DockerRuntime:
 
     async def ensure_databases(self, spec: TenantSpec) -> None:
         await ensure_tenant_databases(self._settings.provisioner_database_url, spec)
+
+    async def ensure_index_schema(self, spec: TenantSpec) -> None:
+        # As the index role itself: it owns its database, so no extra grant is needed.
+        await apply_schema(self._settings, spec.index_db_name, spec.index_db_password)
 
     async def ensure_running(self, spec: TenantSpec) -> TenantHandle:
         # Every name is built (and so validated) before anything is created.
