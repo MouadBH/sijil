@@ -143,6 +143,8 @@ services:
     # generation at a time and a short queue: excess requests get 503 (transient, retried)
     # instead of piling up behind each other.
     cpus: "6"
+    # A quarter of the default CPU weight: under contention the tenants' OCR comes first.
+    cpu_shares: 256
     environment:
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_QUEUE: "8"

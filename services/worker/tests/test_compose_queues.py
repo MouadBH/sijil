@@ -33,6 +33,8 @@ def test_ollama_is_capped_and_fails_fast_when_busy() -> None:
     at a time, and a short queue: excess requests get 503 (transient) instead of piling up."""
     block = _block("ollama")
     assert _key(block, "cpus") == '"6"'
+    # A quarter of the default CPU weight: under contention the tenants' OCR comes first.
+    assert _key(block, "cpu_shares") == "256"
     # The model sizes its thread pool from the host's CPUs (eight), not the quota: eight threads
     # under six CPUs were throttled to 0.4 tokens/s (measured), so every client asks for six.
     text = COMPOSE
