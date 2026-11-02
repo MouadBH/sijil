@@ -62,4 +62,5 @@ pythonpath = ["."]
 markers = [
   "db: needs Postgres (set SIJIL_TEST_DATABASE_URL)",
   "integration: needs the compose stack; run with `make itest`",
+  "slow: long-running (the model, one document at a time); `make acceptance`, not `make itest`",
 ]

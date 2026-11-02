@@ -2,7 +2,7 @@
 export DOCKER_SOCKET_GID ?= $(shell stat -c %g /var/run/docker.sock 2>/dev/null || echo 0)
 COMPOSE := docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env
 
-.PHONY: install lint typecheck test check itest e2e up down smoke seed models eval
+.PHONY: install lint typecheck test check itest acceptance e2e up down smoke seed models eval
 
 install:
 	uv sync --all-packages
@@ -23,8 +23,13 @@ test:
 	uv run pytest
 	pnpm test
 
+# Day to day: everything but the slow (model-bound) acceptance.
 itest:
-	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m integration
+	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m "integration and not slow"
+
+# The slow acceptance (M3: 18 documents through the model, up to 75 min), its log printed (-s).
+acceptance:
+	$(COMPOSE) --profile test run --rm --build tests uv run --frozen pytest -m "integration and slow" -s -v
 
 e2e:
 	pnpm e2e
