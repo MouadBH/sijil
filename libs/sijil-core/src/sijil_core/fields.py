@@ -57,7 +57,9 @@ _DIGITS = {
     **{chr(0x06F0 + i): str(i) for i in range(10)},
 }
 _DIGIT_TABLE = str.maketrans(_DIGITS)
-_ARABIC_MARKS = str.maketrans({"٫": ".", "٬": ","})
+_ARABIC_DECIMAL = "٫"
+_ARABIC_GROUPING = "٬"
+_ARABIC_MARKS = str.maketrans({_ARABIC_DECIMAL: ".", _ARABIC_GROUPING: ","})
 
 
 def _ascii_digits(s: str) -> str:
@@ -103,11 +105,22 @@ def _is_decimal_mark(s: str, mark: str) -> bool:
 def parse_amount(s: str | None) -> Decimal | None:
     if s is None:
         return None
-    t = _ascii_digits(normalise(s)).translate(_ARABIC_MARKS)
+    t = _ascii_digits(normalise(s))
     t = _CURRENCY_STRIP.sub("", t)
     t = re.sub(r"\s+", "", t)
+    arabic = _ARABIC_DECIMAL in t
+    if arabic:
+        # The Arabic decimal mark is unambiguous: 1-2 digits after it, U+066C is grouping.
+        head, _, tail = t.partition(_ARABIC_DECIMAL)
+        if not re.fullmatch(r"\d{1,2}", tail):
+            return None
+        t = head.replace(_ARABIC_GROUPING, "") + "." + tail
+    else:
+        t = t.replace(_ARABIC_GROUPING, "")
     has_dot, has_comma = "." in t, "," in t
-    if has_dot and has_comma:
+    if arabic:
+        pass  # heuristic applies only when no Arabic decimal mark was present
+    elif has_dot and has_comma:
         dec = "." if t.rindex(".") > t.rindex(",") else ","
         grp = "," if dec == "." else "."
         head, _, tail = t.rpartition(dec)
@@ -269,7 +282,7 @@ def _rate_field(raw: str | None) -> str | None:
 def _type_field(raw: str | None) -> str | None:
     if raw is None:
         return None
-    t = raw.lower().strip()
+    t = normalise(raw).lower().strip()
     return t if t in DOCUMENT_TYPES else None
 
 

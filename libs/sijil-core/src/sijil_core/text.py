@@ -3,8 +3,8 @@
 import re
 import unicodedata
 
-_BIDI_CONTROLS = re.compile("[‎‏؜‪-‮⁦-⁩]")
-_HSPACE = re.compile("[ \t   ]+")
+_BIDI_CONTROLS = re.compile("[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+_HSPACE = re.compile("[ \t\u00a0\u202f\u2009]+")
 
 
 def normalise(s: str) -> str:
