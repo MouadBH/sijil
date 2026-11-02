@@ -7,8 +7,8 @@ through a real `IndexEngines` (its credential sealed like provisioning does).
 import hashlib
 import json
 import uuid
-from collections.abc import AsyncIterator, Iterator
-from datetime import UTC, datetime, timedelta
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, get_args
 
@@ -43,6 +43,7 @@ from sijil_core.fields import DOCUMENT_TYPES, FIELD_NAMES
 from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.ollama import OllamaClient, OllamaUnavailable
 from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
+from sijil_core.storage import ObjectRef
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.extract import (
@@ -107,6 +108,25 @@ CANONICAL_01 = {
     "currency": SAMPLE_01["currency"],
 }
 TYPE_IDS = {name: n + 1 for n, name in enumerate(DOCUMENT_TYPES)}
+PROVISIONAL = date(2036, 12, 31)  # arrival in 2026, MA
+
+
+class FakeStore:
+    """Records every retention extension; `observe` runs inside the call (to see what the
+    ledger holds at that moment)."""
+
+    def __init__(self, observe: Callable[[], Awaitable[Any]] | None = None) -> None:
+        self.extended: list[tuple[ObjectRef, date]] = []
+        self.observed: list[Any] = []
+        self.observe = observe
+        self.fail: Exception | None = None
+
+    async def extend_retention(self, ref: ObjectRef, retain_until: date) -> None:
+        if self.observe is not None:
+            self.observed.append(await self.observe())
+        if self.fail is not None:
+            raise self.fail
+        self.extended.append((ref, retain_until))
 
 
 # Fixtures ---------------------------------------------------------------------------------
@@ -127,8 +147,9 @@ def sessions(db: AsyncSession) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(db.bind, expire_on_commit=False)
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def index_db_url() -> Iterator[str]:
+    """One per test: duplicate detection looks at every row of the workspace's index."""
     yield from throwaway_index_db()
 
 
@@ -168,6 +189,8 @@ async def make_ledger(
     state: DocumentState = DocumentState.received,
     ingest_state: IngestState = IngestState.consumed,
     age: timedelta = timedelta(0),
+    ingested_at: datetime | None = None,
+    retention_until: date = PROVISIONAL,
 ) -> DocumentLedger:
     sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     row = DocumentLedger(
@@ -182,8 +205,8 @@ async def make_ledger(
         state=state,
         ingest_state=ingest_state,
         paperless_doc_id=DOC_ID if ingest_state is IngestState.consumed else None,
-        retention_until=NOW.date() + timedelta(days=3650),
-        ingested_at=NOW - age,
+        retention_until=retention_until,
+        ingested_at=ingested_at or NOW - age,
     )
     db.add(row)
     await db.commit()
@@ -228,6 +251,7 @@ def mock_paperless(
     *,
     content: str = CONTENT_01,
     suggested: list[int] | None = None,
+    patch_status: int = 200,
 ) -> respx.Route:
     route = router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(
         200, json={"id": DOC_ID, "content": content}
@@ -243,6 +267,7 @@ def mock_paperless(
             "dates": [],
         },
     )
+    router.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(patch_status, json={"id": DOC_ID})
     return route
 
 
@@ -258,6 +283,8 @@ async def run(
     ollama: FakeOllama,
     *,
     settings: WorkerSettings = SETTINGS,
+    store: FakeStore | None = None,
+    now: datetime = NOW,
 ) -> None:
     async with ollama.client() as client:
         await extract_document(
@@ -267,8 +294,9 @@ async def run(
             index=engines,
             paperless=paperless,
             ollama=client,
+            store=FakeStore() if store is None else store,
             settings=settings,
-            now=NOW,
+            now=now,
         )
 
 
@@ -291,6 +319,10 @@ async def events(db: AsyncSession, workspace: Workspace) -> list[AuditEvent]:
         select(AuditEvent).where(AuditEvent.workspace_id == workspace.id).order_by(AuditEvent.seq)
     )
     return list(rows)
+
+
+async def actions(db: AsyncSession, workspace: Workspace) -> list[str]:
+    return [e.action for e in await events(db, workspace)]
 
 
 async def reload(db: AsyncSession, ledger: DocumentLedger) -> DocumentLedger:
@@ -442,7 +474,8 @@ async def test_extraction_schema(
     assert isinstance(row, FieldsRow)
     assert dict(row.values) == CANONICAL_01
     assert row.document_type == "invoice"
-    assert row.confidence == {}
+    assert set(row.confidence) == set(FIELD_NAMES)
+    assert all(row.confidence[name] >= 0.90 for name in FIELD_NAMES), row.confidence
     assert row.flags == ()
     assert row.model == "qwen3:4b"
     assert row.extracted_at == NOW
@@ -460,11 +493,17 @@ async def test_extraction_schema(
     assert [b["messages"][0]["content"] for b in bodies] == [PROMPT_A, PROMPT_B]
     assert all(b["format"] == extraction_schema() for b in bodies)
     assert all(CONTENT_01.strip() in b["messages"][1]["content"] for b in bodies)
-    # The ledger is left for routing (Task 5); the audit records the run.
-    assert (await reload(db, ledger)).state is DocumentState.received
-    (event,) = await events(db, ready)
-    assert event.action == "document.extracted"
-    assert event.data == {"model": "qwen3:4b", "runs_agree_count": len(FIELD_NAMES)}
+    # Every check passes: filed, after the extraction is audited.
+    assert (await reload(db, ledger)).state is DocumentState.filed
+    extracted, filed = await events(db, ready)
+    assert extracted.action == "document.extracted"
+    assert extracted.data == {
+        "model": "qwen3:4b",
+        "runs_agree_count": len(FIELD_NAMES),
+        "min_confidence_pct": 100,
+    }
+    assert filed.action == "document.filed"
+    assert filed.data == {"min_confidence_pct": 100, "flags": ""}
 
 
 async def test_no_external_host_called(
@@ -512,7 +551,7 @@ async def test_two_runs_disagree_sets_signal_false(
     assert row.signals["total_ht"]["runs_agree"] is True  # equal once canonical
     assert row.signals["supplier_ice"]["runs_agree"] is True
     assert row.signals["document_type"]["paperless_agrees"] is False
-    (event,) = await events(db, ready)
+    event = (await events(db, ready))[0]
     assert event.data["runs_agree_count"] == len(FIELD_NAMES) - 3
 
 
@@ -569,9 +608,12 @@ async def test_empty_content_flags_no_text_without_calling_the_model(
     row = await fields_of(engines, ready, ledger.id)
     assert row.flags == ("no_text",)
     assert dict(row.values) == dict.fromkeys(FIELD_NAMES)
-    (event,) = await events(db, ready)
-    assert event.action == "document.extracted"
-    assert event.data == {"model": "qwen3:4b", "runs_agree_count": 0}
+    extracted, review = await events(db, ready)
+    assert extracted.action == "document.extracted"
+    assert extracted.data == {"model": "qwen3:4b", "runs_agree_count": 0, "min_confidence_pct": 0}
+    assert review.action == "document.needs_review"
+    assert review.data == {"min_confidence_pct": 0, "flags": "no_text"}
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
 
 
 async def test_one_malformed_run_uses_the_other(
@@ -610,9 +652,15 @@ async def test_malformed_json_twice_routes_to_review(
     assert "extraction_failed" in row.flags
     assert dict(row.values) == dict.fromkeys(FIELD_NAMES)
     assert len(await runs_of(engines, ready, ledger.id)) == 2
-    (event,) = await events(db, ready)
-    assert event.action == "document.extraction_failed"
-    assert event.data == {"code": "extraction.ai_bad_output"}
+    failed, review = await events(db, ready)
+    assert failed.action == "document.extraction_failed"
+    assert failed.data == {"code": "extraction.ai_bad_output"}
+    assert review.action == "document.needs_review"
+    assert review.data == {
+        "min_confidence_pct": 0,
+        "flags": "extraction_failed,extraction.ai_bad_output",
+    }
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
 
 
 async def test_ollama_unavailable_is_retried(
@@ -663,8 +711,8 @@ async def test_paperless_unavailable_is_raised_for_retry(
         (DocumentState.received, IngestState.queued),
         (DocumentState.received, IngestState.sending),
         (DocumentState.received, IngestState.failed),
-        (DocumentState.received, IngestState.unsupported),
         (DocumentState.needs_review, IngestState.consumed),
+        (DocumentState.needs_review, IngestState.unsupported),
         (DocumentState.filed, IngestState.consumed),
     ],
 )
@@ -707,7 +755,7 @@ async def test_already_extracted_is_noop(
         assert not router.calls
     assert again.requests == []
     assert len(await runs_of(engines, ready, ledger.id)) == 2
-    assert len(await events(db, ready)) == 1
+    assert await actions(db, ready) == ["document.extracted", "document.filed"]
 
 
 async def test_foreign_region_row_is_left_alone(
@@ -742,13 +790,272 @@ async def test_audit_has_no_field_values(
     with respx.mock(assert_all_called=False) as router:
         mock_paperless(router)
         await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
-    (event,) = await events(db, ready)
-    dumped = json.dumps(event.data, ensure_ascii=False)
-    for value in (*RAW_01.values(), *CANONICAL_01.values(), "1250", "1500", "Atlas"):
-        if value not in (None, "invoice", "MAD", "20"):
-            assert str(value) not in dumped, value
-    assert set(event.data) == {"model", "runs_agree_count"}
-    assert all(isinstance(v, str | int) for v in event.data.values())
+    extracted, filed = await events(db, ready)
+    for event in (extracted, filed):
+        dumped = json.dumps(event.data, ensure_ascii=False)
+        for value in (*RAW_01.values(), *CANONICAL_01.values(), "1250", "1500", "Atlas"):
+            if value not in (None, "invoice", "MAD", "20"):
+                assert str(value) not in dumped, value
+        assert all(isinstance(v, str | int) for v in event.data.values())
+    assert set(extracted.data) == {"model", "runs_agree_count", "min_confidence_pct"}
+    assert set(filed.data) == {"min_confidence_pct", "flags"}
+
+
+# Scoring and routing ----------------------------------------------------------------------
+
+
+def _patches(router: respx.MockRouter) -> list[dict[str, Any]]:
+    return [
+        json.loads(c.request.content)
+        for c in router.calls
+        if c.request.method == "PATCH" and c.request.url.path == f"/api/documents/{DOC_ID}/"
+    ]
+
+
+def _broken_store() -> FakeStore:
+    store = FakeStore()
+    store.fail = ConnectionError("store down")
+    return store
+
+
+async def test_filed_document_gets_its_title_and_type_in_paperless(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+        patches = _patches(router)
+    title = f"{SAMPLE_01['date']} {SUPPLIER_01['name']} {SAMPLE_01['number']}"
+    assert patches == [{"title": title, "document_type": TYPE_IDS["invoice"]}]
+
+
+async def test_paperless_title_failure_does_not_change_routing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    raw = {**RAW_01, "number": None}  # a missing part is left out of the title
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, patch_status=500)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}))
+        title = _patches(router)[0]["title"]
+    assert title == f"{SAMPLE_01['date']} {SUPPLIER_01['name']}"
+    assert (await reload(db, ledger)).state is DocumentState.needs_review  # no number
+    assert await actions(db, ready) == ["document.extracted", "document.needs_review"]
+    assert "title" in caplog.text
+    assert SUPPLIER_01["name"] not in caplog.text  # logged by code only
+
+
+async def test_totals_mismatch_routes_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    # SAMPLE: sample-05's amounts, whose printed TTC is 0.50 off HT + TVA.
+    raw = {**RAW_01, "total_ht": "2 340,00", "vat": "468,00", "total_ttc": "2 808,50"}
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}))
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.signals["total_ttc"]["totals_consistent"] is False
+    assert row.confidence["total_ttc"] < 0.90
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
+    review = (await events(db, ready))[-1]
+    assert review.action == "document.needs_review"
+    assert review.data == {"min_confidence_pct": 50, "flags": ""}
+
+
+async def test_possible_duplicate_flag(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    first = await make_ledger(db, ready)
+    second = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(first, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+        await run(second, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert (await reload(db, first)).state is DocumentState.filed
+    assert (await reload(db, second)).state is DocumentState.needs_review
+    assert (await fields_of(engines, ready, first.id)).flags == ()
+    row = await fields_of(engines, ready, second.id)
+    assert row.flags == ("possible_duplicate",)
+    assert all(row.confidence[name] >= 0.90 for name in FIELD_NAMES)  # only the flag blocks
+    review = (await events(db, ready))[-1]
+    assert (review.target_id, review.action) == (str(second.id), "document.needs_review")
+    assert review.data == {"min_confidence_pct": 100, "flags": "possible_duplicate"}
+
+
+async def test_unsupported_ingest_routes_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """No Paperless document and no extraction: straight to review, with the ingest flag."""
+    ledger = await make_ledger(db, ready, ingest_state=IngestState.unsupported)
+    ollama = FakeOllama({})
+    store = FakeStore()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, ollama, store=store)
+        await run(ledger, sessions, keys, engines, ollama, store=store)  # once only
+        assert not router.calls
+    assert ollama.requests == []
+    assert await runs_of(engines, ready, ledger.id) == []
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.flags == ("ingest.unsupported_format",)
+    assert dict(row.values) == dict.fromkeys(FIELD_NAMES)
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
+    (review,) = await events(db, ready)
+    assert review.action == "document.needs_review"
+    assert review.data == {"min_confidence_pct": 0, "flags": "ingest.unsupported_format"}
+    assert store.extended == []  # arrival in 2026: the provisional date already holds
+
+
+async def test_filing_never_lowers_retention(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    # Arrival in 2026 (kept to 2036-12-31), dated 2024 (only 2034-12-31 would be needed).
+    ledger = await make_ledger(db, ready)
+    raw = {**RAW_01, "date": "2024-05-10"}
+    store = FakeStore()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}), store=store)
+    row = await reload(db, ledger)
+    assert row.state is DocumentState.filed
+    assert row.retention_until == date(2036, 12, 31)
+    assert store.extended == []
+
+
+async def test_filing_extends_retention_and_object_lock(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    arrival = datetime(2026, 1, 5, 10, 0, tzinfo=UTC)
+    ledger = await make_ledger(db, ready, ingested_at=arrival, retention_until=date(2036, 12, 31))
+    raw = {**RAW_01, "date": "2027-01-02"}
+
+    async def committed() -> tuple[DocumentState, date]:
+        # A fresh session sees only what is committed: the ledger must not have moved yet.
+        async with sessions() as other:
+            found = await other.get(DocumentLedger, ledger.id)
+            assert found is not None
+            return found.state, found.retention_until
+
+    store = FakeStore(observe=committed)
+    later = datetime(2027, 1, 2, 12, 0, tzinfo=UTC)  # the date is plausible by then
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        ollama = FakeOllama({1: raw, 2: raw})
+        await run(ledger, sessions, keys, engines, ollama, store=store, now=later)
+    assert store.extended == [(ObjectRef(ledger.object_key, "v1"), date(2037, 12, 31))]
+    assert store.observed == [(DocumentState.received, date(2036, 12, 31))]
+    row = await reload(db, ledger)
+    assert (row.state, row.retention_until) == (DocumentState.filed, date(2037, 12, 31))
+
+
+async def test_implausible_date_never_extends_retention(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """A misread year (2031, in 2026) must not lock the original for years more: an object
+    lock can never be shortened. The arrival date stands in."""
+    ledger = await make_ledger(db, ready)
+    raw = {**RAW_01, "date": "2031-01-01"}
+    store = FakeStore()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}), store=store)
+    row = await reload(db, ledger)
+    assert (row.state, row.retention_until) == (DocumentState.needs_review, date(2036, 12, 31))
+    assert store.extended == []
+
+
+async def test_store_failure_keeps_the_ledger_and_the_retry_routes_the_stored_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """The object lock is extended before the ledger moves: if that fails nothing moves, and
+    the next run routes the row already extracted (no model call)."""
+    ledger = await make_ledger(db, ready, retention_until=date(2036, 6, 30))
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+        with pytest.raises(ConnectionError):
+            await run(ledger, sessions, keys, engines, ollama, store=_broken_store())
+        assert _patches(router) == []
+    row = await reload(db, ledger)
+    assert (row.state, row.retention_until) == (DocumentState.received, date(2036, 6, 30))
+    assert await actions(db, ready) == ["document.extracted"]
+    assert await fields_of(engines, ready, ledger.id) is not None
+    again = FakeOllama({})
+    store = FakeStore()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, again, store=store)
+    assert again.requests == []
+    assert store.extended == [(ObjectRef(ledger.object_key, "v1"), date(2036, 12, 31))]
+    row = await reload(db, ledger)
+    assert (row.state, row.retention_until) == (DocumentState.filed, date(2036, 12, 31))
+    assert await actions(db, ready) == ["document.extracted", "document.filed"]
+
+
+async def test_concurrent_routes_write_one_event(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    import asyncio
+
+    ledger = await make_ledger(db, ready, retention_until=date(2036, 6, 30))
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+        with pytest.raises(ConnectionError):
+            await run(ledger, sessions, keys, engines, ollama, store=_broken_store())
+    store = FakeStore()
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await asyncio.gather(
+            *(run(ledger, sessions, keys, engines, FakeOllama({}), store=store) for _ in range(4))
+        )
+        assert len(_patches(router)) == 1
+    assert await actions(db, ready) == ["document.extracted", "document.filed"]
+    assert len(store.extended) == 1
+    assert (await reload(db, ledger)).state is DocumentState.filed
 
 
 # Retries running out ----------------------------------------------------------------------
@@ -767,21 +1074,33 @@ async def test_exhausted_retries_record_extraction_failed(
         "extraction.ai_unavailable",
         sessions=sessions,
         index=engines,
+        store=FakeStore(),
         settings=SETTINGS,
         now=NOW,
     )
     row = await fields_of(engines, ready, ledger.id)
     # The code rides along in the flags, so a lost audit can be rebuilt from the row.
     assert row.flags == ("extraction_failed", "extraction.ai_unavailable")
-    (event,) = await events(db, ready)
-    assert event.action == "document.extraction_failed"
-    assert event.data == {"code": "extraction.ai_unavailable"}
+    failed, review = await events(db, ready)
+    assert failed.action == "document.extraction_failed"
+    assert failed.data == {"code": "extraction.ai_unavailable"}
+    assert review.action == "document.needs_review"
+    assert review.data == {
+        "min_confidence_pct": 0,
+        "flags": "extraction_failed,extraction.ai_unavailable",
+    }
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
     # Never twice, and never over a row an extraction wrote.
     await record_extraction_failed(
-        ledger.id, "extraction.ai_unavailable", sessions=sessions, index=engines,
-        settings=SETTINGS, now=NOW,
-    )  # fmt: skip
-    assert len(await events(db, ready)) == 1
+        ledger.id,
+        "extraction.ai_unavailable",
+        sessions=sessions,
+        index=engines,
+        store=FakeStore(),
+        settings=SETTINGS,
+        now=NOW,
+    )
+    assert len(await events(db, ready)) == 2
 
 
 async def test_record_failed_leaves_an_extracted_row_alone(
@@ -796,11 +1115,17 @@ async def test_record_failed_leaves_an_extracted_row_alone(
         mock_paperless(router)
         await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
     await record_extraction_failed(
-        ledger.id, "extraction.error", sessions=sessions, index=engines, settings=SETTINGS, now=NOW
+        ledger.id,
+        "extraction.error",
+        sessions=sessions,
+        index=engines,
+        store=FakeStore(),
+        settings=SETTINGS,
+        now=NOW,
     )
     row = await fields_of(engines, ready, ledger.id)
     assert row.flags == ()
-    assert [e.action for e in await events(db, ready)] == ["document.extracted"]
+    assert await actions(db, ready) == ["document.extracted", "document.filed"]
 
 
 async def test_record_failed_skips_a_row_of_another_workspace(
@@ -811,9 +1136,15 @@ async def test_record_failed_skips_a_row_of_another_workspace(
 ) -> None:
     ledger = await make_ledger(db, ready)
     await record_extraction_failed(
-        ledger.id, "extraction.error", sessions=sessions, index=engines, settings=SETTINGS,
-        now=NOW, workspace_id=uuid.uuid4(),
-    )  # fmt: skip
+        ledger.id,
+        "extraction.error",
+        sessions=sessions,
+        index=engines,
+        store=FakeStore(),
+        settings=SETTINGS,
+        now=NOW,
+        workspace_id=uuid.uuid4(),
+    )
     assert await fields_of(engines, ready, ledger.id) is None
     assert await events(db, ready) == []
 
@@ -857,10 +1188,15 @@ async def test_lost_extracted_audit_is_rebuilt_on_the_next_run(
         await run(ledger, sessions, keys, engines, again)
         await run(ledger, sessions, keys, engines, again)  # and only once
     assert again.requests == []
-    (event,) = await events(db, ready)
-    assert event.action == "document.extracted"
-    assert event.data == {"model": "qwen3:4b", "runs_agree_count": len(FIELD_NAMES)}
-    assert calls == ["document.extracted", "document.extracted"]
+    extracted, filed = await events(db, ready)
+    assert extracted.action == "document.extracted"
+    assert extracted.data == {
+        "model": "qwen3:4b",
+        "runs_agree_count": len(FIELD_NAMES),
+        "min_confidence_pct": 100,
+    }
+    assert filed.action == "document.filed"
+    assert calls == ["document.extracted", "document.extracted", "document.filed"]
 
 
 async def test_lost_failure_audit_is_rebuilt_on_the_next_run(
@@ -875,18 +1211,24 @@ async def test_lost_failure_audit_is_rebuilt_on_the_next_run(
 
     async def record() -> None:
         await record_extraction_failed(
-            ledger.id, "extraction.ai_unavailable", sessions=sessions, index=engines,
-            settings=SETTINGS, now=NOW,
-        )  # fmt: skip
+            ledger.id,
+            "extraction.ai_unavailable",
+            sessions=sessions,
+            index=engines,
+            store=FakeStore(),
+            settings=SETTINGS,
+            now=NOW,
+        )
 
     with pytest.raises(ConnectionError):
         await record()
     assert await events(db, ready) == []
     await record()
     await record()
-    (event,) = await events(db, ready)
-    assert event.action == "document.extraction_failed"
-    assert event.data == {"code": "extraction.ai_unavailable"}
+    failed, review = await events(db, ready)
+    assert failed.action == "document.extraction_failed"
+    assert failed.data == {"code": "extraction.ai_unavailable"}
+    assert review.action == "document.needs_review"
 
 
 async def test_lost_bad_output_audit_is_rebuilt_by_the_next_extraction(
@@ -904,9 +1246,10 @@ async def test_lost_bad_output_audit_is_rebuilt_by_the_next_extraction(
         with pytest.raises(ConnectionError):
             await run(ledger, sessions, keys, engines, FakeOllama({1: "x", 2: "y"}))
         await run(ledger, sessions, keys, engines, FakeOllama({}))
-    (event,) = await events(db, ready)
-    assert event.action == "document.extraction_failed"
-    assert event.data == {"code": "extraction.ai_bad_output"}
+    failed, review = await events(db, ready)
+    assert failed.action == "document.extraction_failed"
+    assert failed.data == {"code": "extraction.ai_bad_output"}
+    assert review.action == "document.needs_review"
 
 
 async def test_concurrent_reaudits_write_one_event(
@@ -921,12 +1264,17 @@ async def test_concurrent_reaudits_write_one_event(
 
     async def record() -> None:
         await record_extraction_failed(
-            ledger.id, "extraction.error", sessions=sessions, index=engines,
-            settings=SETTINGS, now=NOW,
-        )  # fmt: skip
+            ledger.id,
+            "extraction.error",
+            sessions=sessions,
+            index=engines,
+            store=FakeStore(),
+            settings=SETTINGS,
+            now=NOW,
+        )
 
     await asyncio.gather(*(record() for _ in range(4)))
-    assert len(await events(db, ready)) == 1
+    assert await actions(db, ready) == ["document.extraction_failed", "document.needs_review"]
 
 
 ARGS = {"ledger_id": "00000000-0000-0000-0000-000000000001", "workspace_id": None}
@@ -998,6 +1346,16 @@ def test_final_failure_records_extraction_failed_at_once(
     assert failed == [(ARGS["ledger_id"], "extraction.paperless_error")]
 
 
+def test_object_store_errors_are_transient_for_extraction() -> None:
+    """Filing extends the object lock: a store that is down is retried, not given up on."""
+    from botocore.exceptions import ClientError, EndpointConnectionError
+
+    denied = ClientError({"Error": {"Code": "SlowDown"}}, "PutObjectRetention")
+    assert tasks.is_extract_transient(denied)
+    assert tasks.is_extract_transient(EndpointConnectionError(endpoint_url="http://s3"))
+    assert not tasks.is_extract_transient(ValueError("retention can only be extended"))
+
+
 def test_extract_backoff_numbers() -> None:
     assert (tasks.EXTRACT_BACKOFF_FACTOR_S, tasks.EXTRACT_BACKOFF_MAX_S) == (30, 900)
     assert tasks.EXTRACT_MAX_RETRIES == 8
@@ -1033,7 +1391,7 @@ def test_beat_requeues_unextracted_every_ten_minutes() -> None:
 # The sweep --------------------------------------------------------------------------------
 
 
-async def test_requeue_unextracted_sends_old_received_consumed_rows_of_this_region(
+async def test_requeue_unextracted_sends_old_received_unrouted_rows_of_this_region(
     db: AsyncSession, sessions: async_sessionmaker[AsyncSession], ready: Workspace
 ) -> None:
     old = timedelta(minutes=30)
@@ -1041,7 +1399,11 @@ async def test_requeue_unextracted_sends_old_received_consumed_rows_of_this_regi
     await make_ledger(db, ready)  # just consumed: its own task is on the way
     await make_ledger(db, ready, age=old, state=DocumentState.needs_review)
     await make_ledger(db, ready, age=old, ingest_state=IngestState.queued)
-    await make_ledger(db, ready, age=old, ingest_state=IngestState.unsupported)
+    await make_ledger(db, ready, age=old, ingest_state=IngestState.failed)
+    # Unsupported: never extracted, but still to be routed to review.
+    unsupported = await make_ledger(
+        db, ready, age=old + timedelta(minutes=1), ingest_state=IngestState.unsupported
+    )
     foreign_org = Organisation(name="F", type=OrgType.business, country="FR", region="eu-fra")
     db.add(foreign_org)
     await db.flush()
@@ -1063,8 +1425,8 @@ async def test_requeue_unextracted_sends_old_received_consumed_rows_of_this_regi
         sent.append((ledger_id, workspace_id))
 
     count = await requeue_unextracted(sessions, enqueue, region="ma-cas", now=NOW)
-    assert count == 1
-    assert sent == [(due.id, ready.id)]
+    assert count == 2
+    assert sent == [(unsupported.id, ready.id), (due.id, ready.id)]
 
 
 async def test_requeue_unextracted_survives_a_failed_enqueue(

@@ -26,3 +26,9 @@ def region_local_date(now: datetime, region: str) -> date:
 def provisional_retain_until(arrival: date, country: str) -> date:
     """Retain until 31 December, `retention_years` after the year of arrival."""
     return date(arrival.year + retention_years(country), 12, 31)
+
+
+def fiscal_retain_until(doc_date: date, country: str) -> date:
+    """Retain until 31 December, `retention_years` after the fiscal (= calendar) year of the
+    document's date (design §5.4)."""
+    return date(doc_date.year + retention_years(country), 12, 31)

@@ -262,9 +262,12 @@ def extract_countdown(retries: int, rand: Callable[[], float] = random.random) -
 
 
 def is_extract_transient(exc: BaseException) -> bool:
-    """Ollama or Paperless down, slow or 5xx, the workspace paused, the database unreachable."""
+    """Ollama or Paperless down, slow or 5xx, the workspace paused, the database or the object
+    store (extending the lock at filing) unreachable."""
     if isinstance(exc, OllamaError):
         return isinstance(exc, OllamaUnavailable)
+    if isinstance(exc, ClientError | BotoCoreError):
+        return True
     return isinstance(exc, WorkspaceNotActive) or is_transient(exc)
 
 
@@ -300,6 +303,7 @@ async def _extract(ledger_id: str, workspace_id: str | None) -> None:
                 index=engines,
                 paperless=PaperlessClient,
                 ollama=ollama,
+                store=S3ObjectStore(StorageSettings()),
                 settings=settings,
                 now=utcnow(),
                 workspace_id=UUID(workspace_id) if workspace_id else None,
@@ -320,6 +324,7 @@ async def _extract_failed(ledger_id: str, workspace_id: str | None, code: str) -
             code,
             sessions=sessions,
             index=engines,
+            store=S3ObjectStore(StorageSettings()),
             settings=settings,
             now=utcnow(),
             workspace_id=UUID(workspace_id) if workspace_id else None,

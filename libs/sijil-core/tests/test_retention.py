@@ -51,3 +51,14 @@ def test_region_local_date_unknown_region_raises() -> None:
 def test_region_local_date_refuses_naive() -> None:
     with pytest.raises(ValueError):
         region_local_date(datetime(2026, 1, 1), "ma-cas")  # noqa: DTZ001
+
+
+def test_fiscal_retain_until_ma() -> None:
+    from sijil_core.retention import fiscal_retain_until
+
+    # Fiscal year = calendar year: kept to 31 December, ten years after the document's year.
+    assert fiscal_retain_until(date(2024, 3, 15), "MA") == date(2034, 12, 31)
+    assert fiscal_retain_until(date(2027, 1, 2), "MA") == date(2037, 12, 31)
+    assert fiscal_retain_until(date(2026, 12, 31), "MA") == date(2036, 12, 31)
+    with pytest.raises(KeyError):
+        fiscal_retain_until(date(2026, 1, 1), "XX")

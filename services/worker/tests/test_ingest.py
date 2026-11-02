@@ -1101,7 +1101,7 @@ async def test_failed_extract_enqueue_does_not_fail_ingest(
     assert (await reload(db, ledger)).ingest_state is IngestState.consumed
 
 
-async def test_unsupported_ingest_does_not_enqueue_extract(
+async def test_unsupported_ingest_enqueues_routing_once(
     db: AsyncSession,
     sessions: async_sessionmaker[AsyncSession],
     keys: LocalKeyService,
@@ -1122,4 +1122,8 @@ async def test_unsupported_ingest_does_not_enqueue_extract(
         )
         await run(ledger, sessions, keys, memory_store, enqueue_extract=enqueue)
     assert (await reload(db, ledger)).ingest_state is IngestState.unsupported
-    assert sent == []
+    # The extraction task routes it to review (no extraction: there is no Paperless document).
+    assert sent == [ledger.id]
+    with respx.mock(assert_all_called=False) as router:
+        await run(ledger, sessions, keys, memory_store, enqueue_extract=enqueue)
+    assert sent == [ledger.id]  # a redelivery of the settled row sends nothing again

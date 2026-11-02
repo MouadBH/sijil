@@ -313,6 +313,33 @@ async def test_seal_fields_idempotent_same_hash_different_refused(conn: AsyncCon
         await index.seal_fields(conn, uuid.uuid4(), fields_sha256=SHA, sealed_at=NOW)
 
 
+async def test_set_scores_replaces_confidence_and_flags_only(conn: AsyncConnection) -> None:
+    fields = row(number="F-1", total_ttc="120.00")
+    await index.write_extraction(conn, fields)
+    await index.set_scores(
+        conn, fields.ledger_id, {"number": 0.95, "total_ttc": 0.5}, ("possible_duplicate",)
+    )
+    stored = await index.read_fields(conn, fields.ledger_id)
+    assert stored is not None
+    assert stored.confidence == {"number": 0.95, "total_ttc": 0.5}
+    assert stored.flags == ("possible_duplicate",)
+    assert (stored.values, stored.signals, stored.updated_at) == (
+        fields.values,
+        fields.signals,
+        fields.updated_at,
+    )
+    with pytest.raises(LookupError):
+        await index.set_scores(conn, uuid.uuid4(), {}, ())
+
+
+async def test_set_scores_refused_once_sealed(conn: AsyncConnection) -> None:
+    fields = row(number="F-1")
+    await index.write_extraction(conn, fields)
+    await index.seal_fields(conn, fields.ledger_id, fields_sha256=SHA, sealed_at=NOW)
+    with pytest.raises(RetentionLocked):
+        await index.set_scores(conn, fields.ledger_id, {"number": 1.0}, ())
+
+
 async def test_find_possible_duplicates_matches_number_ice_ttc(conn: AsyncConnection) -> None:
     ice = f"{uuid.uuid4().int % 10**15:015d}"
     base = {"number": "F-77", "supplier_ice": ice, "total_ttc": "120.00"}

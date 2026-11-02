@@ -18,7 +18,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sijil_core import index as index_db
 from sijil_core.crypto import seal
 from sijil_core.db.base import utcnow
-from sijil_core.db.models import CredentialKind, IngestState, TenantCredential
+from sijil_core.db.models import CredentialKind, DocumentState, IngestState, TenantCredential
+from sijil_core.fields import FIELD_NAMES
 from sijil_core.filetypes import FileKind
 from sijil_core.index import IndexEngines
 from sijil_core.ollama import OllamaClient, OllamaError, OllamaUnavailable
@@ -79,6 +80,7 @@ async def test_extracts_sample_01_with_real_ollama(harness: Harness, index_url: 
                     index=engines,
                     paperless=PaperlessClient,
                     ollama=ollama,
+                    store=harness.store,
                     settings=settings,
                     now=utcnow(),
                 )
@@ -96,3 +98,10 @@ async def test_extracts_sample_01_with_real_ollama(harness: Harness, index_url: 
     print(f"EXTRACTION-VALUES {dict(fields.values)} flags={fields.flags}")
     assert fields.values["total_ttc"] == SAMPLE_01["ttc"] == "1500.00"
     assert fields.values["supplier_ice"] == SAMPLE_01["supplier_ice"] == "001905837000041"
+    # Scored from signals and routed: no longer `received`, retention never lowered.
+    print(f"EXTRACTION-CONFIDENCE {dict(fields.confidence)}")
+    assert set(fields.confidence) == set(FIELD_NAMES)
+    routed = await harness.reload(row)
+    assert routed.state in (DocumentState.filed, DocumentState.needs_review)
+    assert routed.retention_until >= row.retention_until
+    print(f"EXTRACTION-ROUTE {routed.state}")

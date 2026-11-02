@@ -562,8 +562,9 @@ async def ingest_document(
     """`will_retry(exc)` says whether the caller will run this again after `exc`, `retry_after_s`
     seconds from now (the Celery countdown, recorded so the requeue sweep agrees with it).
 
-    Once the row is `consumed` and committed, `enqueue_extract(ledger_id, workspace_id)` sends
-    the extraction. A failed send is logged only: the extraction sweep picks the row up.
+    Once the row is `consumed` (or `unsupported`, to be routed to review) and committed,
+    `enqueue_extract(ledger_id, workspace_id)` sends the extraction. A failed send is logged
+    only: the extraction sweep picks the row up.
 
     A row of another region is left exactly as it is (not claimed, not settled): it belongs to
     that region's worker.
@@ -585,9 +586,10 @@ async def ingest_document(
             doc_id = await _push(
                 job, ledger_id, client, sessions, store, poll_timeout_s, poll_interval_s
             )
-        consumed = await _settle(sessions, ledger_id, claim, doc_id=doc_id)
+        settled = await _settle(sessions, ledger_id, claim, doc_id=doc_id)
     except _Unsupported:
-        await _settle(sessions, ledger_id, claim, unsupported=True)
+        # Never extracted, but the extraction task routes it to review.
+        settled = await _settle(sessions, ledger_id, claim, unsupported=True)
     except Exception as exc:
         # Only a machine code is recorded; the exception carries no secrets by contract.
         code = error_code(exc)
@@ -604,13 +606,12 @@ async def ingest_document(
             corrupt_sha256=exc.observed_sha256 if isinstance(exc, OriginalCorrupt) else None,
         )
         raise
-    else:
-        # After the commit, never inside it: the extraction must find the row `consumed`.
-        if consumed and enqueue_extract is not None:
-            try:
-                await enqueue_extract(ledger_id, claim.workspace_id)
-            except Exception:
-                log.exception("enqueue of extraction failed for document %s", ledger_id)
+    # After the commit, never inside it: the extraction must find the row settled.
+    if settled and enqueue_extract is not None:
+        try:
+            await enqueue_extract(ledger_id, claim.workspace_id)
+        except Exception:
+            log.exception("enqueue of extraction failed for document %s", ledger_id)
 
 
 async def requeue_stuck_ingest(

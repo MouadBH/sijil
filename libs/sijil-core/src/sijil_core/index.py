@@ -285,6 +285,30 @@ async def update_fields(
     return _row(found)
 
 
+async def set_scores(
+    conn: AsyncConnection,
+    ledger_id: UUID,
+    confidence: Mapping[str, float],
+    flags: tuple[str, ...],
+) -> None:
+    """Replaces the row's confidence and flags (scoring at routing), nothing else. Raises
+    `RetentionLocked` once sealed and LookupError for an unknown row."""
+    try:
+        result = await conn.execute(
+            text(
+                "UPDATE document_fields SET confidence = CAST(:confidence AS jsonb), "
+                "flags = CAST(:flags AS text[]) WHERE ledger_id = :id RETURNING ledger_id"
+            ),
+            {"confidence": json.dumps(confidence), "flags": list(flags), "id": ledger_id},
+        )
+    except DBAPIError as exc:
+        if _locked(exc):
+            raise RetentionLocked from exc
+        raise
+    if result.first() is None:
+        raise LookupError("no fields for this document")
+
+
 async def seal_fields(
     conn: AsyncConnection, ledger_id: UUID, *, fields_sha256: str, sealed_at: datetime
 ) -> FieldsRow:
