@@ -47,8 +47,10 @@ from sijil_core.storage import ObjectRef
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.extract import (
+    INGEST_DEFER_WINDOW,
     PROMPT_A,
     PROMPT_B,
+    IngestInProgress,
     RawExtraction,
     extract_document,
     extraction_schema,
@@ -799,6 +801,62 @@ async def test_extract_noop_unless_workspace_active(
     assert await fields_of(engines, ready, ledger.id) is None
     assert await events(db, ready) == []
     assert (await reload(db, ledger)).state is DocumentState.received
+
+
+@pytest.mark.parametrize("ingest_state", [IngestState.queued, IngestState.sending])
+async def test_extraction_waits_while_the_workspace_is_still_ingesting(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    ingest_state: IngestState,
+) -> None:
+    """OCR first: while another document of the same workspace that just arrived is still
+    being ingested, the model is not started (the task retries later, not as a failure)."""
+    ledger = await make_ledger(db, ready)
+    await make_ledger(db, ready, ingest_state=ingest_state, age=timedelta(minutes=2))
+    ollama = FakeOllama({})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        with pytest.raises(IngestInProgress):
+            await run(ledger, sessions, keys, engines, ollama)
+    assert ollama.requests == []
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await events(db, ready) == []
+
+
+async def test_old_stuck_ingest_does_not_hold_extraction_back(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    org: Organisation,
+) -> None:
+    """A row queued for longer than the window (a delayed ingest), or one of another
+    workspace, never holds this workspace's extraction back."""
+    ledger = await make_ledger(db, ready)
+    await make_ledger(
+        db, ready, ingest_state=IngestState.queued, age=INGEST_DEFER_WINDOW + timedelta(1)
+    )
+    slug = f"other-{uuid.uuid4().hex[:8]}"
+    other = Workspace(
+        org_id=org.id,
+        name="Other",
+        slug=slug,
+        state=WorkspaceState.active,
+        db_name=f"paperless_{slug}",
+        index_db_name=f"index_{slug}",
+        kms_key_id=f"kek-{slug}",
+    )
+    db.add(other)
+    await db.commit()
+    await make_ledger(db, other, ingest_state=IngestState.queued)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert (await reload(db, ledger)).state is DocumentState.filed
 
 
 async def test_already_extracted_is_noop(

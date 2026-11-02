@@ -102,8 +102,16 @@ _RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
 REQUEUE_AFTER: Final = timedelta(minutes=15)
 REQUEUE_BATCH: Final = 50  # sends per sweep run
 REQUEUE_SCAN: Final = 500  # rows looked at per sweep run (in-flight ones are skipped)
+# OCR first: the model waits while another document of the workspace that arrived within this
+# window is still being ingested (older queued rows are delayed ingests and never hold it).
+INGEST_DEFER_WINDOW: Final = timedelta(minutes=30)
 # Serialises the write of one document's row across concurrent runs (index database).
 _WRITE_LOCK_SQL: Final = "SELECT pg_advisory_xact_lock(hashtextextended(CAST(:id AS text), 7))"
+
+
+class IngestInProgress(Exception):  # noqa: N818 - a state, not an error
+    """Another document of the workspace is still being ingested: extract later (OCR and the
+    model share the host, and the model would slow the tenant's OCR down)."""
 
 
 class RetentionStore(Protocol):
@@ -633,6 +641,25 @@ async def _name_in_paperless(
         )
 
 
+async def _ingest_in_progress(
+    sessions: async_sessionmaker[AsyncSession], workspace_id: UUID, ledger_id: UUID, now: datetime
+) -> bool:
+    """Whether another document of the workspace, arrived within INGEST_DEFER_WINDOW, is still
+    queued or being sent to Paperless."""
+    async with sessions() as session:
+        found = await session.scalar(
+            select(DocumentLedger.id)
+            .where(
+                DocumentLedger.workspace_id == workspace_id,
+                DocumentLedger.id != ledger_id,
+                DocumentLedger.ingest_state.in_((IngestState.queued, IngestState.sending)),
+                DocumentLedger.ingested_at >= now - INGEST_DEFER_WINDOW,
+            )
+            .limit(1)
+        )
+    return found is not None
+
+
 async def extract_document(
     ledger_id: UUID,
     *,
@@ -657,6 +684,8 @@ async def extract_document(
         # 1. Obtain the row: the stored one (a redelivery, or a run whose audit or routing
         #    was lost), or a fresh extraction.
         stored = await _stored_row(index, job.workspace, ledger_id)
+        if stored is None and await _ingest_in_progress(sessions, job.workspace.id, ledger_id, now):
+            raise IngestInProgress
         row = stored or await _extract(
             job,
             index=index,

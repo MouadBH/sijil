@@ -33,6 +33,7 @@ from sijil_worker.drift import (
     record_check_failed,
 )
 from sijil_worker.extract import (
+    IngestInProgress,
     extract_document,
     record_extraction_failed,
     requeue_unextracted,
@@ -285,6 +286,8 @@ def requeue_stuck_ingest_task() -> int:
 EXTRACT_MAX_RETRIES = 8
 # A retry's pending key lives for its countdown plus this, so it outlasts the wait.
 PENDING_MARGIN_S = 900
+# While the workspace is still ingesting, extraction is sent again this much later.
+INGEST_DEFER_S = 30
 EXTRACT_BACKOFF_FACTOR_S = 30
 EXTRACT_BACKOFF_MAX_S = 900
 
@@ -405,6 +408,14 @@ def extract_document_task(
 
     try:
         asyncio.run(_extract(ledger_id, workspace_id))
+    except IngestInProgress:
+        # OCR first. The deferred message is still this document's one in flight: keep the key.
+        async def keep(pending: PendingExtractions) -> None:
+            await pending.refresh(lid, INGEST_DEFER_S + PENDING_MARGIN_S)
+
+        _pending_quietly(keep)
+        _defer_extract(ledger_id, workspace_id, INGEST_DEFER_S)
+        return
     except Exception as exc:
         if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
             countdown = extract_countdown(retries)
@@ -424,6 +435,18 @@ def extract_document_task(
         _pending_quietly(clear)
         raise
     _pending_quietly(clear)  # routed, or nothing to do
+
+
+def _defer_extract(ledger_id: str, workspace_id: str | None, countdown: int) -> None:
+    """The same extraction as a fresh message `countdown` s later: a deferral is not a retry,
+    so it never spends the retry budget."""
+    name, queue = EXTRACT_TASK
+    current_app.send_task(
+        name,
+        kwargs={"ledger_id": ledger_id, "workspace_id": workspace_id},
+        queue=queue,
+        countdown=countdown,
+    )
 
 
 async def _requeue_extract() -> int:

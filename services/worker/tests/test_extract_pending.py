@@ -232,6 +232,33 @@ def test_task_leaves_the_key_to_expire_when_recording_the_failure_fails(
     assert eager.calls == []
 
 
+def test_task_defers_while_ingest_runs_without_counting_a_retry(
+    eager: FakePending, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ingest still running in the workspace: the same message is sent again later (a fresh
+    one, so it never spends the retry budget), the key is kept, and nothing is recorded."""
+    from sijil_worker.extract import IngestInProgress
+
+    async def busy(ledger_id: str, workspace_id: str | None) -> None:
+        raise IngestInProgress
+
+    deferred: list[tuple[str, str | None, int]] = []
+
+    def defer(ledger_id: str, workspace_id: str | None, countdown: int) -> None:
+        deferred.append((ledger_id, workspace_id, countdown))
+
+    async def must_not_record(ledger_id: str, workspace_id: str | None, code: str) -> None:
+        raise AssertionError("a deferral is not a failure")
+
+    monkeypatch.setattr(tasks, "_extract", busy)
+    monkeypatch.setattr(tasks, "_defer_extract", defer)
+    monkeypatch.setattr(tasks, "_extract_failed", must_not_record)
+    result = tasks.extract_document_task.apply(kwargs={"ledger_id": LID, "workspace_id": None})
+    assert result.successful()
+    assert deferred == [(LID, None, tasks.INGEST_DEFER_S)]
+    assert eager.calls == [("refresh", LID, tasks.INGEST_DEFER_S + tasks.PENDING_MARGIN_S)]
+
+
 def test_task_keeps_and_refreshes_the_key_on_retry(
     eager: FakePending, monkeypatch: pytest.MonkeyPatch
 ) -> None:
