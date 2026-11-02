@@ -7,6 +7,7 @@ Everything in this folder is **fictitious sample data** for development and test
 | `suppliers.json` | 8 fictitious Moroccan suppliers: French and Arabic names, 15-digit ICE, city, VAT rate (20/14/10/7 %) |
 | `invoices/manifest.json` | Ground truth for 12 invoices (6 French, 6 Arabic): number, date, HT, TVA, TTC in MAD |
 | `invoices/*.pdf` | The rendered invoices, produced by `generate.py` |
+| `invoices/scan-02-ar.png` | **SAMPLE** scan for the OCR path: page 1 of `sample-02-ar.pdf` rasterised at 200 dpi (greyscale, no text layer) by `generate.py` with `pypdfium2` |
 | `fonts/` | Noto Naskh Arabic (SIL Open Font License 1.1, see `OFL.txt`) |
 
 Cases the set deliberately includes, for extraction and review tests:

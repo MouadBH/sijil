@@ -57,3 +57,12 @@ def test_pdf_exists_and_is_marked_sample(inv: dict[str, str]) -> None:
     assert pdf.exists()
     text = "".join(page.extract_text() or "" for page in PdfReader(pdf).pages)
     assert "SAMPLE" in text
+
+
+def test_scan_is_a_200_dpi_raster_of_sample_02() -> None:
+    from PIL import Image
+
+    with Image.open(ROOT / "invoices" / "scan-02-ar.png") as image:
+        # A4 at 200 dpi.
+        assert image.size == (1654, 2339)
+        assert round(image.info["dpi"][0]) == 200
