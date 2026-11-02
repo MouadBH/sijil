@@ -3,7 +3,7 @@
 
 `extract_document` runs only for a ledger row that is `received` with `ingest_state =
 consumed` (or `unsupported`, which is only routed: see below), only in an `active` workspace
-(a hibernated or closing one is a no-op), and only in this worker's region. It:
+(any other state, e.g. hibernated or closing, is a no-op), and only in this worker's region. It:
 1. reads the text Paperless extracted (never the PDF's own text layer, ruling P4), normalises
    it and keeps the first 12,000 characters; empty text is flagged `no_text`;
 2. asks Ollama twice (run A: PROMPT_A, seed 1; run B: PROMPT_B, seed 2) for the fields, as a
@@ -292,8 +292,8 @@ async def _load(
             return None
         if ledger.state is not DocumentState.received:
             return None
-        # Only an active workspace extracts: a hibernated or closing one is left alone (and
-        # the sweep skips it), so it never holds the one model in flight.
+        # Only an active workspace extracts: any other (hibernated, closing, ...) is left
+        # alone (and the sweep skips it), so it never holds the one model in flight.
         if workspace.state is not WorkspaceState.active:
             log.info(
                 "extraction of document %s skipped: workspace is %s", ledger_id, workspace.state

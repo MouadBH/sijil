@@ -98,10 +98,9 @@ async def test_a_repetition_abort_is_bad_output_not_unavailable() -> None:
     assert not isinstance(exc.value, OllamaUnavailable)
 
 
-async def test_a_runaway_answer_is_cut_and_is_bad_output() -> None:
-    """A run that never closes its JSON (seen live: one run generating for 5 min) is cut at
-    `num_predict` tokens; the truncated answer is bad output (the other run is used), never a
-    request that holds the one model until the timeout."""
+async def test_a_truncated_answer_is_bad_output() -> None:
+    """What a run cut at `num_predict` returns (unclosed JSON, `done_reason: length`) is bad
+    output, so the other run is used. The cap itself is pinned by the request-shape test."""
 
     def handler(_r: httpx.Request) -> httpx.Response:
         body = {"message": {"role": "assistant", "content": '{"number": "F-1",   '}}
