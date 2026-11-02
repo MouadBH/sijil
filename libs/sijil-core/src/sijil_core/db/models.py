@@ -269,12 +269,20 @@ class DocumentLedger(Base):
     """One row per archived original. Holds no content: no filename, subject or sender.
 
     Immutable columns, retention monotonicity and the ban on DELETE are enforced by the
-    document_ledger_immutable trigger (retention layer 3).
+    document_ledger_immutable trigger (retention layer 3); once sealed, `fields_sha256`, `state`
+    and `retention_until` are frozen too (0008).
     """
 
     __tablename__ = "document_ledger"
     __table_args__ = (
         UniqueConstraint("workspace_id", "sha256", name="uq_document_ledger_workspace_sha256"),
+        # 0008: sealed iff sealed_at iff fields_sha256; sealed_by only once sealed.
+        CheckConstraint(
+            "(state = 'sealed') = (sealed_at IS NOT NULL) "
+            "AND (sealed_at IS NULL) = (fields_sha256 IS NULL) "
+            "AND (sealed_by IS NULL OR sealed_at IS NOT NULL)",
+            name="seal_consistent",
+        ),
         Index("ix_document_ledger_workspace_ingested", "workspace_id", text("ingested_at DESC")),
         Index(
             "ix_document_ledger_ingest_pending",

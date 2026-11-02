@@ -1,7 +1,11 @@
+import os
 import re
+import subprocess
+import sys
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,6 +30,7 @@ from sijil_core.db.models import (
 pytestmark = pytest.mark.db
 
 MakeActor = Callable[[str], Awaitable[Any]]
+CP_DIR = Path(__file__).parents[1]
 SHA = "a" * 64
 IMMUTABLE_UPDATES = {
     "id": "gen_random_uuid()",
@@ -125,10 +130,8 @@ async def test_seal_fields_set_once_then_frozen(
     row = ledger(workspace.id)
     db.add(row)
     await db.commit()
-    # NULL -> value: sealing is allowed, once.
-    await owner_conn.execute(
-        text("UPDATE document_ledger SET sealed_at = now(), sealed_by = :u"), {"u": user.id}
-    )
+    # NULL -> value: sealing is allowed, once (0008: with the state and the hash, together).
+    await owner_conn.execute(text(SEAL_SQL), {"u": user.id})
     other = User(email=f"{uuid.uuid4().hex[:8]}@example.com", name="Other", password_hash="x")
     db.add(other)
     await db.commit()
@@ -145,6 +148,130 @@ async def test_seal_fields_set_once_then_frozen(
             )
     # Re-writing the same values (an ORM flush of an unchanged row) is not a change.
     await owner_conn.execute(text("UPDATE document_ledger SET sealed_at = sealed_at"))
+
+
+SEAL_SQL = (
+    "UPDATE document_ledger SET state = 'sealed', fields_sha256 = repeat('f', 64), "
+    "sealed_at = now(), sealed_by = :u, retention_until = '2037-12-31'"
+)
+SEALED_FROZEN = {
+    "fields_sha256 = repeat('e', 64)": "another hash",
+    "fields_sha256 = NULL": "the hash cleared",
+    "state = 'filed'": "back to filed",
+    "state = 'removed'": "removed after seal",
+    "retention_until = '2040-12-31'": "retention raised after seal",
+    "retention_until = '2030-12-31'": "retention lowered after seal",
+}
+
+
+@pytest.mark.parametrize("assignment", sorted(SEALED_FROZEN))
+async def test_sealed_row_hash_state_and_retention_frozen(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User, assignment: str
+) -> None:
+    """0008: once sealed, `fields_sha256`, `state` and `retention_until` never change, even for
+    the table owner."""
+    db.add(ledger(workspace.id))
+    await db.commit()
+    await owner_conn.execute(text(SEAL_SQL), {"u": user.id})
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await owner_conn.execute(text(f"UPDATE document_ledger SET {assignment}"))  # noqa: S608
+    # The app role is refused the same way.
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await db.execute(text(f"UPDATE document_ledger SET {assignment}"))  # noqa: S608
+    await db.rollback()
+
+
+async def test_unsealed_row_hash_is_set_once(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User
+) -> None:
+    """`fields_sha256` goes NULL -> value once, at seal; an unsealed row keeps its mutable
+    columns (state, retention upwards)."""
+    db.add(ledger(workspace.id))
+    await db.commit()
+    await owner_conn.execute(
+        text("UPDATE document_ledger SET state = 'needs_review', retention_until = '2037-12-31'")
+    )
+    await owner_conn.execute(text(SEAL_SQL), {"u": user.id})
+    sealed = (
+        await owner_conn.execute(
+            text("SELECT state, fields_sha256, sealed_by, retention_until FROM document_ledger")
+        )
+    ).one()
+    assert tuple(sealed) == ("sealed", "f" * 64, user.id, date(2037, 12, 31))
+
+
+SEAL_INCONSISTENT = {
+    "state = 'sealed'": "sealed state without sealed_at",
+    "sealed_at = now()": "sealed_at without the state or the hash",
+    "sealed_at = now(), state = 'sealed'": "sealed without a hash",
+    "fields_sha256 = repeat('f', 64)": "a hash on an unsealed row",
+    "sealed_by = :u": "sealed_by without sealed_at",
+    "state = 'sealed', fields_sha256 = repeat('f', 64)": "sealed state and hash, no sealed_at",
+}
+
+
+@pytest.mark.parametrize("assignment", sorted(SEAL_INCONSISTENT))
+async def test_seal_columns_consistent(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User, assignment: str
+) -> None:
+    """CHECK ck_document_ledger_seal_consistent: state sealed iff sealed_at iff fields_sha256,
+    and sealed_by only on a sealed row."""
+    db.add(ledger(workspace.id))
+    await db.commit()
+    with pytest.raises(IntegrityError, match="ck_document_ledger_seal_consistent"):
+        await owner_conn.execute(
+            text(f"UPDATE document_ledger SET {assignment}"),  # noqa: S608
+            {"u": user.id} if ":u" in assignment else {},
+        )
+
+
+async def test_seal_consistency_check_on_insert(db: AsyncSession, workspace: Workspace) -> None:
+    db.add(ledger(workspace.id, state=DocumentState.sealed))
+    with pytest.raises(IntegrityError, match="ck_document_ledger_seal_consistent"):
+        await db.commit()
+    await db.rollback()
+
+
+async def test_0008_upgrade_keeps_existing_unsealed_rows(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, migrated_db: Any
+) -> None:
+    """Rows written before 0008 (unsealed, no hash) pass its CHECK: downgrade to 0007 with rows
+    of every unsealed state present, then upgrade again."""
+    for n, state in enumerate(
+        (DocumentState.received, DocumentState.needs_review, DocumentState.filed), start=1
+    ):
+        db.add(ledger(workspace.id, sha=f"{n:064x}", state=state))
+    await db.commit()
+    await db.close()
+    _alembic(migrated_db.owner_url, "downgrade", "0007")
+    try:
+        names = await _constraint_names(owner_conn)
+        assert "ck_document_ledger_seal_consistent" not in names
+    finally:
+        _alembic(migrated_db.owner_url, "upgrade", "head")
+    assert "ck_document_ledger_seal_consistent" in await _constraint_names(owner_conn)
+
+
+async def _constraint_names(conn: AsyncConnection) -> set[str]:
+    rows = await conn.execute(
+        text("SELECT conname FROM pg_constraint WHERE conrelid = 'document_ledger'::regclass")
+    )
+    return {r[0] for r in rows}
+
+
+def _alembic(owner_url: str, *args: str) -> None:
+    subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "alembic", *args],
+        cwd=CP_DIR,
+        env={
+            **os.environ,
+            "SIJIL_MIGRATION_DATABASE_URL": owner_url,
+            "SIJIL_REGION": "ma-cas",
+            "SIJIL_ENVIRONMENT": "test",
+            "SIJIL_APP_DB_ROLE": "sijil_test_app",
+        },
+        check=True,
+    )
 
 
 async def test_ledger_unique_per_workspace_sha(db: AsyncSession, workspace: Workspace) -> None:
