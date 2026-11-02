@@ -85,6 +85,19 @@ async def test_num_thread_is_sent_when_set() -> None:
     assert json.loads(seen[0].content)["options"]["num_thread"] == 6
 
 
+async def test_a_repetition_abort_is_bad_output_not_unavailable() -> None:
+    """Ollama aborts a degenerate run with HTTP 500 (seen live on a SAMPLE invoice, every time:
+    temperature 0 and a fixed seed). Retrying it cannot help: it is that run's bad output."""
+
+    def handler(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "prediction aborted, token repeat limit reached"})
+
+    async with client(handler) as ai:
+        with pytest.raises(OllamaBadOutput) as exc:
+            await ai.chat_json("m", "s", "u", SCHEMA, seed=2)
+    assert not isinstance(exc.value, OllamaUnavailable)
+
+
 async def test_a_runaway_answer_is_cut_and_is_bad_output() -> None:
     """A run that never closes its JSON (seen live: one run generating for 5 min) is cut at
     `num_predict` tokens; the truncated answer is bad output (the other run is used), never a

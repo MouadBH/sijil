@@ -70,6 +70,21 @@ def _host_allowed(base_url: str, allowed_hosts: Collection[str]) -> bool:
     return url.host.lower() in {h.strip().lower() for h in allowed_hosts}
 
 
+# What Ollama 0.40 answers (HTTP 500) when it aborts a degenerate run (the same token over and
+# over). Deterministic at temperature 0 with a fixed seed: that run's bad output, not a server
+# that is down, so it is never retried.
+_REPEAT_ABORT_MARKER: Final = "token repeat limit"
+
+
+def _error_text(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return error.lower() if isinstance(error, str) else ""
+
+
 def _load_failed(response: httpx.Response) -> bool:
     try:
         body = response.json()
@@ -132,6 +147,8 @@ class OllamaClient:
         except httpx.HTTPError as exc:
             raise OllamaUnavailable(f"ai.unavailable: {type(exc).__name__}") from None
         status = response.status_code
+        if status >= 500 and _REPEAT_ABORT_MARKER in _error_text(response):
+            raise OllamaBadOutput("ai.bad_output: repetition aborted")
         if status >= 500:
             raise OllamaUnavailable(
                 f"ai.unavailable: HTTP {status}", status, model_load_failed=_load_failed(response)
