@@ -382,6 +382,8 @@ Branch `m2-capture`. Covers **CAP-1, CAP-2, CAP-4, ARC-4**.
 
 Branch `m3-recognition`. Covers **REC-1, REC-2, REC-3, REC-4**.
 
+**Status: done** (tasks 3.1–3.7; `test_m3_acceptance`, run by `make acceptance`). Amended by the product owner: the COMPLIANCE lock is applied by the separate `worker-seal` after the control plane commits the seal, and extraction runs on its own `worker-extraction`.
+
 | Task | Deliverable | Acceptance tests |
 | --- | --- | --- |
 | 3.1 OCR config | Tenant env: `ara+fra+eng`, PDF/A output; content read back via the client | `test_arabic_fixture_text_extracted` (integration: Arabic supplier name appears in the content) |
