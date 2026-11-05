@@ -11,6 +11,11 @@ code and re-raises, so the caller can retry. When the caller's retries run out:
 - any other cause makes the row `failed`, audited as `document.ingest_failed`.
 `consumed`, `unsupported` and `failed` are final: a redelivery of the task is a no-op.
 
+A document its Owner removed while it was being ingested (ledger `removed`, frozen by 0011) is
+not claimed, and a run that holds it stops before each step that would write to Paperless or to
+the row (the upload, the task id, the outcome). A stop is not a failure: nothing is retried,
+audited or sent to extraction; the purge after the removal deletes whatever Paperless consumed.
+
 Paperless 3.4.1 does not refuse duplicates (it only flags them), so before uploading, ingest
 looks the file's SHA-256 up in Paperless and adopts the existing document. That makes a retry
 after a lost response, or the same bytes arriving by two routes, harmless.
@@ -39,6 +44,7 @@ from sijil_core import audit
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     CredentialKind,
     DocumentLedger,
@@ -114,6 +120,10 @@ class OriginalCorrupt(Exception):  # noqa: N818
     def __init__(self, observed_sha256: str) -> None:
         super().__init__("original does not match its SHA-256")
         self.observed_sha256 = observed_sha256
+
+
+class DocumentRemoved(Exception):  # noqa: N818 - a state, not an error
+    """The row went terminal (its Owner removed it) during the run: stop, touch nothing."""
 
 
 class ConsumeFailed(Exception):  # noqa: N818
@@ -221,6 +231,8 @@ async def _claim(
                 update(DocumentLedger)
                 .where(
                     *scope,
+                    # A removed row is frozen: never claimed (see the module docstring).
+                    DocumentLedger.state.not_in(TERMINAL_STATES),
                     or_(
                         DocumentLedger.ingest_state == IngestState.queued,
                         and_(
@@ -327,11 +339,22 @@ async def _await_task(
         await asyncio.sleep(interval_s)
 
 
+async def _removed(sessions: async_sessionmaker[AsyncSession], ledger_id: UUID) -> bool:
+    """Whether the row went terminal (its Owner removed it)."""
+    async with sessions() as session:
+        state = await session.scalar(
+            select(DocumentLedger.state).where(DocumentLedger.id == ledger_id)
+        )
+    return state in TERMINAL_STATES
+
+
 async def _set_task_id(
     sessions: async_sessionmaker[AsyncSession], ledger_id: UUID, claim: _Claim, task_id: str | None
 ) -> None:
     async with sessions() as session:
         ledger = await session.get(DocumentLedger, ledger_id, with_for_update=True)
+        if ledger is not None and ledger.state in TERMINAL_STATES:
+            raise DocumentRemoved
         if ledger is not None and ledger.ingest_claimed_at == claim.claimed_at:
             ledger.paperless_task_id = task_id
             await session.commit()
@@ -395,6 +418,9 @@ async def _push(
         if resumed is not None:
             return resumed
         await _set_task_id(sessions, ledger_id, claim, None)  # unknown or failed: start over
+    # The one step that writes to Paperless: never for a document removed meanwhile.
+    if await _removed(sessions, ledger_id):
+        raise DocumentRemoved
     content = await _read_original(store, claim.ref)
     # Never hand Paperless (or lock in as "the document") bytes that are not the original.
     observed = hashlib.sha256(content).hexdigest()
@@ -438,6 +464,7 @@ async def _settle(
         ledger = await session.get(DocumentLedger, ledger_id, with_for_update=True)
         if (
             ledger is None
+            or ledger.state in TERMINAL_STATES  # removed meanwhile: frozen, a stop
             or ledger.ingest_state is not IngestState.sending
             or ledger.ingest_claimed_at != claim.claimed_at
         ):
@@ -590,7 +617,15 @@ async def ingest_document(
     except _Unsupported:
         # Never extracted, but the extraction task routes it to review.
         settled = await _settle(sessions, ledger_id, claim, unsupported=True)
+    except DocumentRemoved:
+        log.info("ingest of document %s stopped: removed", ledger_id)
+        return
     except Exception as exc:
+        # Whatever failed (a `ledger.immutable` included), a removed row is a stop: no retry,
+        # no `ingest_failed`.
+        if await _removed(sessions, ledger_id):
+            log.info("ingest of document %s stopped: removed", ledger_id)
+            return
         # Only a machine code is recorded; the exception carries no secrets by contract.
         code = error_code(exc)
         log.error("ingest of document %s failed: %s", ledger_id, code)
@@ -642,6 +677,8 @@ async def requeue_stuck_ingest(
                 .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(
                     Organisation.region == region,
+                    # A removed row stays queued or sending for ever: nothing to send.
+                    DocumentLedger.state.not_in(TERMINAL_STATES),
                     or_(
                         and_(
                             DocumentLedger.ingest_state == IngestState.queued,

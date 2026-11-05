@@ -23,10 +23,12 @@ from sijil_core.db.models import (
     CredentialKind,
     DocumentLedger,
     DocumentSource,
+    DocumentState,
     IngestState,
     IntegrityAlert,
     Organisation,
     TenantCredential,
+    User,
     Workspace,
     WorkspaceState,
 )
@@ -1127,3 +1129,162 @@ async def test_unsupported_ingest_enqueues_routing_once(
     with respx.mock(assert_all_called=False) as router:
         await run(ledger, sessions, keys, memory_store, enqueue_extract=enqueue)
     assert sent == [ledger.id]  # a redelivery of the settled row sends nothing again
+
+
+# A document removed by its Owner while it is still being ingested ---------------------------
+# A `removed` row is frozen (0011): ingest stops before each step that would write to Paperless
+# or to the row. A stop is not a failure: no retry, no `ingest_failed` audit, no extraction.
+
+REMOVAL_REASON = "Déposé par erreur pendant l'envoi (SAMPLE)"
+
+
+async def _remove(sessions: async_sessionmaker[AsyncSession], ledger_id: uuid.UUID) -> None:
+    """What the Owner's removal commits."""
+    async with sessions() as session:
+        ledger = await session.get(DocumentLedger, ledger_id, with_for_update=True)
+        assert ledger is not None
+        user = User(email=f"{uuid.uuid4().hex[:8]}@example.com", name="O", password_hash="x")
+        session.add(user)
+        await session.flush()
+        ledger.state = DocumentState.removed
+        ledger.removed_at = utcnow()
+        ledger.removed_by = user.id
+        ledger.removal_reason = REMOVAL_REASON
+        await session.commit()
+
+
+class _Extractions:
+    def __init__(self) -> None:
+        self.sent: list[uuid.UUID] = []
+
+    async def __call__(self, ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        self.sent.append(ledger_id)
+
+
+async def _ingest_actions(db: AsyncSession, workspace: Workspace) -> list[str]:
+    return [e.action for e in await events(db, workspace) if e.action.startswith("document.ingest")]
+
+
+async def test_ingest_stops_on_removed(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    """Removed before the run: it never claims the row and never calls Paperless."""
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    await _remove(sessions, ledger.id)
+    extractions = _Extractions()
+    with respx.mock(assert_all_called=False) as router:
+        await run(ledger, sessions, keys, memory_store, will_retry=True,
+                  enqueue_extract=extractions)  # fmt: skip
+        assert router.calls.call_count == 0
+    row = await reload(db, ledger)
+    assert (row.state, row.ingest_state, row.ingest_attempts) == (
+        DocumentState.removed, IngestState.queued, 0
+    )  # fmt: skip
+    assert await _ingest_actions(db, ready) == []
+    assert extractions.sent == []
+
+
+class _RemovedWhile(PaperlessClient):
+    """A Paperless client that lets the Owner remove the row at one point of the run."""
+
+    sessions: async_sessionmaker[AsyncSession]
+    ledger_id: uuid.UUID
+    at: str
+    then: Exception | None = None
+
+    async def _maybe(self, step: str) -> None:
+        if step == self.at:
+            await _remove(self.sessions, self.ledger_id)
+            if self.then is not None:
+                raise self.then
+
+    async def find_document_by_checksum(self, sha256: str) -> int | None:
+        await self._maybe("lookup")
+        return await super().find_document_by_checksum(sha256)
+
+    async def task(self, task_id: str) -> Any:
+        found = await super().task(task_id)
+        await self._maybe("poll")
+        return found
+
+
+def _removing(
+    sessions: async_sessionmaker[AsyncSession],
+    ledger_id: uuid.UUID,
+    at: str,
+    then: Exception | None = None,
+) -> Callable[..., PaperlessClient]:
+    def make(base_url: str, **kw: Any) -> PaperlessClient:
+        client = _RemovedWhile(base_url, **kw)
+        client.sessions, client.ledger_id, client.at, client.then = sessions, ledger_id, at, then
+        return client
+
+    return make
+
+
+@pytest.mark.parametrize(
+    ("at", "then", "uploads"),
+    [
+        ("lookup", None, 0),  # before the upload: nothing is sent to Paperless
+        ("lookup", PaperlessUnavailable("down"), 0),  # and a transient error then: no retry
+        ("poll", None, 1),  # after the upload: the result is never written to the row
+    ],
+)
+async def test_ingest_stops_when_removed_mid_run(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    at: str,
+    then: Exception | None,
+    uploads: int,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    extractions = _Extractions()
+    with respx.mock(assert_all_called=False) as router:
+        upload, _ = mock_flow(router)
+        # Returns, never raises: a stop is not something to retry.
+        await ingest_document(
+            ledger.id,
+            sessions=sessions,
+            keys=keys,
+            store=memory_store,
+            paperless=_removing(sessions, ledger.id, at, then),
+            poll_timeout_s=5,
+            poll_interval_s=0,
+            settings=SETTINGS,
+            will_retry=lambda _exc: True,
+            enqueue_extract=extractions,
+        )
+        assert upload.call_count == uploads
+    row = await reload(db, ledger)
+    assert row.state is DocumentState.removed
+    assert row.paperless_doc_id is None
+    assert await _ingest_actions(db, ready) == []
+    assert extractions.sent == []
+
+
+async def test_requeue_skips_removed_rows(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+) -> None:
+    """A removed row stays `queued` for ever (it is frozen): the sweep must not re-send it."""
+    ledger = await make_ledger(db, memory_store, ready, tmp_path, age=timedelta(hours=1))
+    await _remove(sessions, ledger.id)
+    sent: list[uuid.UUID] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append(ledger_id)
+
+    assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas") == 0
+    assert sent == []
