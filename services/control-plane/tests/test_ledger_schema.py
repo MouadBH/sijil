@@ -202,7 +202,6 @@ async def test_unsealed_row_hash_is_set_once(
 
 SEAL_INCONSISTENT = {
     "state = 'sealed'": "sealed state without sealed_at",
-    "sealed_at = now()": "sealed_at without the state or the hash",
     "sealed_at = now(), state = 'sealed'": "sealed without a hash",
     "fields_sha256 = repeat('f', 64)": "a hash on an unsealed row",
     "sealed_by = :u": "sealed_by without sealed_at",
@@ -223,6 +222,17 @@ async def test_seal_columns_consistent(
             text(f"UPDATE document_ledger SET {assignment}"),  # noqa: S608
             {"u": user.id} if ":u" in assignment else {},
         )
+
+
+async def test_sealed_at_without_the_sealed_state_refused_by_trigger(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace
+) -> None:
+    """0011: `sealed_at` is written only together with the state `sealed` (the trigger refuses
+    it before the CHECK, which now accepts a seal on a deleting row)."""
+    db.add(ledger(workspace.id))
+    await db.commit()
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await owner_conn.execute(text("UPDATE document_ledger SET sealed_at = now()"))
 
 
 async def test_seal_consistency_check_on_insert(db: AsyncSession, workspace: Workspace) -> None:
@@ -431,3 +441,66 @@ async def test_0009_downgrade_to_0008_keeps_the_0008_guards(
     finally:
         _alembic(migrated_db.owner_url, "upgrade", "head")
     assert "object_locked_at" in await _columns(owner_conn)
+
+
+TERMINAL_COLUMNS = {
+    "removed_at",
+    "removed_by",
+    "removal_reason",
+    "deletion_eligible_at",
+    "deletion_approved_at",
+    "deletion_approved_by",
+    "deleted_at",
+    "original_removed_at",
+}
+
+
+async def _has_region_today(conn: AsyncConnection) -> bool:
+    found = await conn.scalar(
+        text("SELECT count(*) FROM pg_proc WHERE proname = 'sijil_region_today'")
+    )
+    return bool(found)
+
+
+async def test_0011_downgrade_restores_0009_guard(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """Down to 0010 (whose function is 0009's): the terminal columns, CHECKs and
+    `sijil_region_today()` are gone, the sealed row is frozen again in every state (no way to
+    `deleting`), and the seal CHECK is 0008's (a seal only on a sealed row)."""
+    db.add(ledger(workspace.id))
+    db.add(ledger(workspace.id, sha=f"{9:064x}"))
+    await db.commit()
+    await db.close()
+    await owner_conn.execute(text(SEAL_SQL + " WHERE sha256 = :sha"), {"u": user.id, "sha": SHA})
+    _alembic(migrated_db.owner_url, "downgrade", "0010")
+    try:
+        assert not TERMINAL_COLUMNS & await _columns(owner_conn)
+        names = await _constraint_names(owner_conn)
+        assert "ck_document_ledger_terminal_consistent" not in names
+        assert "ck_document_ledger_removal_reason_length" not in names
+        assert {
+            "ck_document_ledger_seal_consistent",
+            "ck_document_ledger_object_locked_after_seal",
+        } <= names
+        assert not await _has_region_today(owner_conn)
+        for assignment in (*SEALED_FROZEN, "state = 'deleting'", "state = 'deleted'"):
+            with pytest.raises(DBAPIError, match="ledger.immutable"):
+                await owner_conn.execute(
+                    text(f"UPDATE document_ledger SET {assignment} WHERE sha256 = :sha"),  # noqa: S608
+                    {"sha": SHA},
+                )
+        # 0009's trigger lets an unsealed row change state; 0008's CHECK refuses the seal on it.
+        with pytest.raises(IntegrityError, match="ck_document_ledger_seal_consistent"):
+            await owner_conn.execute(
+                text(
+                    "UPDATE document_ledger SET state = 'deleting', sealed_at = now(), "
+                    "fields_sha256 = repeat('f', 64) WHERE sha256 = :sha"
+                ),
+                {"sha": f"{9:064x}"},
+            )
+    finally:
+        _alembic(migrated_db.owner_url, "upgrade", "head")
+    assert TERMINAL_COLUMNS <= await _columns(owner_conn)
+    assert await _has_region_today(owner_conn)
