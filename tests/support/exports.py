@@ -2,7 +2,6 @@
 originals from the in-memory store, the fields from one throw-away index database, signed with
 the test seed (the one `tests/support/worker_tasks.py` puts in SIJIL_EXPORT_SIGNING_KEY)."""
 
-import base64
 import hashlib
 import uuid
 from datetime import date, datetime, timedelta
@@ -26,17 +25,14 @@ from sijil_core.db.models import (
     User,
     Workspace,
 )
-from sijil_core.export_report import public_key
 from sijil_core.fields import FIELD_NAMES, fields_digest
 from sijil_core.index import FieldsRow
 from sijil_core.settings import CoreSettings
 from sijil_core.storage import ObjectRef
 from sijil_worker.export import build_export
+from tests.support.export_keys import TEST_SEED
 from tests.support.memory_store import MemoryExportStore, MemoryObjectStore, StoredObject
 
-# Deterministic test-only export signing seed (32 bytes), and its public key.
-TEST_SEED = bytes(range(32, 64))
-TEST_PUBLIC_KEY_B64 = base64.b64encode(public_key(TEST_SEED)).decode()
 _SETTINGS = CoreSettings.model_construct(region="ma-cas", environment="test")
 FAR = date(2036, 12, 31)
 REASON = "Avoir du fournisseur reçu après le scellement (SAMPLE)."

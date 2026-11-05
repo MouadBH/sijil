@@ -19,6 +19,7 @@ from celery.result import EagerResult
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.settings import BrokerSettings
+from tests.support.export_keys import TEST_SEED_B64
 from tests.support.memory_store import MemoryExportStore, MemoryObjectStore
 
 # Deterministic test-only master key (32 bytes); never contacted endpoints.
@@ -35,7 +36,7 @@ _ENV = {
     "SIJIL_OBJECTSTORE_SECRET_KEY": "test-secret",
     "SIJIL_OBJECTSTORE_BUCKET": "sijil-originals-test",
     # Deterministic test-only export signing seed (32 bytes).
-    "SIJIL_EXPORT_SIGNING_KEY": base64.b64encode(bytes(range(32, 64))).decode(),
+    "SIJIL_EXPORT_SIGNING_KEY": TEST_SEED_B64,
 }
 
 

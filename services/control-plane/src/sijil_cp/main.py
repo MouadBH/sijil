@@ -6,12 +6,13 @@ from redis.asyncio import Redis
 
 from sijil_core.crypto import LocalKeyService
 from sijil_core.index import IndexEngines
-from sijil_core.storage import S3ObjectStore
+from sijil_core.storage import S3ExportStore, S3ObjectStore
 from sijil_cp import __version__
 from sijil_cp.api import (
     auth,
     corrections,
     documents,
+    exports,
     health,
     jobs,
     members,
@@ -66,6 +67,8 @@ def create_app(settings: CpSettings) -> FastAPI:
     app.state.enqueuer = CeleryEnqueuer(str(settings.redis_url))
     # The original store (object lock); tests swap in an in-memory double.
     app.state.store = S3ObjectStore(settings)
+    # Built exports, read with the app key (read-only on that bucket); tests swap in a double.
+    app.state.exports = S3ExportStore(settings)
     register_error_handlers(app)
     app.add_middleware(CsrfMiddleware)
 
@@ -82,6 +85,8 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(corrections.router)
     v1.include_router(retention.router)
     v1.include_router(removal.router)
+    v1.include_router(exports.router)
+    v1.include_router(exports.regions)
     app.include_router(v1)
     return app
 
