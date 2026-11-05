@@ -20,8 +20,10 @@ copy and the index rows. A lost message is re-sent by the `requeue_unremoved` sw
 Every refusal to a signed-in member of the workspace (design §5.5: "every refused deletion is
 logged") is audited `document.removal_refused` `{code}`, in its own transaction once the
 request's own has been rolled back, so a refused request changes nothing else. That is why
-the permission and step-up checks run here, in the handler, and not as route dependencies. A
-non-member gets the 404 of every workspace route, unaudited (no existence leak).
+the permission and step-up checks run here, in the handler, and not as route dependencies, and
+why the body is parsed here too (a malformed one is audited with the code `validation`, after
+the role and the step-up, so it tells an Admin nothing). A role refusal is the API's usual 403
+`forbidden`. A non-member gets the 404 of every workspace route, unaudited (no existence leak).
 """
 
 import asyncio
@@ -31,7 +33,8 @@ from typing import Annotated, Final
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,7 +74,7 @@ CurrentUser = Annotated[User, Depends(current_user)]
 Now = Annotated[datetime, Depends(get_now)]
 
 REFUSED: Final = "document.removal_refused"
-PERMISSION_DENIED: Final = "permission.denied"
+INVALID_BODY: Final = "validation"
 SEALED: Final = "document.sealed_cannot_be_removed"
 NOT_REMOVABLE: Final = "document.not_removable"
 REASON_REQUIRED: Final = "removal.reason_required"
@@ -96,6 +99,16 @@ class RemovalOut(BaseModel):
 
 def _ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+def _body(raw: bytes) -> RemovalIn:
+    """The JSON body, or the same 422 `validation` FastAPI would have answered."""
+    try:
+        return RemovalIn.model_validate_json(raw)
+    except ValidationError as exc:
+        raise RequestValidationError(
+            [{**error, "loc": ("body", *error["loc"])} for error in exc.errors()]
+        ) from None
 
 
 def _reason(body: RemovalIn) -> str:
@@ -172,11 +185,17 @@ async def _audit_refusal(
     "/workspaces/{workspace_id}/documents/{doc_id}/remove",
     status_code=202,
     response_model=RemovalOut,
+    # The body is read in the handler (see the module docstring); documented here.
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": RemovalIn.model_json_schema()}},
+        }
+    },
 )
 async def remove_document(
     workspace_id: UUID,
     doc_id: UUID,
-    body: RemovalIn,
     request: Request,
     session: Session,
     user: CurrentUser,
@@ -189,21 +208,17 @@ async def remove_document(
     # Kept apart: the rollback before a refusal's audit expires the loaded rows.
     ws_id, user_id = workspace.id, user.id
     try:
-        try:
-            # Non-members get 404 and another region 421, unaudited; then the role.
-            await authorize(
-                db, user.id, workspace, Action.documents_remove, request.app.state.settings
-            )
-        except ApiError as exc:
-            if exc.code != "forbidden":
-                raise
-            raise ApiError(PERMISSION_DENIED, 403) from None
+        # Non-members get 404 and another region 421, unaudited; then the role (`forbidden`).
+        await authorize(db, user.id, workspace, Action.documents_remove, request.app.state.settings)
         await require_totp_compliance(session, user, db)
         await _step_up(session, user, now)
-        reason = _reason(body)
+        reason = _reason(_body(await request.body()))
         ledger = await _locked_ledger(db, workspace, doc_id)
         _refuse_unless_removable(ledger)
         await _refuse_if_half_sealed(request, workspace, ledger)
+    except RequestValidationError:
+        await _audit_refusal(db, request, ws_id, user_id, doc_id, INVALID_BODY, now)
+        raise
     except ApiError as exc:
         if exc.code != "not_found":
             await _audit_refusal(db, request, ws_id, user_id, doc_id, exc.code, now)

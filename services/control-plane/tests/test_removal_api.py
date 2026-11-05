@@ -147,13 +147,13 @@ async def test_admin_cannot_remove(
     make_actor: MakeActor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
     index_conn: AsyncConnection, enqueuer: Any, role: Role,
 ) -> None:  # fmt: skip
-    """Admin, Member and ReadOnly, even stepped up, get 403 `permission.denied`: audited."""
+    """Admin, Member and ReadOnly, even stepped up, get 403 `forbidden`: audited."""
     actor = await _actor(make_actor, db, ws, role)
     row = await add_document(db, memory_store, index_conn, ws)
     r = await actor.client.post(_remove_url(ws, row.id), json={"reason": REASON})
-    assert (r.status_code, _code(r)) == (403, "permission.denied")
+    assert (r.status_code, _code(r)) == (403, "forbidden")
     assert (await _ledger(db, row.id)).state is DocumentState.filed
-    assert await _refusals(db, ws) == [(str(row.id), {"code": "permission.denied"})]
+    assert await _refusals(db, ws) == [(str(row.id), {"code": "forbidden"})]
     [refused] = await _events(db, ws, "document.removal_refused")
     assert refused.actor_id == str(actor.user_id)
     assert await _events(db, ws, "document.removed") == []
@@ -320,3 +320,55 @@ async def test_removed_is_hidden_from_lists_and_review(
     body = (await reader.client.get(f"/v1/workspaces/{ws.id}/documents/{gone.id}")).json()
     assert "removal_reason" not in body
     assert (body["state"], body["sha256"]) == ("removed", gone.sha256)
+
+
+@pytest.mark.parametrize(
+    "content", [b'{"reason": 5}', b'["not", "an", "object"]', b"not json", b""]
+)
+async def test_a_malformed_body_is_a_refusal_too(
+    owner: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, content: bytes,
+) -> None:  # fmt: skip
+    """The validation 422 is audited like every other refusal, with its code."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await owner.client.post(
+        _remove_url(ws, row.id), content=content, headers={"Content-Type": "application/json"}
+    )
+    assert (r.status_code, _code(r)) == (422, "validation")
+    assert await _refusals(db, ws) == [(str(row.id), {"code": "validation"})]
+    assert (await _ledger(db, row.id)).state is DocumentState.filed
+    assert enqueuer.removals == []
+
+
+async def test_a_malformed_body_from_an_admin_is_still_forbidden(
+    make_actor: MakeActor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """The role is judged before the body: an Admin learns nothing about the body's shape."""
+    admin = await _actor(make_actor, db, ws, Role.admin)
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await admin.client.post(
+        _remove_url(ws, row.id), content=b"not json", headers={"Content-Type": "application/json"}
+    )
+    assert (r.status_code, _code(r)) == (403, "forbidden")
+    assert await _refusals(db, ws) == [(str(row.id), {"code": "forbidden"})]
+
+
+async def test_fields_of_a_removed_document_answer_its_tombstone(
+    owner: Actor, make_actor: MakeActor, ws: Workspace, db: AsyncSession,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """GET …/fields answers as GET …/documents/{id} does for a terminal row: the tombstone,
+    never the field values (still in the index until the purge runs)."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await owner.client.post(_remove_url(ws, row.id), json={"reason": REASON})
+    assert r.status_code == 202, r.text
+    url = f"/v1/workspaces/{ws.id}/documents/{row.id}"
+    fields = await owner.client.get(f"{url}/fields")
+    assert fields.status_code == 200, fields.text
+    assert fields.json() == (await owner.client.get(url)).json()
+    assert "fields" not in fields.json()
+    assert fields.json()["removal_reason"] == REASON
+    reader = await _actor(make_actor, db, ws, Role.readonly, step_up=False)
+    body = (await reader.client.get(f"{url}/fields")).json()
+    assert (body["state"], "removal_reason" in body, "fields" in body) == ("removed", False, False)

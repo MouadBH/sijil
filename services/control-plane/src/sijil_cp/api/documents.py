@@ -383,7 +383,7 @@ async def list_documents(
     )
 
 
-def _tombstone(row: DocumentLedger, role: Role) -> TombstoneOut:
+def tombstone(row: DocumentLedger, role: Role) -> TombstoneOut:
     out = TombstoneOut(
         id=row.id,
         state=row.state,
@@ -412,9 +412,9 @@ async def get_document(
     )
     if row is None:
         raise ApiError("document.not_found", 404)
-    tombstone = row.state in TOMBSTONES
+    dead = row.state in TOMBSTONES
     # A tombstone has nothing left in Paperless to ask about.
-    ids = [row.paperless_doc_id] if row.paperless_doc_id is not None and not tombstone else []
+    ids = [row.paperless_doc_id] if row.paperless_doc_id is not None and not dead else []
     docs = await _titles(request, db, workspace, ids)
     await audit.append(
         db,
@@ -428,4 +428,4 @@ async def get_document(
         now=now,
     )
     await db.commit()
-    return _tombstone(row, ctx.role) if tombstone else _out(row, docs)
+    return tombstone(row, ctx.role) if dead else _out(row, docs)

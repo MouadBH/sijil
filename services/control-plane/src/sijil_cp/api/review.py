@@ -61,6 +61,7 @@ from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, pars
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
+from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
@@ -286,10 +287,16 @@ async def review_queue(
     )
 
 
-@router.get("/workspaces/{workspace_id}/documents/{doc_id}/fields", response_model=FieldsOut)
+@router.get(
+    "/workspaces/{workspace_id}/documents/{doc_id}/fields",
+    response_model=FieldsOut | TombstoneOut,
+    response_model_exclude_unset=True,
+)
 async def get_fields(
     doc_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
-) -> FieldsOut:
+) -> FieldsOut | TombstoneOut:
+    """The fields, or for a removed or deleted document its tombstone, as GET …/documents/{id}
+    answers: never the values, which stay in the index only until the purge."""
     workspace = ctx.workspace
     ledger = await db.scalar(
         select(DocumentLedger).where(
@@ -298,7 +305,8 @@ async def get_fields(
     )
     if ledger is None:
         raise ApiError("document.not_found", 404)
-    row = await _read(_engines(request), workspace, ledger.id)
+    dead = ledger.state in TOMBSTONES
+    row = None if dead else await _read(_engines(request), workspace, ledger.id)
     await audit.append(
         db,
         workspace_id=workspace.id,
@@ -311,7 +319,7 @@ async def get_fields(
         now=now,
     )
     await db.commit()
-    return _full(ledger, row)
+    return tombstone(ledger, ctx.role) if dead else _full(ledger, row)
 
 
 def _parsed(raw: Mapping[str, str | None]) -> dict[str, str | None]:
