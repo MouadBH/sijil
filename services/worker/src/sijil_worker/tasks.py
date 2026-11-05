@@ -24,7 +24,7 @@ from sijil_core.paperless import (
     PaperlessError,
     PaperlessUnavailable,
 )
-from sijil_core.pending import PENDING_TTL_S, REMOVE_PREFIX
+from sijil_core.pending import PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
 from sijil_core.region import RegionMismatch
 from sijil_core.storage import RetentionActive, S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
@@ -51,6 +51,7 @@ from sijil_worker.lock import lock_sealed, requeue_unlocked
 from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
+from sijil_worker.purge import purge_document, requeue_unpurged
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
@@ -885,3 +886,127 @@ def requeue_unremoved_task() -> int:
     """Re-send the removal for `removed` and `deleting` rows whose original is not yet recorded
     removed. Runs on the main worker: it only reads the ledger and sends tasks (no store key)."""
     return asyncio.run(_requeue_unremoved())
+
+
+# The purge of a removed or deleted document's Paperless copy and index rows (main worker): 30 s,
+# 1 min ... capped at 15 min, PURGE_MAX_RETRIES times, for a workspace not active, Paperless or a
+# database down (`is_mirror_transient`). Once those run out the key is cleared, so the next sweep
+# may send it again. A permanent failure (e.g. Paperless refusing the admin) is logged by its
+# code only and its `purge:pending` key kept for the full TTL (1 h), so the sweep re-sends that
+# row at most hourly.
+PURGE_MAX_RETRIES = 8
+PURGE_BACKOFF_FACTOR_S = 30
+PURGE_BACKOFF_MAX_S = 900
+
+
+def _purge_code(exc: BaseException) -> str:
+    if isinstance(exc, PaperlessError) and exc.status is not None:
+        return f"{type(exc).__name__}:{exc.status}"
+    return type(exc).__name__
+
+
+async def _with_purge_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(WorkerSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix=PURGE_PREFIX))
+    finally:
+        await redis.aclose()
+
+
+def _pending_purge_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_purge_pending(op))
+    except Exception as exc:
+        log.warning("purge pending key update failed: %s", type(exc).__name__)
+
+
+async def _purge(ledger_id: str, workspace_id: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        await purge_document(
+            UUID(ledger_id),
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.purge_document", queue="default", max_retries=PURGE_MAX_RETRIES)
+def purge_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A removed or deleted document purged from Paperless and the index (sijil_worker.purge)."""
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_purge(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_mirror_transient(exc) and retries < PURGE_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=PURGE_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=PURGE_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_purge_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        if is_mirror_transient(exc):
+            _pending_purge_quietly(clear)
+            raise  # retries ran out: the next sweep may send it again
+        log.error("purge of document %s failed: %s", ledger_id, _purge_code(exc))
+
+        async def keep(pending: PendingExtractions) -> None:
+            await pending.refresh(lid, PENDING_TTL_S)
+
+        _pending_purge_quietly(keep)
+        return
+    _pending_purge_quietly(clear)
+
+
+async def _requeue_unpurged() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ledger_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.purge_document",
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            queue="default",
+        )
+
+    try:
+        return await requeue_unpurged(
+            make_sessionmaker(engine),
+            send,
+            region=settings.region,
+            pending=PendingExtractions(redis, prefix=PURGE_PREFIX),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unpurged")
+def requeue_unpurged_task() -> int:
+    """Re-send the purge for removed and deleted documents whose original is gone but that never
+    recorded `document.purged`. It only reads the ledger and the audit log and sends tasks."""
+    return asyncio.run(_requeue_unpurged())

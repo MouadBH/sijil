@@ -14,6 +14,7 @@ from sijil_core.paperless import (
     SERVICE_PERMISSIONS,
     SUPPORT_PERMISSIONS,
     PaperlessClient,
+    PaperlessError,
     PaperlessForbidden,
 )
 
@@ -140,3 +141,36 @@ async def test_custom_fields_as_the_mirror_sets_them(admin: PaperlessClient) -> 
         document = await svc.get_document(doc_id)
         stored = {f["field"]: f["value"] for f in document["custom_fields"]}
         assert stored == {theirs: "kept", ttc: "MAD1500.00", day: "2026-09-30", sealed: True}
+
+
+async def test_admin_delete_and_empty_trash_as_the_purge_does(admin: PaperlessClient) -> None:
+    """What `sijil_worker.purge` relies on in 3.4.1: a delete moves the document to the trash
+    (404 afterwards), `empty_trash` removes it for good, and a document not in the trash (or
+    already emptied) answers 400 on the trash, 404 on a second delete."""
+    token = await admin.obtain_token("sijil-admin", ADMIN_PASSWORD)
+    async with PaperlessClient(URL, token=token) as client:
+        content = SAMPLE.read_bytes() + f"\n%sijil-it-{uuid.uuid4()}\n".encode()
+        task_id = await client.upload(content, SAMPLE.name)
+        deadline = time.monotonic() + 120
+        task = await client.task(task_id)
+        while task.status not in ("SUCCESS", "FAILURE") and time.monotonic() < deadline:
+            await asyncio.sleep(2)
+            task = await client.task(task_id)
+        assert task.status == "SUCCESS"
+        assert task.related_document is not None
+        doc_id = task.related_document
+        with pytest.raises(PaperlessError) as live:
+            await client.empty_trash([doc_id])  # still live: not in the trash
+        assert live.value.status == 400
+        await client.delete_document(doc_id)
+        with pytest.raises(PaperlessError) as gone:
+            await client.get_document(doc_id)
+        assert gone.value.status == 404
+        await client.empty_trash([doc_id])
+        with pytest.raises(PaperlessError) as emptied:
+            await client.empty_trash([doc_id])
+        assert emptied.value.status == 400
+        with pytest.raises(PaperlessError) as again:
+            await client.delete_document(doc_id)
+        assert again.value.status == 404
+        assert await client.find_document_by_checksum(hashlib.sha256(content).hexdigest()) is None

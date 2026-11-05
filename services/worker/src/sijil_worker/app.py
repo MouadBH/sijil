@@ -12,6 +12,7 @@ REQUEUE_INGEST_INTERVAL_S = 300
 REQUEUE_EXTRACT_INTERVAL_S = 600
 REQUEUE_UNLOCKED_INTERVAL_S = 300
 REQUEUE_UNREMOVED_INTERVAL_S = 300
+REQUEUE_UNPURGED_INTERVAL_S = 300
 QUEUES = ("default", "provisioning", "ingest", "extraction", "seal", "removal")
 
 
@@ -48,6 +49,10 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
             "requeue-unremoved": {
                 "task": "sijil.requeue_unremoved",
                 "schedule": REQUEUE_UNREMOVED_INTERVAL_S,
+            },
+            "requeue-unpurged": {
+                "task": "sijil.requeue_unpurged",
+                "schedule": REQUEUE_UNPURGED_INTERVAL_S,
             },
             "drift-check-nightly": {
                 "task": "sijil.drift_check_all",

@@ -369,7 +369,15 @@ class PaperlessClient:
             raise PaperlessError("GET /api/documents/: unexpected body") from None
 
     async def delete_document(self, doc_id: int) -> None:
+        """Moves the document to Paperless's trash (`empty_trash` removes it for good)."""
         await self._request("DELETE", f"/api/documents/{doc_id}/")
+
+    async def empty_trash(self, doc_ids: Sequence[int]) -> None:
+        """Deletes these trashed documents for good, so Paperless keeps no copy. 3.4.1 answers
+        400 when any of them is not in the trash (`TrashSerializer.validate_documents`)."""
+        await self._request(
+            "POST", "/api/trash/", json={"documents": list(doc_ids), "action": "empty"}
+        )
 
     async def document_content(self, doc_id: int) -> str:
         """The document's text as Paperless extracted it (OCR or text layer), or ""."""
