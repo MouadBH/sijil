@@ -19,12 +19,14 @@ bytes, made with the region's platform key (only the export worker holds its see
 
 import base64
 import binascii
+import calendar
 import hashlib
 import json
+import re
 import zipfile
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Final
 from uuid import UUID
@@ -40,6 +42,8 @@ SIGNATURE_NAME: Final = "integrity-report.json.sig"
 INDEX_NAME: Final = "index.csv"
 KEY_BYTES: Final = 32
 _CHUNK: Final = 1024 * 1024
+# The same rule as the `export_job.period` CHECK (0012).
+_PERIOD: Final = re.compile(r"(?P<year>[0-9]{4})(?:-(?P<month>0[1-9]|1[0-2]))?")
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,18 @@ class AuditHead:
 class VerifyOutcome:
     ok: bool
     problems: list[str] = field(default_factory=list)
+
+
+def period_bounds(period: str) -> tuple[date, date]:
+    """The first and last day of a period, `YYYY` or `YYYY-MM`. ValueError otherwise."""
+    match = _PERIOD.fullmatch(period)
+    if match is None:
+        raise ValueError("period must be YYYY or YYYY-MM")
+    year = int(match["year"])
+    if match["month"] is None:
+        return date(year, 1, 1), date(year, 12, 31)
+    month = int(match["month"])
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
 
 
 def decode_key(b64: str) -> bytes:
@@ -219,6 +235,7 @@ __all__ = [
     "build_report",
     "decode_key",
     "key_id",
+    "period_bounds",
     "public_key",
     "read_report",
     "sign",

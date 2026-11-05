@@ -19,7 +19,7 @@ from celery.result import EagerResult
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.settings import BrokerSettings
-from tests.support.memory_store import MemoryObjectStore
+from tests.support.memory_store import MemoryExportStore, MemoryObjectStore
 
 # Deterministic test-only master key (32 bytes); never contacted endpoints.
 _ENV = {
@@ -34,6 +34,8 @@ _ENV = {
     "SIJIL_OBJECTSTORE_ACCESS_KEY": "test-access",
     "SIJIL_OBJECTSTORE_SECRET_KEY": "test-secret",
     "SIJIL_OBJECTSTORE_BUCKET": "sijil-originals-test",
+    # Deterministic test-only export signing seed (32 bytes).
+    "SIJIL_EXPORT_SIGNING_KEY": base64.b64encode(bytes(range(32, 64))).decode(),
 }
 
 
@@ -77,7 +79,12 @@ class WorkerTasks:
 
 
 def worker_tasks(
-    monkeypatch: pytest.MonkeyPatch, *, database_url: str, redis_url: str, store: MemoryObjectStore
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    database_url: str,
+    redis_url: str,
+    store: MemoryObjectStore,
+    exports: MemoryExportStore | None = None,
 ) -> WorkerTasks:
     for name, value in (_ENV | {"SIJIL_DATABASE_URL": database_url, "SIJIL_REDIS_URL": redis_url}
                         ).items():  # fmt: skip
@@ -87,5 +94,7 @@ def worker_tasks(
     runner = WorkerTasks(app)
     monkeypatch.setattr(app, "send_task", runner._record)
     monkeypatch.setattr(tasks, "S3ObjectStore", lambda _settings: store)
+    exports = exports or MemoryExportStore()
+    monkeypatch.setattr(tasks, "S3ExportStore", lambda _settings: exports)
     monkeypatch.setattr(docker, "from_env", lambda **_: _NoDocker())
     return runner

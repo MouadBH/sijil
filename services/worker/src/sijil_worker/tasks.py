@@ -26,7 +26,7 @@ from sijil_core.paperless import (
 )
 from sijil_core.pending import PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
 from sijil_core.region import RegionMismatch
-from sijil_core.storage import RetentionActive, S3ObjectStore, StorageSettings
+from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -34,6 +34,12 @@ from sijil_worker.drift import (
     record_check_failed,
 )
 from sijil_worker.eligibility import mark_eligible
+from sijil_worker.export import (
+    EXPORT_FAILED,
+    build_export,
+    expire_exports,
+    record_export_failed,
+)
 from sijil_worker.extract import (
     IngestInProgress,
     extract_document,
@@ -62,6 +68,7 @@ from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import (
+    ExportSettings,
     ExtractionSettings,
     RemovalSettings,
     SealSettings,
@@ -1061,3 +1068,85 @@ def requeue_unpurged_task() -> int:
     """Re-send the purge for removed and deleted documents whose original is gone but that never
     recorded `document.purged`. It only reads the ledger and the audit log and sends tasks."""
     return asyncio.run(_requeue_unpurged())
+
+
+# A period export (export worker): 30 s, 1 min ... capped at 15 min, EXPORT_MAX_RETRIES times,
+# for a store or database that is unreachable or failing (`is_lock_transient`); the job stays
+# `building` meanwhile and the retry builds it again from a fresh snapshot. A final failure is
+# recorded `failed` with `export.error` and audited `export.failed`; a hash mismatch is recorded
+# by `build_export` itself (`export.hash_mismatch`).
+EXPORT_MAX_RETRIES = 6
+EXPORT_BACKOFF_FACTOR_S = 30
+EXPORT_BACKOFF_MAX_S = 900
+
+
+async def _build_export(job_id: str) -> None:
+    settings = ExportSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        await build_export(
+            UUID(job_id),
+            sessions=sessions,
+            index=engines,
+            originals=S3ObjectStore(settings),
+            exports=S3ExportStore(settings),
+            settings=settings,
+            seed=settings.signing_seed(),
+            now=utcnow(),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _export_failed(job_id: str, code: str) -> bool:
+    settings = ExportSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await record_export_failed(
+            UUID(job_id), code, sessions=make_sessionmaker(engine), settings=settings, now=utcnow()
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.build_export", queue="export", max_retries=EXPORT_MAX_RETRIES)
+def build_export_task(self: "Task[Any, Any]", job_id: str) -> None:
+    """A period export built, signed and stored (sijil_worker.export)."""
+    try:
+        asyncio.run(_build_export(job_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_lock_transient(exc) and retries < EXPORT_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=EXPORT_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=EXPORT_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        log.error("export %s failed: %s", job_id, _store_code(exc))
+        try:
+            asyncio.run(_export_failed(job_id, EXPORT_FAILED))
+        except Exception as audit_exc:
+            log.error("export %s failure not recorded: %s", job_id, type(audit_exc).__name__)
+
+
+async def _expire_exports() -> int:
+    settings = ExportSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await expire_exports(
+            make_sessionmaker(engine), S3ExportStore(settings), settings=settings, now=utcnow()
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.expire_exports", queue="export")
+def expire_exports_task() -> int:
+    """Daily, on the export worker (the only one that can delete an export): exports ready for
+    more than 7 days are deleted and marked `expired`."""
+    return asyncio.run(_expire_exports())

@@ -106,6 +106,15 @@ TERMINAL_STATES: Final = frozenset(
 )
 
 
+class ExportState(StrEnum):
+    queued = "queued"
+    building = "building"
+    ready = "ready"
+    failed = "failed"
+    # A ready export whose ZIP the daily expiry deleted (7 days after `ready_at`).
+    expired = "expired"
+
+
 class IngestState(StrEnum):
     queued = "queued"
     sending = "sending"
@@ -421,3 +430,36 @@ class IntegrityAlert(Base):
     detail: Mapped[dict[str, Any]] = mapped_column(JSONB)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     resolved_at: Mapped[datetime | None] = _tstz()
+
+
+class ExportJob(Base):
+    """A period export (ARC-5): built by the export worker into the exports bucket at
+    `object_key` (`<workspace_id>/<job_id>.zip`). The app role has SELECT, INSERT and UPDATE
+    only (0012). Holds no content: the period, the ZIP's hash and size, a count."""
+
+    __tablename__ = "export_job"
+    __table_args__ = (
+        CheckConstraint(r"period ~ '^[0-9]{4}(-(0[1-9]|1[0-2]))?$'", name="period_format"),
+        CheckConstraint(
+            "state IN ('queued', 'building', 'ready', 'failed', 'expired')", name="state_known"
+        ),
+        CheckConstraint(
+            "state NOT IN ('ready', 'expired') OR (object_key IS NOT NULL AND sha256 IS NOT NULL"
+            " AND size_bytes IS NOT NULL AND document_count IS NOT NULL AND ready_at IS NOT NULL)",
+            name="ready_complete",
+        ),
+        Index("ix_export_job_workspace_created", "workspace_id", text("created_at DESC")),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    period: Mapped[str] = mapped_column(String(7))
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_account.id"))
+    state: Mapped[ExportState] = mapped_column(_enum(ExportState), default=ExportState.queued)
+    object_key: Mapped[str | None] = mapped_column(String)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    document_count: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String)
+    created_at: Mapped[datetime] = _created_at()
+    ready_at: Mapped[datetime | None] = _tstz()

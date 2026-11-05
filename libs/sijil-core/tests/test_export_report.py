@@ -5,7 +5,7 @@ import hashlib
 import json
 import zipfile
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from uuid import UUID
 
@@ -21,6 +21,7 @@ from sijil_core.export_report import (
     ReportDocument,
     build_report,
     key_id,
+    period_bounds,
     public_key,
     sign,
     verify_zip,
@@ -177,3 +178,22 @@ def test_verify_flags_a_duplicated_entry(tmp_path: Path) -> None:
     with zipfile.ZipFile(path, "a") as zf, pytest.warns(UserWarning, match="Duplicate name"):
         zf.writestr(f"originals/{DOC}.pdf", ORIGINAL)
     assert verify_zip(path, public_key(SEED)).problems == [f"file.extra:originals/{DOC}.pdf"]
+
+
+@pytest.mark.parametrize(
+    ("period", "bounds"),
+    [
+        ("2026", (date(2026, 1, 1), date(2026, 12, 31))),
+        ("2026-02", (date(2026, 2, 1), date(2026, 2, 28))),
+        ("2028-02", (date(2028, 2, 1), date(2028, 2, 29))),
+        ("2026-12", (date(2026, 12, 1), date(2026, 12, 31))),
+    ],
+)
+def test_period_bounds(period: str, bounds: tuple[date, date]) -> None:
+    assert period_bounds(period) == bounds
+
+
+@pytest.mark.parametrize("period", ["26", "2026-13", "2026-00", "2026-1", "2026/10", " 2026", ""])
+def test_period_bounds_refuses_a_malformed_period(period: str) -> None:
+    with pytest.raises(ValueError, match="period"):
+        period_bounds(period)
