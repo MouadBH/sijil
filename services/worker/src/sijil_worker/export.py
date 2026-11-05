@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Final, Protocol
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from sijil_core import audit
@@ -289,7 +289,39 @@ async def build_export(
 ) -> bool:
     """See the module docstring. True when this run made the export ready; False when there
     was nothing to do here or the job failed on a hash mismatch. Any other error propagates
-    for the task to retry or record (`record_export_failed`)."""
+    for the task to retry or record (`record_export_failed`).
+
+    One build per job at a time: a transaction-scoped advisory lock is held for the whole
+    build, and a delivery that cannot take it leaves the job alone (it would otherwise
+    overwrite the ZIP the running build is about to record)."""
+    async with sessions() as guard:
+        held = await guard.scalar(
+            text("SELECT pg_try_advisory_xact_lock(hashtextextended('export:' || :id, 0))"),
+            {"id": str(job_id)},
+        )
+        if not held:
+            log.info("export %s skipped: another build of it is running", job_id)
+            return False
+        try:
+            return await _build(
+                job_id, sessions=sessions, index=index, originals=originals, exports=exports,
+                settings=settings, seed=seed, now=now,
+            )  # fmt: skip
+        finally:
+            await guard.rollback()
+
+
+async def _build(
+    job_id: UUID,
+    *,
+    sessions: async_sessionmaker[AsyncSession],
+    index: IndexSource,
+    originals: OriginalReader,
+    exports: ExportWriter,
+    settings: CoreSettings,
+    seed: bytes,
+    now: datetime,
+) -> bool:
     claimed = await _claim(sessions, job_id, settings)
     if claimed is None:
         return False

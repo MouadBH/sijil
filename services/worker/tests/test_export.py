@@ -420,3 +420,22 @@ async def test_the_app_role_cannot_delete_a_job(
     job = await _job(db, workspace, user)
     with pytest.raises(DBAPIError, match="permission denied"):
         await db.execute(text("DELETE FROM export_job WHERE id = :id"), {"id": job.id})
+
+
+async def test_a_second_delivery_while_one_builds_does_nothing(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex,
+) -> None:  # fmt: skip
+    """Two deliveries of one job must not both write `<ws>/<job>.zip`: the ZIP one records
+    would be overwritten by the other's."""
+    job = await _job(db, workspace, user)
+    async with sessions() as running:  # the first delivery, mid-build
+        await running.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended('export:' || :id, 0))"),
+            {"id": str(job.id)},
+        )
+        assert not await _build(job, sessions, idx, memory_store, exports)
+        await running.rollback()
+    assert (await _fresh(db, job)).state is ExportState.queued
+    assert exports.objects == {}
+    assert await _build(job, sessions, idx, memory_store, exports)  # once it is done
