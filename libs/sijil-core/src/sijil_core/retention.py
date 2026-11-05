@@ -79,7 +79,7 @@ async def lowest_policy_years(db: AsyncSession, workspace_id: UUID) -> int:
             RetentionPolicy.workspace_id == workspace_id
         )
     )
-    rows: dict[str, int] = dict(found.tuples().all())
+    rows: dict[str, int] = {name: years for name, years in found}
     country = await db.scalar(
         select(Organisation.country)
         .join(Workspace, Workspace.org_id == Organisation.id)
