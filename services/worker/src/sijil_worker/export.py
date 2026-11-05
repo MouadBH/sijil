@@ -17,8 +17,10 @@ region's Ed25519 signing seed, reaches no tenant network and has no Docker socke
 4. streams each original from the object store into the ZIP at `originals/<id>.<ext>`, hashing
    as it goes: a hash or size that is not the ledger's fails the job (`export.hash_mismatch`)
    and audits `integrity.export_mismatch` on the document;
-5. writes `index.csv` (UTF-8 with BOM, CRLF, RFC 4180), with the effective field values (the
-   latest correction note per field wins) and the corrected field names, then the canonical
+5. writes `index.csv` (UTF-8 with BOM, `;`-separated so French-locale Excel opens it in
+   columns, CRLF, RFC 4180 quoting), with the effective field values (the latest correction
+   note per field wins, a free-text value that a spreadsheet would run as a formula escaped)
+   and the corrected field names, then the canonical
    `integrity-report.json` and its signature (sijil_core.export_report);
 6. puts the ZIP at `<workspace_id>/<job_id>.zip` in the exports bucket, sets the job `ready`
    with the ZIP's hash and size, and audits `export.ready` `{period, document_count}`.
@@ -88,6 +90,10 @@ INCLUDED: Final = (
 _BUILDABLE: Final = (ExportState.queued, ExportState.building)
 # The file extension of each `content_kind` (sijil_core.filetypes.FileKind).
 _EXTENSIONS: Final = {"jpeg": "jpg", "tiff": "tif"}
+# The extracted fields people type or OCR reads as they are; every other column is an id, a
+# hash, a state, a date or a canonical value.
+FREE_TEXT_FIELDS: Final = frozenset({"supplier_name", "number"})
+_FORMULA_STARTS: Final = ("=", "+", "-", "@", "\t", "\r")
 CSV_COLUMNS: Final = (
     "document_id",
     "state",
@@ -144,17 +150,27 @@ def _ts(value: datetime | None) -> str:
     return "" if value is None else value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _cell(name: str, value: str | None) -> str:
+    """A free-text value a spreadsheet would run as a formula gets a leading apostrophe;
+    canonical values (amounts, dates, codes) never start with one of those but `-`, and stay."""
+    text = value or ""
+    if name in FREE_TEXT_FIELDS and text.startswith(_FORMULA_STARTS):
+        return "'" + text
+    return text
+
+
 def index_csv(docs: Sequence[_Doc]) -> bytes:
-    """UTF-8 with a BOM, CRLF line ends, RFC 4180 quoting (only where needed)."""
+    """UTF-8 with a BOM, `;` separators, CRLF line ends, RFC 4180 quoting (only where needed).
+    No `sep=` line: Excel drops the BOM after one."""
     out = io.StringIO(newline="")
-    writer = csv.writer(out, lineterminator="\r\n", quoting=csv.QUOTE_MINIMAL)
+    writer = csv.writer(out, delimiter=";", lineterminator="\r\n", quoting=csv.QUOTE_MINIMAL)
     writer.writerow(CSV_COLUMNS)
     for doc in docs:
         row = doc.ledger
         effective = (
             index_db.effective_fields(doc.fields, doc.corrections) if doc.fields is not None else {}
         )
-        values = [effective.get(name, (None, False))[0] or "" for name in FIELD_NAMES]
+        values = [_cell(name, effective.get(name, (None, False))[0]) for name in FIELD_NAMES]
         corrected = sorted(name for name, (_v, flag) in effective.items() if flag)
         writer.writerow(
             [

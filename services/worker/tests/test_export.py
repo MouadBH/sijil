@@ -157,7 +157,7 @@ def _zip(exports: MemoryExportStore, job: ExportJob, tmp_path: Path) -> Path:
 def _rows(path: Path) -> list[dict[str, str]]:
     with zipfile.ZipFile(path) as zf:
         raw = zf.read(INDEX_NAME)
-    return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
+    return list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""), delimiter=";"))
 
 
 async def test_export_contains_all_period_docs(
@@ -239,7 +239,7 @@ async def test_index_csv_bom_crlf_arabic_and_quotes(
     memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex,
     index_conn: AsyncConnection, tmp_path: Path,
 ) -> None:  # fmt: skip
-    name = 'شركة الأطلس "SAMPLE", ش.م.م'
+    name = 'شركة الأطلس "SAMPLE"; ش.م.م'
     row = await add_exportable(
         db, memory_store, index_conn, workspace, user, state=DocumentState.sealed,
         arrived=datetime(2026, 10, 3, 8, 0, tzinfo=UTC),
@@ -253,8 +253,11 @@ async def test_index_csv_bom_crlf_arabic_and_quotes(
     assert raw.startswith(b"\xef\xbb\xbf")
     body = raw[3:].decode("utf-8")
     assert body.endswith("\r\n")
-    assert body.split("\r\n", 1)[0] == ",".join(HEADER)
-    assert '"شركة الأطلس ""SAMPLE"", ش.م.م"' in body  # RFC 4180: quoted, quotes doubled
+    # `;`-separated, so French-locale Excel (fr-MA) opens it in columns; no `sep=` line,
+    # which would make Excel drop the BOM.
+    assert body.split("\r\n", 1)[0] == ";".join(HEADER)
+    assert not body.startswith("sep=")
+    assert '"شركة الأطلس ""SAMPLE""; ش.م.م"' in body  # RFC 4180: quoted, quotes doubled
     [parsed] = _rows(path)
     assert list(parsed) == HEADER
     assert parsed["supplier_name"] == name
@@ -293,6 +296,8 @@ async def test_corrected_value_flagged(
     assert parsed["number"] == ""
     assert parsed["supplier_name"] == "Atlas Télécom SAMPLE SARL"  # not corrected
     assert parsed["corrected_fields"] == "number;total_ttc"
+    with zipfile.ZipFile(path) as zf:
+        assert ';"number;total_ttc"\r\n' in zf.read(INDEX_NAME).decode("utf-8-sig")
     # The sealed record is unchanged: its digest is still the one signed.
     report = read_report(path)
     assert report is not None
@@ -439,3 +444,41 @@ async def test_a_second_delivery_while_one_builds_does_nothing(
     assert (await _fresh(db, job)).state is ExportState.queued
     assert exports.objects == {}
     assert await _build(job, sessions, idx, memory_store, exports)  # once it is done
+
+
+async def test_index_csv_escapes_formulas_in_free_text_only(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex,
+    index_conn: AsyncConnection, tmp_path: Path,
+) -> None:  # fmt: skip
+    """A free-text value starting with = + - @ TAB or CR gets a leading apostrophe, so a
+    spreadsheet shows it rather than runs it; canonical values (a negative amount) stay as they
+    are. The report hashes the file as written."""
+    formula = '=HYPERLINK("http://example.invalid","SAMPLE")'
+    await add_exportable(
+        db, memory_store, index_conn, workspace, user, state=DocumentState.sealed,
+        arrived=datetime(2026, 10, 3, 8, 0, tzinfo=UTC),
+        values=_values(
+            date="2026-10-02", supplier_name=formula, number="@SUM(1)", total_ttc="-150.00",
+            total_ht="-125.00",
+        ),
+    )  # fmt: skip
+    for value in ("+1 SAMPLE", "-SAMPLE", "\tSAMPLE", "\rSAMPLE"):
+        await add_exportable(
+            db, memory_store, index_conn, workspace, user,
+            arrived=datetime(2026, 10, 4, 8, 0, tzinfo=UTC),
+            values=_values(date="2026-10-02", supplier_name=value),
+        )  # fmt: skip
+    job = await _job(db, workspace, user)
+    assert await _build(job, sessions, idx, memory_store, exports)
+    path = _zip(exports, job, tmp_path)
+    rows = _rows(path)
+    first = next(r for r in rows if r["total_ttc"] == "-150.00")
+    assert first["supplier_name"] == "'" + formula
+    assert first["number"] == "'@SUM(1)"
+    assert (first["total_ttc"], first["total_ht"]) == ("-150.00", "-125.00")  # canonical
+    assert sorted(r["supplier_name"] for r in rows if r is not first) == sorted(
+        ["'+1 SAMPLE", "'-SAMPLE", "'\tSAMPLE", "'\rSAMPLE"]
+    )
+    assert all(r["state"] in ("sealed", "filed") and r["date"] == "2026-10-02" for r in rows)
+    assert verify_zip(path, public_key(SEED)).ok  # the escaped file is the one signed

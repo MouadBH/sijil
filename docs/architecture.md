@@ -193,6 +193,20 @@ canonical_json = sorted keys, no whitespace, UTF-8, timestamps ISO-8601 UTC with
 - The `audit_event` migration revokes `UPDATE` and `DELETE` from `sijil_cp_app`, and a trigger rejects them as defence in depth.
 - `sijil-cp audit verify --workspace <id>` walks the chain. Export integrity reports include the chain head.
 
+## Period export (M4, ARC-5)
+
+- Built by `worker-export` alone. It reads originals from the object store with the read-only export key (never from Paperless), holds the region's Ed25519 signing seed, sits on `core` only and has no Docker socket. The control plane streams a ready ZIP with the app key (read-only on `<bucket>-exports`), and `GET /v1/regions/{region}/export-key` publishes the public key.
+- A document is in the period when its retention basis (the plausible document date, else the region-local arrival date) falls in it. `received`, `needs_review`, `filed` and `sealed` documents are included; `removed`, `deleting` and `deleted` ones are not.
+- The ZIP holds:
+  - `originals/<ledger_id>.<ext>`, hashed while streamed; a mismatch with the ledger fails the export (`export.hash_mismatch`);
+  - `index.csv`:
+    - UTF-8 with a BOM, **`;` as separator** (French-locale Excel, fr-MA, opens it in columns), CRLF, RFC 4180 quoting; no `sep=` line, which makes Excel drop the BOM;
+    - columns `document_id;state;sha256;size_bytes;content_kind;source;ingested_at;sealed_at;fields_sha256;retention_until`, then every field name (its effective value: the latest correction note wins), then `corrected_fields` (names joined with `;`, so quoted);
+    - a free-text value (`supplier_name`, `number`) starting with `=`, `+`, `-`, `@`, TAB or CR gets a leading `'` so a spreadsheet shows it instead of running it; ids, hashes, states, dates, canonical amounts and `corrected_fields` are never changed;
+  - `integrity-report.json`: canonical JSON `{v, workspace_id, region, period, generated_at, documents: [{id, path, sha256, size_bytes, fields_sha256}], index_csv_sha256, audit_head: {id, hash}, key_id}`. `index_csv_sha256` is the hash of the file as written (escaped). `key_id` is the first 16 hex characters of the SHA-256 of the raw public key;
+  - `integrity-report.json.sig`: base64 of the raw 64-byte Ed25519 signature over the report's exact bytes.
+- `sijil-cp export verify <zip> [--public-key B64] [--against-ledger]` prints `ok` or one problem code per line: `signature.invalid`, `key_id.mismatch`, `file.missing:<path>`, `file.extra:<path>`, `file.hash:<path>`, `index_csv.hash`, `zip.invalid`, `ledger.mismatch:<id>`.
+
 ## Region enforcement
 
 - Every service starts with `SIJIL_REGION`. Settings won't load without it (`sijil_core.settings.CoreSettings`).
