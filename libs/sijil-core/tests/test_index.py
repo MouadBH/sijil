@@ -74,7 +74,11 @@ async def test_ensure_schema_idempotent(conn: AsyncConnection) -> None:
     await index.ensure_schema(conn)
     await index.ensure_schema(conn)
     versions = (await conn.execute(text("SELECT version FROM index_schema"))).scalars().all()
-    assert versions == [index.SCHEMA_VERSION]
+    assert versions == list(range(1, index.SCHEMA_VERSION + 1))
+
+
+def test_schema_version_is_the_latest_ddl() -> None:
+    assert max(index._DDL) == index.SCHEMA_VERSION == 2
 
 
 async def test_concurrent_first_runs_apply_once(fresh_db_url: str) -> None:
@@ -87,7 +91,7 @@ async def test_concurrent_first_runs_apply_once(fresh_db_url: str) -> None:
         assert results == [None] * 4
         async with engine.connect() as c:
             versions = (await c.execute(text("SELECT version FROM index_schema"))).scalars().all()
-        assert versions == [index.SCHEMA_VERSION]
+        assert versions == list(range(1, index.SCHEMA_VERSION + 1))
     finally:
         await engine.dispose()
 
@@ -98,14 +102,15 @@ async def test_later_versions_apply_in_order(
     engine = create_async_engine(fresh_db_url)
     try:
         await _run_ensure(engine)
-        monkeypatch.setattr(index, "SCHEMA_VERSION", 3)
+        later = index.SCHEMA_VERSION + 1
+        monkeypatch.setattr(index, "SCHEMA_VERSION", later + 1)
         monkeypatch.setattr(
             index,
             "_DDL",
             {
                 **index._DDL,
-                2: ("CREATE TABLE v2 (id int PRIMARY KEY)",),
-                3: ("CREATE TABLE v3 (id int REFERENCES v2 (id))",),
+                later: ("CREATE TABLE later (id int PRIMARY KEY)",),
+                later + 1: ("CREATE TABLE latest (id int REFERENCES later (id))",),
             },
         )
         await _run_ensure(engine)
@@ -116,7 +121,7 @@ async def test_later_versions_apply_in_order(
                 .scalars()
                 .all()
             )
-        assert versions == [1, 2, 3]
+        assert versions == list(range(1, later + 2))
     finally:
         await engine.dispose()
 
