@@ -17,16 +17,13 @@ After the commit `remove:pending:<id>` is claimed and `sijil.remove_original` se
 removal worker, which deletes the original and then has the main worker purge the Paperless
 copy and the index rows. A lost message is re-sent by the `requeue_unremoved` sweep.
 
-Every refusal to a signed-in member of the workspace (design §5.5: "every refused deletion is
-logged") is audited `document.removal_refused` `{code}`, in its own transaction once the
-request's own has been rolled back, so a refused request changes nothing else. That is why
-the permission and step-up checks run here, in the handler, and not as route dependencies, and
-why the body is parsed here too (a malformed one is audited with the code `validation`, after
-the role and the step-up, so it tells an Admin nothing). A role refusal is the API's usual 403
-`forbidden`. A non-member gets the 404 of every workspace route, unaudited (no existence leak).
+Every refusal to a signed-in member of the workspace is audited `document.removal_refused`
+`{code}` (sijil_cp.removals), which is why the permission and step-up checks run here, in the
+handler, and not as route dependencies, and why the body is parsed here too. A role refusal is
+the API's usual 403 `forbidden`. A non-member gets the 404 of every workspace route, unaudited
+(no existence leak).
 """
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Annotated, Final
@@ -34,7 +31,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,7 +48,6 @@ from sijil_core.db.models import (
     Workspace,
 )
 from sijil_core.index import IndexEngines
-from sijil_core.pending import PENDING_TTL_S, REMOVE_PREFIX, pending_key
 from sijil_cp.deps import (
     current_session,
     current_user,
@@ -60,9 +56,16 @@ from sijil_cp.deps import (
     require_recent_totp,
     require_totp_compliance,
 )
-from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
 from sijil_cp.permissions import Action, authorize
+from sijil_cp.removals import (
+    INVALID_BODY,
+    STEP_UP_MINUTES,
+    audit_refusal,
+    client_ip,
+    parse_body,
+    send_removal,
+)
 
 log = logging.getLogger(__name__)
 
@@ -73,15 +76,12 @@ Session = Annotated[UserSession, Depends(current_session())]
 CurrentUser = Annotated[User, Depends(current_user)]
 Now = Annotated[datetime, Depends(get_now)]
 
-REFUSED: Final = "document.removal_refused"
-INVALID_BODY: Final = "validation"
 SEALED: Final = "document.sealed_cannot_be_removed"
 NOT_REMOVABLE: Final = "document.not_removable"
 REASON_REQUIRED: Final = "removal.reason_required"
 INDEX_UNAVAILABLE: Final = "removal.index_unavailable"
 REASON_MIN: Final = 10
 REASON_MAX: Final = 1000
-STEP_UP_MINUTES: Final = 10
 
 # Called from the handler, so its refusal is audited like the others.
 _step_up = require_recent_totp(STEP_UP_MINUTES)
@@ -95,20 +95,6 @@ class RemovalIn(BaseModel):
 class RemovalOut(BaseModel):
     id: UUID
     state: DocumentState
-
-
-def _ip(request: Request) -> str | None:
-    return request.client.host if request.client else None
-
-
-def _body(raw: bytes) -> RemovalIn:
-    """The JSON body, or the same 422 `validation` FastAPI would have answered."""
-    try:
-        return RemovalIn.model_validate_json(raw)
-    except ValidationError as exc:
-        raise RequestValidationError(
-            [{**error, "loc": ("body", *error["loc"])} for error in exc.errors()]
-        ) from None
 
 
 def _reason(body: RemovalIn) -> str:
@@ -154,33 +140,6 @@ async def _refuse_if_half_sealed(
         raise ApiError(SEALED, 409)
 
 
-async def _audit_refusal(
-    db: AsyncSession,
-    request: Request,
-    workspace_id: UUID,
-    user_id: UUID,
-    doc_id: UUID,
-    code: str,
-    now: datetime,
-) -> None:
-    """`document.removal_refused` `{code}` in a transaction of its own: whatever the refused
-    request had started is rolled back first (and the ledger lock with it)."""
-    await db.rollback()
-    await audit.append(
-        db,
-        workspace_id=workspace_id,
-        action=REFUSED,
-        actor_type=ActorType.user,
-        actor_id=str(user_id),
-        target_type="document",
-        target_id=str(doc_id),
-        ip=_ip(request),
-        data={"code": code},
-        now=now,
-    )
-    await db.commit()
-
-
 @router.post(
     "/workspaces/{workspace_id}/documents/{doc_id}/remove",
     status_code=202,
@@ -212,16 +171,16 @@ async def remove_document(
         await authorize(db, user.id, workspace, Action.documents_remove, request.app.state.settings)
         await require_totp_compliance(session, user, db)
         await _step_up(session, user, now)
-        reason = _reason(_body(await request.body()))
+        reason = _reason(parse_body(RemovalIn, await request.body()))
         ledger = await _locked_ledger(db, workspace, doc_id)
         _refuse_unless_removable(ledger)
         await _refuse_if_half_sealed(request, workspace, ledger)
     except RequestValidationError:
-        await _audit_refusal(db, request, ws_id, user_id, doc_id, INVALID_BODY, now)
+        await audit_refusal(db, request, ws_id, user_id, [doc_id], INVALID_BODY, now)
         raise
     except ApiError as exc:
         if exc.code != "not_found":
-            await _audit_refusal(db, request, ws_id, user_id, doc_id, exc.code, now)
+            await audit_refusal(db, request, ws_id, user_id, [doc_id], exc.code, now)
         raise
     ledger.state = DocumentState.removed
     ledger.removed_at = now
@@ -235,36 +194,10 @@ async def remove_document(
         actor_id=str(user_id),
         target_type="document",
         target_id=str(doc_id),
-        ip=_ip(request),
+        ip=client_ip(request),
         data={"reason_length": len(reason)},
         now=now,
     )
     await db.commit()
-    await _after_commit(request, doc_id, ws_id)
+    await send_removal(request, doc_id, ws_id)
     return RemovalOut(id=doc_id, state=DocumentState.removed)
-
-
-async def _after_commit(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
-    """The removal stands whatever happens here: a lost message is re-sent by the
-    `requeue_unremoved` sweep. `remove:pending:<id>` is claimed first, the key the removal
-    worker clears and the sweep honours, so this send and a sweep re-send never both run."""
-    redis = request.app.state.redis
-    key = pending_key(ledger_id, REMOVE_PREFIX)
-    try:
-        claimed = bool(await redis.set(key, "1", nx=True, ex=PENDING_TTL_S))
-    except Exception as exc:  # noqa: BLE001 - the worker is idempotent: send anyway
-        log.warning("removal claim of document %s failed: %s", ledger_id, type(exc).__name__)
-        claimed = True
-    if not claimed:
-        return
-    try:
-        await asyncio.to_thread(get_enqueuer(request).send_remove, ledger_id, workspace_id)
-    except Exception as exc:  # noqa: BLE001 - the broker being down must not undo a removal
-        log.warning("removal enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
-        try:
-            await redis.delete(key)
-        except Exception as release_exc:  # noqa: BLE001 - it expires anyway
-            log.warning(
-                "removal release of document %s failed: %s",
-                ledger_id, type(release_exc).__name__,
-            )  # fmt: skip
