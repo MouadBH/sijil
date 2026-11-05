@@ -36,7 +36,7 @@ from sijil_core.db.models import (
     Workspace,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES, sniff
-from sijil_core.retention import provisional_retain_until, region_local_date
+from sijil_core.retention import policy_years, provisional_retain_until, region_local_date
 from sijil_core.storage import ObjectStore
 from sijil_core.tenancy import tenant_ref
 
@@ -175,7 +175,6 @@ async def accept_file(
     store: ObjectStore,
     enqueue: Enqueue,
     workspace: Workspace,
-    country: str,
     region: str,
     chunks: AsyncIterator[bytes],
     source: DocumentSource,
@@ -211,7 +210,10 @@ async def accept_file(
                 return Duplicate(existing)
         # The arrival date is the region's civil date: a UTC date would cut a year of
         # retention from files arriving just after local midnight on 1 January.
-        retain_until = provisional_retain_until(region_local_date(now, region), country)
+        # Provisional: the type is not known yet, so the workspace's `other` period.
+        async with sessions() as db:
+            years = await policy_years(db, workspace_id, None)
+        retain_until = provisional_retain_until(region_local_date(now, region), years)
         # Before the ledger row: a row must never point at an object that is not there. The key
         # is content-addressed, so a racer that loses below only added an identical version.
         ref = await store.put_original(

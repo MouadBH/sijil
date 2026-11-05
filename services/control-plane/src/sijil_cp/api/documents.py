@@ -166,7 +166,7 @@ async def upload_document(
     if workspace.state not in _ACCEPTS_UPLOADS:
         # Nothing would ever ingest it: refuse before a byte is stored or locked.
         raise ApiError("workspace.not_ready", 409)
-    country, region = org.country, org.region
+    region = org.region
     user_id = str(user.id)
     # Hand the connection back before the (possibly long) body arrives; accept_file opens its
     # own short transactions. Loaded attributes stay readable on the detached objects.
@@ -183,7 +183,6 @@ async def upload_document(
             store=request.app.state.store,
             enqueue=enqueue,
             workspace=workspace,
-            country=country,
             region=region,
             chunks=_file_part(request, _boundary(request)),
             source=DocumentSource.upload,

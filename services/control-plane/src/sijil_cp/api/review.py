@@ -58,7 +58,7 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, parse_field
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
-from sijil_core.retention import REGION_TZ, fiscal_retain_until, retention_basis
+from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
@@ -400,7 +400,6 @@ class _Sealer:
 
     engine: AsyncEngine
     workspace_id: UUID
-    country: str
     region: str
     user_id: UUID
     ip: str | None
@@ -411,12 +410,15 @@ def _missing(row: FieldsRow) -> list[str]:
     return sorted(n for n in _required(row.document_type) if row.values.get(n) is None)
 
 
-def _final_retention(ledger: DocumentLedger, row: FieldsRow, sealer: _Sealer) -> date:
+async def _final_retention(
+    db: AsyncSession, ledger: DocumentLedger, row: FieldsRow, sealer: _Sealer
+) -> date:
     """The later of the ledger's retention and the fiscal year of the shared basis (a plausible
     document date, else the arrival date, never after today): a COMPLIANCE lock can never be
     shortened, so an implausible year never locks an original for longer."""
     basis = retention_basis(row.values.get("date"), ledger.ingested_at, sealer.region, sealer.now)
-    return max(ledger.retention_until, fiscal_retain_until(basis, sealer.country))
+    years = await policy_years(db, sealer.workspace_id, row.document_type)
+    return max(ledger.retention_until, fiscal_retain_until(basis, years))
 
 
 async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger) -> FieldsOut:
@@ -436,7 +438,7 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
     digest = fields_digest(row.values)
     if row.sealed_at is not None and row.fields_sha256 != digest:
         raise ApiError(LOCKED, 409)
-    final = _final_retention(ledger, row, sealer)
+    final = await _final_retention(db, ledger, row, sealer)
     # The index row frozen, in its own committed transaction. The digest is recomputed from the
     # row it locks, so values that changed since the read above are refused, never sealed
     # under a stale hash. On a retry it is already sealed with this hash: its stored
@@ -527,7 +529,6 @@ async def _sealer(
     return _Sealer(
         engine=engine,
         workspace_id=workspace.id,
-        country=org.country,
         region=org.region,
         user_id=user.id,
         ip=_ip(request),

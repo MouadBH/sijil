@@ -127,7 +127,7 @@ async def test_upload_stores_original_and_ledger_row(
     assert row.source_email_id is None
     assert row.state is DocumentState.received
     assert row.ingest_state is IngestState.queued
-    retain_until = provisional_retain_until(region_local_date(clock.now, "ma-cas"), "MA")
+    retain_until = provisional_retain_until(region_local_date(clock.now, "ma-cas"), 10)
     assert row.retention_until == retain_until
     assert row.ingested_at == clock.now
 
@@ -532,7 +532,6 @@ async def test_accept_file_cleans_up_spool_files(
             store=memory_store,
             enqueue=enqueue,
             workspace=workspace,
-            country=org.country,
             region=org.region,
             chunks=_chunks(*parts),
             source=DocumentSource.upload,
@@ -592,7 +591,6 @@ async def test_accept_file_enqueues_only_after_commit(
         store=memory_store,
         enqueue=enqueue,
         workspace=workspace,
-        country=org.country,
         region=org.region,
         chunks=_chunks(PDF),
         source=DocumentSource.upload,
@@ -624,7 +622,6 @@ async def test_accept_file_email_source_audits_email_received(
             store=memory_store,
             enqueue=enqueue,
             workspace=workspace,
-            country=org.country,
             region=org.region,
             chunks=_chunks(eml),
             source=DocumentSource.email,
@@ -639,7 +636,6 @@ async def test_accept_file_email_source_audits_email_received(
         store=memory_store,
         enqueue=enqueue,
         workspace=workspace,
-        country=org.country,
         region=org.region,
         chunks=_chunks(eml),
         source=DocumentSource.email,

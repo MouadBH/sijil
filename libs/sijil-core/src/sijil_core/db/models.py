@@ -173,6 +173,24 @@ class Workspace(Base):
     inbound_token: Mapped[str] = mapped_column(String(10), unique=True, default=new_token)
 
 
+class RetentionPolicy(Base):
+    """A workspace's retention in years for one document type. `locked` rows (all the seeded
+    ones) can be raised but never go below `preset_years`."""
+
+    __tablename__ = "retention_policy"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "document_type"),
+        CheckConstraint("years BETWEEN 1 AND 50", name="years_range"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    document_type: Mapped[str] = mapped_column(String)
+    years: Mapped[int] = mapped_column(Integer)
+    preset_years: Mapped[int] = mapped_column(Integer)
+    locked: Mapped[bool] = mapped_column(default=True, server_default=false())
+
+
 class User(Base):
     # Not "user": that is a reserved word in PostgreSQL.
     __tablename__ = "user_account"

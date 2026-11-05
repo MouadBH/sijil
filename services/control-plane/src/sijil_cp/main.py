@@ -8,7 +8,7 @@ from sijil_core.crypto import LocalKeyService
 from sijil_core.index import IndexEngines
 from sijil_core.storage import S3ObjectStore
 from sijil_cp import __version__
-from sijil_cp.api import auth, documents, health, jobs, members, orgs, review, workspaces
+from sijil_cp.api import auth, documents, health, jobs, members, orgs, retention, review, workspaces
 from sijil_cp.auth import csrf
 from sijil_cp.auth.csrf import CsrfMiddleware
 from sijil_cp.db import make_engine, make_sessionmaker
@@ -67,6 +67,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(jobs.router)
     v1.include_router(documents.router)
     v1.include_router(review.router)
+    v1.include_router(retention.router)
     app.include_router(v1)
     return app
 
