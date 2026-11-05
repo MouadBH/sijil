@@ -287,6 +287,48 @@ async def test_unexpired_compliance_refusal_records_nothing(
 
 
 @pytest.mark.db
+@pytest.mark.parametrize("first", ["tombstone", "re-upload"])
+async def test_two_rows_sharing_a_key_each_remove_only_their_own_version(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, first: str,
+) -> None:  # fmt: skip
+    """A removed document's bytes archived again (0013): one content key, two versions. Each
+    removal deletes its own version id only, whichever runs first."""
+    tomb = await _ledger(db, memory_store, workspace, user, DocumentState.removed)
+    again = DocumentLedger(
+        workspace_id=workspace.id, sha256=tomb.sha256, md5="0" * 32, size_bytes=6,
+        content_kind="pdf", source=DocumentSource.upload, object_key=tomb.object_key,
+        object_version_id="v2", state=DocumentState.filed, ingest_state=IngestState.consumed,
+        retention_until=FAR, ingested_at=NOW,
+    )  # fmt: skip
+    db.add(again)
+    await db.commit()
+    memory_store.objects[_ref(again)] = StoredObject(
+        data=b"SAMPLE", mode="GOVERNANCE", retain_until=FAR
+    )
+    await db.execute(
+        text(
+            "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+            " removed_by = :u, removal_reason = :reason WHERE id = :id"
+        ),
+        {"id": again.id, "u": user.id, "reason": REASON},
+    )
+    await db.commit()
+    rows = [tomb, await _fresh(db, again)]
+    if first == "re-upload":
+        rows.reverse()
+    store = RecordingStore(memory_store)
+    assert await _remove(rows[0], sessions, store)
+    assert store.calls == [(_ref(rows[0]), True)]
+    assert _ref(rows[1]) in memory_store.objects  # the other version untouched
+    assert (await _fresh(db, rows[1])).original_removed_at is None
+    assert await _remove(rows[1], sessions, store)
+    assert store.calls == [(_ref(rows[0]), True), (_ref(rows[1]), True)]
+    assert memory_store.versions(tomb.object_key) == []
+    assert [(await _fresh(db, r)).object_version_id for r in (tomb, again)] == ["v1", "v2"]
+
+
+@pytest.mark.db
 async def test_absent_version_counts_as_removed(
     db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
     memory_store: MemoryObjectStore,

@@ -369,6 +369,99 @@ async def test_ledger_unique_per_workspace_sha(db: AsyncSession, workspace: Work
         await db.commit()
 
 
+_TO_TERMINAL = {
+    DocumentState.removed: [
+        "state = 'removed', removed_at = now(), removed_by = :u, removal_reason = :reason"
+    ],
+    DocumentState.deleting: [
+        "state = 'sealed', fields_sha256 = repeat('f', 64), sealed_at = now(), sealed_by = :u",
+        "state = 'deleting', deletion_approved_at = now(), deletion_approved_by = :u",
+    ],
+}
+_TO_TERMINAL[DocumentState.deleted] = [
+    *_TO_TERMINAL[DocumentState.deleting],
+    "original_removed_at = now()",
+    "state = 'deleted', deleted_at = now()",
+]
+
+
+async def _tombstone(
+    db: AsyncSession, workspace: Workspace, user: User, state: DocumentState
+) -> uuid.UUID:
+    """A row brought to `state` through the transitions 0011 allows (its retention long over)."""
+    row = ledger(workspace.id, retention_until=date(2020, 12, 31))
+    db.add(row)
+    await db.commit()
+    row_id = row.id
+    for assignment in _TO_TERMINAL[state]:
+        await db.execute(
+            text(f"UPDATE document_ledger SET {assignment} WHERE id = :id"),  # noqa: S608
+            {"id": row_id, "u": user.id, "reason": "Déposé par erreur (SAMPLE)"},
+        )
+        await db.commit()
+    return row_id
+
+
+@pytest.mark.parametrize(
+    "state", [DocumentState.removed, DocumentState.deleting, DocumentState.deleted]
+)
+async def test_ledger_unique_only_among_live_rows(
+    db: AsyncSession, workspace: Workspace, user: User, state: DocumentState
+) -> None:
+    """0013: a tombstone's hash may be archived again, once: two live rows never share it."""
+    await _tombstone(db, workspace, user, state)
+    db.add(ledger(workspace.id, object_version_id="v2"))
+    await db.commit()
+    db.add(ledger(workspace.id, object_version_id="v3"))
+    with pytest.raises(IntegrityError, match="uq_document_ledger_workspace_sha256_live"):
+        await db.commit()
+
+
+async def test_0013_downgrade_refuses_shared_hashes_and_keeps_every_row(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """Down to 0012 the full unique constraint would not hold while a tombstone and a live row
+    share a hash: the downgrade refuses, in its own transaction, rather than drop either row, and
+    the partial index stays."""
+    await _tombstone(db, workspace, user, DocumentState.removed)
+    db.add(ledger(workspace.id, object_version_id="v2"))
+    await db.commit()
+    await db.close()
+    with pytest.raises(subprocess.CalledProcessError):
+        _alembic(migrated_db.owner_url, "downgrade", "0012")
+    assert await owner_conn.scalar(text("SELECT count(*) FROM document_ledger")) == 2
+    assert "uq_document_ledger_workspace_sha256" not in await _constraint_names(owner_conn)
+    assert await _has_live_index(owner_conn)
+
+
+async def _has_live_index(conn: AsyncConnection) -> bool:
+    found = await conn.scalar(
+        text("SELECT count(*) FROM pg_indexes WHERE indexname = :n"),
+        {"n": "uq_document_ledger_workspace_sha256_live"},
+    )
+    return bool(found)
+
+
+async def test_0013_downgrade_restores_the_full_constraint(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """With no hash shared, down to 0012 brings back 0004's constraint over every row, and the
+    tombstone stays."""
+    await _tombstone(db, workspace, user, DocumentState.removed)
+    await db.close()
+    _alembic(migrated_db.owner_url, "downgrade", "0012")
+    try:
+        assert "uq_document_ledger_workspace_sha256" in await _constraint_names(owner_conn)
+        assert not await _has_live_index(owner_conn)
+        assert await owner_conn.scalar(text("SELECT count(*) FROM document_ledger")) == 1
+    finally:
+        _alembic(migrated_db.owner_url, "upgrade", "head")
+    assert "uq_document_ledger_workspace_sha256" not in await _constraint_names(owner_conn)
+    assert await _has_live_index(owner_conn)
+
+
 def audit(workspace_id: uuid.UUID) -> AuditEvent:
     return AuditEvent(
         workspace_id=workspace_id,

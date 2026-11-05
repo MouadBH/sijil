@@ -106,6 +106,10 @@ TERMINAL_STATES: Final = frozenset(
 )
 
 
+# The rows among which (workspace_id, sha256) is unique (0013): every non-terminal one.
+LIVE_LEDGER_ROW: Final = "state NOT IN ('removed', 'deleting', 'deleted')"
+
+
 class ExportState(StrEnum):
     queued = "queued"
     building = "building"
@@ -316,7 +320,14 @@ class DocumentLedger(Base):
 
     __tablename__ = "document_ledger"
     __table_args__ = (
-        UniqueConstraint("workspace_id", "sha256", name="uq_document_ledger_workspace_sha256"),
+        # 0013: one live row per hash; a tombstone's bytes may be archived again beside it.
+        Index(
+            "uq_document_ledger_workspace_sha256_live",
+            "workspace_id",
+            "sha256",
+            unique=True,
+            postgresql_where=text(LIVE_LEDGER_ROW),
+        ),
         # 0008, relaxed by 0011: a sealed row has sealed_at, which only a sealed, deleting or
         # deleted row carries; sealed_at iff fields_sha256; sealed_by only once sealed.
         CheckConstraint(

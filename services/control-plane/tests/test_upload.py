@@ -187,6 +187,73 @@ async def test_upload_same_file_twice_returns_409_with_existing_id(
     ]
 
 
+async def _remove(db: AsyncSession, row_id: UUID, user_id: UUID) -> None:
+    """The Owner's pre-seal removal, as 0011 allows it (its API is test_removal_api.py)."""
+    await db.execute(
+        text(
+            "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+            " removed_by = :u, removal_reason = :reason WHERE id = :id"
+        ),
+        {"id": row_id, "u": user_id, "reason": "Déposé par erreur (SAMPLE)"},
+    )
+    await db.commit()
+
+
+async def test_reupload_after_removal_is_a_new_row_and_version(
+    uploader: Actor,
+    workspace: Workspace,
+    db: AsyncSession,
+    memory_store: MemoryObjectStore,
+    enqueuer: RecordingEnqueuer,
+) -> None:
+    """A mistaken removal never bars the same bytes from the archive: a new ledger row and a
+    new object version under the same content key (deleted and deleting rows alike:
+    test_ledger_schema.py)."""
+    first = await _upload(uploader, workspace, PDF)
+    assert first.status_code == 202
+    tomb_id = UUID(first.json()["document_id"])
+    await _remove(db, tomb_id, uploader.user_id)
+    [before] = await _ledger(db, workspace)
+
+    again = await _upload(uploader, workspace, PDF)
+    assert again.status_code == 202, again.text
+    new_id = UUID(again.json()["document_id"])
+    assert new_id != tomb_id
+    rows = {r.id: r for r in await _ledger(db, workspace)}
+    assert set(rows) == {tomb_id, new_id}
+    tomb, new = rows[tomb_id], rows[new_id]
+    assert new.state is DocumentState.received
+    assert new.object_key == tomb.object_key
+    assert new.object_version_id != tomb.object_version_id
+    # The tombstone keeps its own version: the removal worker deletes only by version id.
+    assert (tomb.state, tomb.object_version_id, tomb.retention_until) == (
+        DocumentState.removed, before.object_version_id, before.retention_until
+    )  # fmt: skip
+    assert len(memory_store.versions(new.object_key)) == 2
+    assert enqueuer.ingests == [(tomb_id, workspace.id), (new_id, workspace.id)]
+    actions = [(e.action, e.target_id) for e in await _events(db, workspace)]
+    assert actions[-1] == ("document.uploaded", str(new_id))
+
+
+async def test_reupload_while_a_live_row_exists_is_still_a_duplicate(
+    uploader: Actor, workspace: Workspace, db: AsyncSession, memory_store: MemoryObjectStore
+) -> None:
+    """Beside a tombstone, the live row is the document: a third upload is refused, pointing at
+    it and never at the tombstone."""
+    first = await _upload(uploader, workspace, PDF)
+    await _remove(db, UUID(first.json()["document_id"]), uploader.user_id)
+    live = await _upload(uploader, workspace, PDF)
+    assert live.status_code == 202
+    third = await _upload(uploader, workspace, PDF)
+    assert third.status_code == 409
+    assert third.json() == {
+        "error": {"code": "document.duplicate"},
+        "document_id": live.json()["document_id"],
+    }
+    assert len(await _ledger(db, workspace)) == 2
+    assert len(memory_store.puts) == 2
+
+
 class BarrierStore(MemoryObjectStore):
     """Holds every put until `parties` uploads have all passed the duplicate pre-check."""
 
