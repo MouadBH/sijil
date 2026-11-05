@@ -48,6 +48,7 @@ from sijil_worker.pending import PendingExtractions
 from sijil_worker.purge import (
     ConsumeInFlight,
     PurgeIncomplete,
+    TooManyMatches,
     purge_document,
     requeue_unpurged,
 )
@@ -341,6 +342,125 @@ async def test_every_checksum_match_is_deleted_across_pages(
     assert await _purge(row, sessions, keys, engines)
     assert list(fake.live) == [99]
     assert fake.trash == {}
+
+
+@pytest.mark.parametrize("lists_checksum", [True, False])
+async def test_a_paperless_ignoring_the_filter_deletes_only_the_target(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, lists_checksum: bool,
+) -> None:  # fmt: skip
+    """A Paperless that ignores the checksum filter answers every document: only the rows whose
+    `checksum` is the target's (or, when the payload has none, whose file name is ingest's for
+    it) are deleted. The workspace's other documents, live or trashed, stay."""
+    fake.ignore_checksum_filter = True
+    fake.lists_checksum = lists_checksum
+    row = await _document(db, engines, ready, user, DocumentState.removed, paperless_doc_id=None)
+    fake.add(DOC_ID, row.sha256)
+    others = {i: hashlib.sha256(f"other-{i}".encode()).hexdigest() for i in range(20, 32)}
+    for doc_id, sha in others.items():
+        fake.add(doc_id, sha)
+    fake.add(40, hashlib.sha256(b"trashed").hexdigest(), trashed=True)
+    assert await _purge(row, sessions, keys, engines)
+    assert sorted(fake.live) == sorted(others)
+    assert list(fake.trash) == [40]
+    deletes = [p for m, p in fake.methods() if m == "DELETE"]
+    assert deletes == [f"/api/documents/{DOC_ID}/"]
+
+
+async def test_a_trashed_namesake_with_another_checksum_stays(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """The trash follows the same rule: a trashed document whose payload names another
+    checksum is not this one, whatever its file name."""
+    row = await _document(db, engines, ready, user, DocumentState.removed, paperless_doc_id=None)
+    fake.add(41, hashlib.sha256(b"namesake").hexdigest(), name=f"{row.sha256[:12]}.pdf",
+             trashed=True)  # fmt: skip
+    assert await _purge(row, sessions, keys, engines)
+    assert list(fake.trash) == [41]
+
+
+async def test_more_than_ten_true_matches_refuses_the_purge(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """More than ten copies is not a tenant the purge understands: an error is logged, nothing
+    is deleted or recorded, and the error is not transient (the task logs it and keeps its
+    key, so the sweep tries again an hour later)."""
+    row = await _document(db, engines, ready, user, DocumentState.removed)
+    for doc_id in range(DOC_ID, DOC_ID + 11):
+        fake.add(doc_id, row.sha256)
+    with caplog.at_level("ERROR", logger="sijil_worker.purge"), pytest.raises(TooManyMatches):
+        await _purge(row, sessions, keys, engines)
+    assert [r for r in caplog.records if r.levelname == "ERROR"]
+    assert not any(method in ("DELETE", "POST") and path != "/api/token/"
+                   for method, path in fake.methods())  # fmt: skip
+    assert len(fake.live) == 11
+    assert await _index_row(engines, ready, row.id) is not None
+    assert [e.action for e in await _events(db, ready)] == []
+    assert not tasks.is_purge_transient(TooManyMatches(11))
+
+
+async def test_ten_matches_are_still_purged(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    row = await _document(db, engines, ready, user, DocumentState.removed)
+    for doc_id in range(DOC_ID, DOC_ID + 10):
+        fake.add(doc_id, row.sha256)
+    assert await _purge(row, sessions, keys, engines)
+    assert (fake.live, fake.trash) == ({}, {})
+
+
+async def _live_sibling(
+    db: AsyncSession, of: DocumentLedger, *, paperless_doc_id: int | None,
+    ingest_state: IngestState = IngestState.consumed,
+) -> DocumentLedger:  # fmt: skip
+    """The tombstone's bytes archived again (0013): a live row with the same hash."""
+    row = DocumentLedger(
+        workspace_id=of.workspace_id, sha256=of.sha256, md5="0" * 32, size_bytes=10,
+        content_kind="pdf", source=DocumentSource.upload, object_key=of.object_key,
+        object_version_id="v2", state=DocumentState.received, ingest_state=ingest_state,
+        paperless_doc_id=paperless_doc_id, retention_until=FAR, ingested_at=NOW,
+    )  # fmt: skip
+    db.add(row)
+    await db.commit()
+    return row
+
+
+@pytest.mark.parametrize("sibling_copy", [8, DOC_ID])
+async def test_a_tombstones_purge_spares_the_copy_of_its_live_re_upload(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, sibling_copy: int,
+) -> None:  # fmt: skip
+    """The same bytes archived again after the removal: the purge of the tombstone (a late
+    message, or the sweep) never deletes the copy the live row recorded, its own upload (8) or
+    the tombstone's copy it adopted by checksum (DOC_ID)."""
+    row = await _document(db, engines, ready, user, DocumentState.removed)
+    fake.add(DOC_ID, row.sha256)
+    fake.add(8, row.sha256)
+    await _live_sibling(db, row, paperless_doc_id=sibling_copy)
+    assert await _purge(row, sessions, keys, engines)
+    assert sibling_copy in fake.live
+    assert [p for m, p in fake.methods() if m == "DELETE"] == [
+        f"/api/documents/{i}/" for i in (DOC_ID, 8) if i != sibling_copy
+    ]
+
+
+async def test_a_tombstones_purge_waits_for_its_re_upload_to_settle(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """A live re-upload still on its way into Paperless may adopt any copy with this checksum:
+    nothing is deleted until it has recorded its own."""
+    row = await _document(db, engines, ready, user, DocumentState.removed)
+    fake.add(DOC_ID, row.sha256)
+    await _live_sibling(db, row, paperless_doc_id=None, ingest_state=IngestState.sending)
+    with pytest.raises(ConsumeInFlight):
+        await _purge(row, sessions, keys, engines)
+    assert not any(method == "DELETE" for method, _ in fake.methods())
+    assert DOC_ID in fake.live
+    assert [e.action for e in await _events(db, ready)] == []
 
 
 async def test_a_trashed_copy_is_found_by_its_file_name_and_emptied(

@@ -28,6 +28,11 @@ class FakePaperless:
         self.calls: list[tuple[str, str, str | None, Any]] = []
         self.keep_in_trash = False  # an `empty` that answers 200 but keeps them
         self.down = False
+        # A Paperless that ignores the checksum filter (an undeclared one, as 3.4.1 does with a
+        # bare `checksum=`) and lists every live document.
+        self.ignore_checksum_filter = False
+        # Whether list rows (documents and trash) carry `checksum`; `original_file_name` always.
+        self.lists_checksum = True
 
     def add(
         self, doc_id: int, sha256: str, *, name: str | None = None, trashed: bool = False
@@ -38,6 +43,12 @@ class FakePaperless:
 
     def methods(self) -> list[tuple[str, str]]:
         return [(method, path) for method, path, _, _ in self.calls]
+
+    def _row(self, doc_id: int, entry: tuple[str, str]) -> dict[str, Any]:
+        row: dict[str, Any] = {"id": doc_id, "original_file_name": entry[1]}
+        if self.lists_checksum:
+            row["checksum"] = entry[0]
+        return row
 
     @staticmethod
     def _page(request: httpx.Request, rows: list[dict[str, Any]]) -> httpx.Response:
@@ -65,7 +76,11 @@ class FakePaperless:
             return httpx.Response(403)
         if request.method == "GET" and path == "/api/documents/":
             wanted = request.url.params["checksum__iexact"].lower()
-            rows = [{"id": i} for i, (sha, _) in sorted(self.live.items()) if sha == wanted]
+            rows = [
+                self._row(i, entry)
+                for i, entry in sorted(self.live.items())
+                if self.ignore_checksum_filter or entry[0] == wanted
+            ]
             return self._page(request, rows)
         if request.method == "DELETE" and path.startswith("/api/documents/"):
             doc_id = int(path.split("/")[3])
@@ -74,9 +89,7 @@ class FakePaperless:
             self.trash[doc_id] = self.live.pop(doc_id)
             return httpx.Response(204)
         if request.method == "GET" and path == "/api/trash/":
-            trashed: list[dict[str, Any]] = [
-                {"id": i, "original_file_name": n} for i, (_, n) in sorted(self.trash.items())
-            ]
+            trashed = [self._row(i, entry) for i, entry in sorted(self.trash.items())]
             return self._page(request, trashed)
         if request.method == "POST" and path == "/api/trash/":
             assert body is not None

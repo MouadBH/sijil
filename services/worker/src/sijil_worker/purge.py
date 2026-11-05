@@ -25,7 +25,15 @@ sends it again when it stops on a removed row after an upload. `purge_document`:
    error logged, and never recorded purged;
 5. finds every copy: the ledger's id, the document a finished consume task produced, every live
    document with this SHA-256 (all pages: 3.4.1 keeps duplicates), and every trashed document
-   with ingest's file name `{sha256[:12]}.{ext}` (the trash has no checksum filter);
+   with ingest's file name `{sha256[:12]}.{ext}` (the trash has no checksum filter). A listed
+   row counts only when it is a copy (`paperless.is_copy_of`: its `checksum` is this SHA-256,
+   or, when the payload carries none, its file name is ingest's), never on Paperless's filter
+   alone: one it ignores answers every document. More than MAX_MATCHES (10) copies is not a
+   tenant this understands: TooManyMatches (not transient: an error logged, nothing deleted or
+   recorded, the sweep sends it again an hour later);
+   the same bytes may be archived again after a removal (0013): a live row with this SHA-256
+   keeps the copy it recorded, and while it has recorded none and its ingest may still run
+   (it adopts any copy with this checksum), the purge waits (ConsumeInFlight), deleting nothing;
 6. deletes the live ones (a 404 counts as deleted) and empties each from the trash (400: not in
    it, i.e. emptied already), then lists the trash again: a copy still there raises
    PurgeIncomplete (transient), so `document.purged` is recorded only once Paperless keeps none;
@@ -53,6 +61,7 @@ from sijil_core import audit
 from sijil_core import index as index_db
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     AuditEvent,
     CredentialKind,
@@ -91,6 +100,8 @@ _TASK_DONE = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
 CONSUME_BOUND: Final = timedelta(hours=24)
 RECHECK_MIN: Final = timedelta(minutes=1)
 RECHECK_MAX: Final = timedelta(hours=1)
+# More copies than this and the purge refuses (TooManyMatches): never a bulk delete.
+MAX_MATCHES: Final = 10
 
 
 class ConsumeInFlight(Exception):  # noqa: N818 - a state, not an error
@@ -104,6 +115,15 @@ class ConsumeInFlight(Exception):  # noqa: N818 - a state, not an error
 
 class PurgeIncomplete(Exception):  # noqa: N818
     """A copy is still in Paperless's trash after it was emptied. Transient: purge again."""
+
+
+class TooManyMatches(Exception):  # noqa: N818
+    """More than MAX_MATCHES Paperless documents are copies of this one: nothing is deleted.
+    Not transient: the task logs it, and the sweep sends the purge again later."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(f"{count} copies in Paperless, more than {MAX_MATCHES}")
+        self.count = count
 
 
 @dataclass(frozen=True)
@@ -121,6 +141,10 @@ class _Target:
     claimed_at: datetime | None
     next_attempt_at: datetime | None
     decided_at: datetime | None  # the removal (or the approved deletion)
+    # Live rows with the same bytes (archived again after this one's removal, 0013): the copies
+    # they recorded, and whether one has recorded none yet while its ingest may still run.
+    kept: frozenset[int]
+    sibling_unsettled: bool
 
 
 async def _target(
@@ -168,6 +192,16 @@ async def _target(
             keys,
             credential_context(workspace.id, kind),
         ).decode()
+        siblings = (
+            await session.execute(
+                select(DocumentLedger.paperless_doc_id, DocumentLedger.ingest_state).where(
+                    DocumentLedger.workspace_id == workspace.id,
+                    DocumentLedger.sha256 == ledger.sha256,
+                    DocumentLedger.id != ledger.id,
+                    DocumentLedger.state.not_in(TERMINAL_STATES),
+                )
+            )
+        ).all()
         return _Target(
             ledger_id=ledger_id,
             workspace=workspace,
@@ -182,6 +216,10 @@ async def _target(
             claimed_at=ledger.ingest_claimed_at,
             next_attempt_at=ledger.ingest_next_attempt_at,
             decided_at=ledger.removed_at or ledger.deletion_approved_at,
+            kept=frozenset(d for d, _ in siblings if d is not None),
+            sibling_unsettled=any(
+                d is None and st in (IngestState.queued, IngestState.sending) for d, st in siblings
+            ),
         )
 
 
@@ -216,7 +254,14 @@ class _Found:
 
 
 async def _copies(client: PaperlessClient, target: _Target, now: datetime) -> _Found:
-    """Every live copy Paperless holds (see the module docstring, steps 4 and 5)."""
+    """Every live copy Paperless holds (see the module docstring, steps 4 and 5), but those a
+    live row with the same bytes recorded."""
+    if target.sibling_unsettled:
+        log.info(
+            "purge of document %s waits: its bytes, archived again, are still being ingested",
+            target.ledger_id,
+        )
+        raise ConsumeInFlight(_recheck_in(_waited(target, now)))
     found = _Found(ids=set())
     if target.paperless_doc_id is not None:
         found.ids.add(target.paperless_doc_id)
@@ -241,12 +286,17 @@ async def _copies(client: PaperlessClient, target: _Target, now: datetime) -> _F
             found.ids.add(task.related_document)
         elif _recent_upload(target, now):
             raise ConsumeInFlight(_recheck_in(waited))
-    found.ids.update(await client.documents_with_checksum(target.sha256))
+    found.ids.update(await client.documents_with_checksum(target.sha256, filename=target.filename))
+    found.ids -= target.kept
     return found
 
 
-async def _trashed(client: PaperlessClient, filename: str) -> set[int]:
-    return {d.id for d in await client.trashed_documents() if d.original_file_name == filename}
+async def _trashed(client: PaperlessClient, target: _Target) -> set[int]:
+    return {
+        d.id
+        for d in await client.trashed_documents()
+        if d.is_copy_of(target.sha256, target.filename) and d.id not in target.kept
+    }
 
 
 async def _purge_paperless(
@@ -258,6 +308,13 @@ async def _purge_paperless(
         token = await anonymous.obtain_token(ADMIN_USERNAME, target.admin_password)
     async with paperless(target.paperless_url, token=token) as client:
         found = await _copies(client, target, now)
+        matches = len(found.ids | await _trashed(client, target))
+        if matches > MAX_MATCHES:
+            log.error(
+                "purge of document %s refused: %d copies in Paperless, more than %d",
+                target.ledger_id, matches, MAX_MATCHES,
+            )  # fmt: skip
+            raise TooManyMatches(matches)
         deleted: set[int] = set()
         for doc_id in sorted(found.ids):
             try:
@@ -268,7 +325,7 @@ async def _purge_paperless(
                 continue  # absent: deleted already, perhaps still in the trash (found below)
             deleted.add(doc_id)
         emptied: set[int] = set()
-        for doc_id in sorted(deleted | await _trashed(client, target.filename)):
+        for doc_id in sorted(deleted | await _trashed(client, target)):
             try:
                 await client.empty_trash([doc_id])
             except PaperlessError as exc:
@@ -278,7 +335,8 @@ async def _purge_paperless(
             emptied.add(doc_id)
         ours = deleted | emptied
         if any(
-            d.id in ours or d.original_file_name == target.filename
+            d.id in ours
+            or (d.is_copy_of(target.sha256, target.filename) and d.id not in target.kept)
             for d in await client.trashed_documents()
         ):
             raise PurgeIncomplete

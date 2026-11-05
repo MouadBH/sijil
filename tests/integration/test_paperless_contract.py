@@ -163,7 +163,7 @@ async def test_admin_delete_and_empty_trash_as_the_purge_does(admin: PaperlessCl
         assert task.status == "SUCCESS"
         assert task.related_document is not None
         doc_id = task.related_document
-        assert await client.documents_with_checksum(sha256) == [doc_id]
+        assert await client.documents_with_checksum(sha256, filename=filename) == [doc_id]
         with pytest.raises(PaperlessError) as live:
             await client.empty_trash([doc_id])  # still live: not in the trash
         assert live.value.status == 400
@@ -171,7 +171,7 @@ async def test_admin_delete_and_empty_trash_as_the_purge_does(admin: PaperlessCl
         with pytest.raises(PaperlessError) as gone:
             await client.get_document(doc_id)
         assert gone.value.status == 404
-        assert await client.documents_with_checksum(sha256) == []
+        assert await client.documents_with_checksum(sha256, filename=filename) == []
         trashed = {d.id: d.original_file_name for d in await client.trashed_documents()}
         assert trashed[doc_id] == filename
         await client.empty_trash([doc_id])

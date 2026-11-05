@@ -40,7 +40,7 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, fields_digest
 from sijil_core.index import FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.paperless import PaperlessClient
-from sijil_worker.purge import purge_document
+from sijil_worker.purge import TooManyMatches, purge_document
 from sijil_worker.settings import WorkerSettings
 from tests.support.fake_paperless import FakePaperless, fake_paperless
 from tests.support.index_db import throwaway_index_db
@@ -295,5 +295,39 @@ async def test_the_region_is_asserted_first(
     assert not await _purge(row, sessions, keys, engines, settings=elsewhere)
     assert fake.calls == []
     assert DOC_ID in fake.live
+    assert await _index_row(engines, ws, row.id) is not None
+    assert await _purged(db, ws) == []
+
+
+@pytest.mark.parametrize("state", [DocumentState.removed, DocumentState.deleted])
+async def test_a_filter_paperless_ignores_never_widens_the_purge(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ws: Workspace,
+    user: User, fake: FakePaperless, state: DocumentState,
+) -> None:  # fmt: skip
+    """The one automatic bulk delete never trusts Paperless's filter alone: when it answers every
+    document, only the target's copy goes and the working copies of sealed documents stay."""
+    row = await _row(db, engines, ws, user, state)
+    fake.ignore_checksum_filter = True
+    fake.add(DOC_ID, row.sha256)
+    for doc_id in range(20, 25):  # other documents, sealed ones among them
+        fake.add(doc_id, hashlib.sha256(f"sealed-{doc_id}".encode()).hexdigest())
+    assert await _purge(row, sessions, keys, engines)
+    assert sorted(fake.live) == list(range(20, 25))
+    assert [p for m, p in fake.methods() if m == "DELETE"] == [f"/api/documents/{DOC_ID}/"]
+
+
+async def test_more_than_ten_matches_deletes_nothing(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ws: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """More than ten true matches: the purge refuses before any delete and records nothing."""
+    row = await _row(db, engines, ws, user, DocumentState.removed)
+    for doc_id in range(DOC_ID, DOC_ID + 11):
+        fake.add(doc_id, row.sha256)
+    with pytest.raises(TooManyMatches):
+        await _purge(row, sessions, keys, engines)
+    assert len(fake.live) == 11
+    assert not any(m == "DELETE" or (m == "POST" and p == "/api/trash/")
+                   for m, p in fake.methods())  # fmt: skip
     assert await _index_row(engines, ws, row.id) is not None
     assert await _purged(db, ws) == []

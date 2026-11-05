@@ -328,7 +328,9 @@ async def test_m4_acceptance(
                         return True
                     trashed = {d.id for d in await admin.trashed_documents()}
                     return bool(
-                        await admin.documents_with_checksum(removed.sha256)
+                        await admin.documents_with_checksum(
+                            removed.sha256, filename=f"{removed.sha256[:12]}.pdf"
+                        )
                         or removed.paperless_doc_id in trashed
                     )
 
