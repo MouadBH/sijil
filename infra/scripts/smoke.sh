@@ -237,4 +237,48 @@ case "$(compose port smtp 2525 2>/dev/null)" in
   *) fail "smtp published beyond localhost" ;;
 esac
 
+# The export worker: the only holder of the signing seed and the export key, consuming
+# `export`, on `core` only, with no Docker socket.
+ping_out=$(compose exec -T worker-export celery -A sijil_worker.main_export inspect ping \
+  --timeout 10 2>/dev/null)
+grep -A1 'export@' <<<"$ping_out" | grep -q pong \
+  && pass "export worker answers celery ping" || fail "export worker ping"
+sock=$(compose exec -T worker-export sh -c \
+  'if [ -S /var/run/docker.sock ]; then echo socket; else echo none; fi' 2>/dev/null | tr -d '\r')
+case "$sock" in
+  none) pass "export worker has no Docker socket" ;;
+  socket) fail "export worker has the Docker socket" ;;
+  *) fail "export worker socket check could not run (exec failed)" ;;
+esac
+export_id=$(compose ps -q worker-export 2>/dev/null)
+nets=$(docker inspect "$export_id" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' 2>/dev/null)
+[ "$nets" = "${project:-sijil}_core " ] \
+  && pass "export worker is on the core network only" \
+  || fail "export worker networks: '$nets' (only ${project:-sijil}_core expected)"
+export_key=$(sed -n 's/^SIJIL_OBJECTSTORE_EXPORT_ACCESS_KEY=//p' .env)
+held=$(compose exec -T worker-export printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')
+[ -n "$export_key" ] && [ "$held" = "$export_key" ] \
+  && pass "export worker uses the export key" || fail "export worker object-store key"
+seed=$(sed -n 's/^SIJIL_EXPORT_SIGNING_KEY=//p' .env)
+held=$(compose exec -T worker-export printenv SIJIL_EXPORT_SIGNING_KEY 2>/dev/null | tr -d '\r')
+[ -n "$seed" ] && [ "$held" = "$seed" ] \
+  && pass "export worker holds the signing seed" || fail "export worker signing seed"
+for svc in control-plane worker worker-extraction worker-seal worker-removal smtp beat; do
+  names=$(env_names "$svc")
+  values=$(compose exec -T "$svc" sh -c 'env | cut -d= -f2-' 2>/dev/null | tr -d '\r')
+  if grep -qx exec-failed <<<"$names" || [ -z "$names" ]; then
+    fail "$svc env check could not run (exec failed)"
+  elif grep -q '^SIJIL_EXPORT_SIGNING_KEY$\|^SIJIL_OBJECTSTORE_EXPORT_' <<<"$names" \
+    || { [ -n "$seed" ] && grep -qxF -- "$seed" <<<"$values"; } \
+    || [ "$(compose exec -T "$svc" printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')" = "$export_key" ]; then
+    fail "$svc holds the signing seed or the export key"
+  else
+    pass "$svc holds neither the signing seed nor the export key"
+  fi
+done
+public=$(sed -n 's/^SIJIL_EXPORT_PUBLIC_KEY=//p' .env)
+curl -s localhost:8000/v1/regions/ma-cas/export-key | grep -qF "\"public_key\":\"$public\"" \
+  && pass "control plane publishes the region's export key" || fail "published export key"
+
 if [ "$failures" -eq 0 ]; then echo "smoke: all checks passed"; else echo "smoke: $failures check(s) failed"; exit 1; fi

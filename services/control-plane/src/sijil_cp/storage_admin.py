@@ -17,6 +17,13 @@ Only the one-shot `migrate` service holds the RustFS root key. It creates (idemp
   holds: read an original's retention and delete a version, with the bypass, so it can delete an
   unsealed (GOVERNANCE) original or one whose lock has expired. It never reads or writes bytes,
   never changes a retention, and the unversioned delete (a delete marker) is denied.
+- `SIJIL_OBJECTSTORE_EXPORT_ACCESS_KEY` (policy `sijil-export`), which only `worker-export`
+  holds: read an original (any version) and put, read and delete the built exports in the
+  exports bucket (`<bucket>-exports`, no versioning, no object lock). It never writes,
+  deletes or relocks an original.
+
+The app key also reads the exports bucket (the control plane streams a download), and only
+reads it.
 
 Nobody, the root key included, can delete or shorten a COMPLIANCE lock before its date.
 
@@ -26,7 +33,7 @@ S3 SigV4 signatures.
 
 import json
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from botocore.auth import S3SigV4Auth
@@ -35,7 +42,7 @@ from botocore.credentials import Credentials
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from sijil_core.storage import StorageSettings
+from sijil_core.storage import StorageSettings, exports_bucket
 
 APP_POLICY_NAME = "sijil-app"
 _SIGNING_REGION = "us-east-1"  # S3 signing region, not the Sijil region
@@ -105,6 +112,27 @@ REMOVAL_DENIED_ACTIONS = (
 )
 
 
+EXPORT_POLICY_NAME = "sijil-export"
+EXPORT_ORIGINALS_ACTIONS = ("s3:GetObject", "s3:GetObjectVersion")  # versioned reads
+EXPORT_EXPORTS_ACTIONS = ("s3:PutObject", "s3:GetObject", "s3:DeleteObject")
+EXPORT_DENIED_ON_ORIGINALS = (
+    "s3:PutObject",
+    "s3:PutObjectRetention",
+    "s3:BypassGovernanceRetention",
+    "s3:DeleteObject",
+    "s3:DeleteObjectVersion",
+    "s3:PutObjectLegalHold",
+    *_BUCKET_CONFIGURATION,
+)
+# The control plane's download: the app key reads a built export and nothing more.
+APP_DENIED_ON_EXPORTS = ("s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion")
+
+
+class _Credential(Protocol):
+    @property
+    def access_key(self) -> SecretStr: ...
+
+
 class AppCredentialSettings(BaseSettings):
     """The services' object-store credential, as `migrate` provisions it."""
 
@@ -139,7 +167,20 @@ class RemovalCredentialSettings(BaseSettings):
     secret_key: SecretStr
 
 
+class ExportCredentialSettings(BaseSettings):
+    """The export worker's credential (`worker-export` alone holds it), as `migrate`
+    provisions it."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SIJIL_OBJECTSTORE_EXPORT_", extra="ignore", hide_input_in_errors=True
+    )
+
+    access_key: SecretStr
+    secret_key: SecretStr
+
+
 def app_policy(bucket: str) -> dict[str, Any]:
+    exports = exports_bucket(bucket)
     return {
         "Version": "2012-10-17",
         "Statement": [
@@ -160,6 +201,18 @@ def app_policy(bucket: str) -> dict[str, Any]:
                 "Effect": "Deny",
                 "Action": list(APP_DENIED_ACTIONS),
                 "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            },
+            {
+                "Sid": "ReadExports",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{exports}/*"],
+            },
+            {
+                "Sid": "NeverWriteExports",
+                "Effect": "Deny",
+                "Action": list(APP_DENIED_ON_EXPORTS),
+                "Resource": [f"arn:aws:s3:::{exports}/*"],
             },
         ],
     }
@@ -200,6 +253,39 @@ def removal_policy(bucket: str) -> dict[str, Any]:
                 "Effect": "Deny",
                 "Action": list(REMOVAL_DENIED_ACTIONS),
                 "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            },
+        ],
+    }
+
+
+def export_policy(bucket: str) -> dict[str, Any]:
+    exports = exports_bucket(bucket)
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "ReadOriginals",
+                "Effect": "Allow",
+                "Action": list(EXPORT_ORIGINALS_ACTIONS),
+                "Resource": [f"arn:aws:s3:::{bucket}/*"],
+            },
+            {
+                "Sid": "NeverWriteOriginals",
+                "Effect": "Deny",
+                "Action": list(EXPORT_DENIED_ON_ORIGINALS),
+                "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            },
+            {
+                "Sid": "Exports",
+                "Effect": "Allow",
+                "Action": list(EXPORT_EXPORTS_ACTIONS),
+                "Resource": [f"arn:aws:s3:::{exports}/*"],
+            },
+            {
+                "Sid": "NeverReconfigureExports",
+                "Effect": "Deny",
+                "Action": list(_BUCKET_CONFIGURATION),
+                "Resource": [f"arn:aws:s3:::{exports}"],
             },
         ],
     }
@@ -284,7 +370,7 @@ def ensure_seal_user(
 def ensure_removal_user(
     root: StorageSettings,
     removal: RemovalCredentialSettings,
-    others: Sequence[AppCredentialSettings | SealCredentialSettings],
+    others: Sequence[_Credential],
     client: httpx.Client | None = None,
 ) -> None:
     """Create or update the removal user, its policy and the binding. Safe to run repeatedly."""
@@ -296,4 +382,22 @@ def ensure_removal_user(
     _ensure_user(
         root, access_key, removal.secret_key, REMOVAL_POLICY_NAME,
         removal_policy(root.objectstore_bucket), client,
+    )  # fmt: skip
+
+
+def ensure_export_user(
+    root: StorageSettings,
+    export: ExportCredentialSettings,
+    others: Sequence[_Credential],
+    client: httpx.Client | None = None,
+) -> None:
+    """Create or update the export user, its policy and the binding. Safe to run repeatedly."""
+    access_key = export.access_key.get_secret_value()
+    taken = {root.objectstore_access_key.get_secret_value()}
+    taken |= {other.access_key.get_secret_value() for other in others}
+    if access_key in taken:
+        raise ValueError("the export credential must differ from every other credential")
+    _ensure_user(
+        root, access_key, export.secret_key, EXPORT_POLICY_NAME,
+        export_policy(root.objectstore_bucket), client,
     )  # fmt: skip

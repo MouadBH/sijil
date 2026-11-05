@@ -1,10 +1,11 @@
 from ipaddress import IPv4Network
 from typing import Annotated, Any
 
-from pydantic import RedisDsn, field_validator
+from pydantic import RedisDsn, SecretStr, field_validator
 from pydantic_settings import NoDecode
 
 from sijil_core.crypto import KeySettings
+from sijil_core.export_report import decode_key
 from sijil_core.settings import CoreSettings
 from sijil_core.storage import StorageSettings
 
@@ -31,6 +32,26 @@ class RemovalSettings(StorageSettings, BrokerSettings):
     no provisioner role, no tenant or AI settings, no app or seal key."""
 
     database_url: str
+
+
+class ExportSettings(KeySettings, StorageSettings, BrokerSettings):
+    """The export worker (`-Q export`): the control-plane database as the app role, the broker,
+    the master key (to open the workspaces' index databases, as the control plane does), the
+    object store through the export key (read originals, own the exports bucket) and the
+    region's Ed25519 signing seed (SIJIL_EXPORT_SIGNING_KEY, base64 of the raw 32 bytes), which
+    no other service holds. No provisioner role, no tenant or AI settings."""
+
+    database_url: str
+    export_signing_key: SecretStr
+
+    @field_validator("export_signing_key")
+    @classmethod
+    def _check_seed(cls, v: SecretStr) -> SecretStr:
+        decode_key(v.get_secret_value())  # fail at boot, not at the first export
+        return v
+
+    def signing_seed(self) -> bytes:
+        return decode_key(self.export_signing_key.get_secret_value())
 
 
 class ExtractionSettings(KeySettings, BrokerSettings):

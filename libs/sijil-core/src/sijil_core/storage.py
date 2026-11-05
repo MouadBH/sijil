@@ -121,22 +121,46 @@ def _retention_absent(exc: ClientError) -> bool:
     return _error_code(exc) == "InternalError" and message.startswith("Version not found")
 
 
+def _client(settings: StorageSettings) -> "S3Client":
+    return boto3.client(
+        "s3",
+        endpoint_url=str(settings.objectstore_endpoint),
+        aws_access_key_id=settings.objectstore_access_key.get_secret_value(),
+        aws_secret_access_key=settings.objectstore_secret_key.get_secret_value(),
+        region_name=_SIGNING_REGION,
+        config=Config(
+            s3={"addressing_style": "path"},
+            retries={"max_attempts": 3, "mode": "standard"},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+        ),
+    )
+
+
+def _sha256_b64(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while block := source.read(CHUNK_BYTES):
+            digest.update(block)
+    return base64.b64encode(digest.digest()).decode()
+
+
+async def _stream(body: Any) -> AsyncIterator[bytes]:
+    chunks: Iterator[bytes] = body.iter_chunks(CHUNK_BYTES)
+    try:
+        while True:
+            chunk = await asyncio.to_thread(next, chunks, None)
+            if chunk is None:
+                return
+            yield chunk
+    finally:
+        await asyncio.to_thread(body.close)
+
+
 class S3ObjectStore(ObjectStore):
     def __init__(self, settings: StorageSettings) -> None:
         self.bucket = settings.objectstore_bucket
-        self.client: S3Client = boto3.client(
-            "s3",
-            endpoint_url=str(settings.objectstore_endpoint),
-            aws_access_key_id=settings.objectstore_access_key.get_secret_value(),
-            aws_secret_access_key=settings.objectstore_secret_key.get_secret_value(),
-            region_name=_SIGNING_REGION,
-            config=Config(
-                s3={"addressing_style": "path"},
-                retries={"max_attempts": 3, "mode": "standard"},
-                request_checksum_calculation="when_required",
-                response_checksum_validation="when_required",
-            ),
-        )
+        self.client: S3Client = _client(settings)
 
     async def ensure_bucket(self) -> None:
         await asyncio.to_thread(self._ensure_bucket)
@@ -166,11 +190,7 @@ class S3ObjectStore(ObjectStore):
     def _put(self, key: str, path: Path, retain_until: date) -> ObjectRef:
         # The store verifies the bytes it received against this digest, so corruption in
         # transit is rejected instead of being locked for the retention period.
-        digest = hashlib.sha256()
-        with path.open("rb") as source:
-            while block := source.read(CHUNK_BYTES):
-                digest.update(block)
-        checksum = base64.b64encode(digest.digest()).decode()
+        checksum = _sha256_b64(path)
         with path.open("rb") as body:
             out = self.client.put_object(
                 Bucket=self.bucket,
@@ -189,15 +209,8 @@ class S3ObjectStore(ObjectStore):
                 Bucket=self.bucket, Key=ref.key, VersionId=ref.version_id
             )["Body"]
         )
-        chunks: Iterator[bytes] = body.iter_chunks(CHUNK_BYTES)
-        try:
-            while True:
-                chunk = await asyncio.to_thread(next, chunks, None)
-                if chunk is None:
-                    return
-                yield chunk
-        finally:
-            await asyncio.to_thread(body.close)
+        async for chunk in _stream(body):
+            yield chunk
 
     async def head(self, ref: ObjectRef) -> int | None:
         return await asyncio.to_thread(self._head, ref)
@@ -307,4 +320,90 @@ class S3ObjectStore(ObjectStore):
                 raise
 
 
-__all__ = ["ObjectRef", "ObjectStore", "RetentionActive", "S3ObjectStore", "StorageSettings"]
+def exports_bucket(originals_bucket: str) -> str:
+    """The region's exports bucket, beside its originals bucket."""
+    return f"{originals_bucket}-exports"
+
+
+class ExportStore(Protocol):
+    """Built exports (`<workspace_id>/<job_id>.zip`): a plain bucket, no versioning, no object
+    lock. The export worker puts, reads and deletes them; the control plane only reads them."""
+
+    async def ensure_bucket(self) -> None: ...
+
+    async def put_export(self, key: str, path: Path) -> None: ...
+
+    def open_export(self, key: str) -> AsyncIterator[bytes]: ...
+
+    async def delete_export(self, key: str) -> None:
+        """Delete the object; an absent one counts as deleted."""
+        ...
+
+
+class S3ExportStore(ExportStore):
+    def __init__(self, settings: StorageSettings) -> None:
+        self.bucket = exports_bucket(settings.objectstore_bucket)
+        self.client: S3Client = _client(settings)
+
+    async def ensure_bucket(self) -> None:
+        await asyncio.to_thread(self._ensure_bucket)
+
+    def _ensure_bucket(self) -> None:
+        try:
+            self.client.head_bucket(Bucket=self.bucket)
+        except ClientError as exc:
+            if _error_code(exc) not in _ABSENT_CODES:
+                raise
+            try:
+                self.client.create_bucket(Bucket=self.bucket)
+            except ClientError as created:
+                if _error_code(created) not in {"BucketAlreadyOwnedByYou", "BucketAlreadyExists"}:
+                    raise
+        # An expired export must really go: a versioned bucket would keep its old version.
+        versioning = self.client.get_bucket_versioning(Bucket=self.bucket).get("Status")
+        if versioning in ("Enabled", "Suspended"):
+            raise RuntimeError(f"bucket {self.bucket} must not be versioned")
+
+    async def put_export(self, key: str, path: Path) -> None:
+        await asyncio.to_thread(self._put, key, path)
+
+    def _put(self, key: str, path: Path) -> None:
+        checksum = _sha256_b64(path)
+        with path.open("rb") as body:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ChecksumAlgorithm="SHA256",
+                ChecksumSHA256=checksum,
+                ContentType="application/zip",
+            )
+
+    async def open_export(self, key: str) -> AsyncIterator[bytes]:
+        body = await asyncio.to_thread(
+            lambda: self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
+        )
+        async for chunk in _stream(body):
+            yield chunk
+
+    async def delete_export(self, key: str) -> None:
+        await asyncio.to_thread(self._delete, key)
+
+    def _delete(self, key: str) -> None:
+        try:
+            self.client.delete_object(Bucket=self.bucket, Key=key)
+        except ClientError as exc:
+            if _error_code(exc) not in _ABSENT_CODES:
+                raise
+
+
+__all__ = [
+    "ExportStore",
+    "ObjectRef",
+    "ObjectStore",
+    "RetentionActive",
+    "S3ExportStore",
+    "S3ObjectStore",
+    "StorageSettings",
+    "exports_bucket",
+]

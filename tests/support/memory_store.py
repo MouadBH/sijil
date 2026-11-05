@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from sijil_core.storage import ObjectRef, ObjectStore, RetentionActive
+from sijil_core.storage import ExportStore, ObjectRef, ObjectStore, RetentionActive
 
 CHUNK_BYTES = 1024 * 1024
 
@@ -96,3 +96,29 @@ class MemoryObjectStore(ObjectStore):
 
     def versions(self, key: str) -> list[ObjectRef]:
         return [ref for ref in self.objects if ref.key == key]
+
+
+class MemoryExportStore(ExportStore):
+    """The exports bucket in memory: plain objects by key, no versions, no lock."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.deleted: list[str] = []
+
+    async def ensure_bucket(self) -> None:
+        return None
+
+    async def put_export(self, key: str, path: Path) -> None:
+        self.objects[key] = path.read_bytes()  # noqa: ASYNC240 - test double, small files
+
+    async def open_export(self, key: str) -> AsyncIterator[bytes]:
+        try:
+            data = self.objects[key]
+        except KeyError:
+            raise FileNotFoundError(key) from None
+        for start in range(0, len(data), CHUNK_BYTES):
+            yield data[start : start + CHUNK_BYTES]
+
+    async def delete_export(self, key: str) -> None:
+        if self.objects.pop(key, None) is not None:
+            self.deleted.append(key)

@@ -11,12 +11,14 @@ from uuid import UUID
 import httpx
 from botocore.exceptions import BotoCoreError, ClientError
 
-from sijil_core.storage import S3ObjectStore, StorageSettings
+from sijil_core.storage import S3ExportStore, S3ObjectStore, StorageSettings
 from sijil_cp.storage_admin import (
     AppCredentialSettings,
+    ExportCredentialSettings,
     RemovalCredentialSettings,
     SealCredentialSettings,
     ensure_app_user,
+    ensure_export_user,
     ensure_removal_user,
     ensure_seal_user,
 )
@@ -34,9 +36,10 @@ def serve() -> None:
 
 
 def bootstrap_storage() -> None:
-    """Create the object-locked bucket and, if missing, the three users the running services
-    hold: the app user (most services), the seal user (`worker-seal`) and the removal user
-    (`worker-removal`), each with its own policy (sijil_cp.storage_admin).
+    """Create the object-locked bucket, the plain exports bucket and, if missing, the four users
+    the running services hold: the app user (most services), the seal user (`worker-seal`), the
+    removal user (`worker-removal`) and the export user (`worker-export`), each with its own
+    policy (sijil_cp.storage_admin).
 
     Runs with the root key (only `migrate` holds it). Safe to run repeatedly. The store may
     still be starting when the one-shot `migrate` service reaches this point, so connection
@@ -46,13 +49,17 @@ def bootstrap_storage() -> None:
     app = AppCredentialSettings()
     sealer = SealCredentialSettings()
     remover = RemovalCredentialSettings()
+    exporter = ExportCredentialSettings()
     store = S3ObjectStore(settings)
+    exports = S3ExportStore(settings)
     for attempt in range(1, _BOOTSTRAP_ATTEMPTS + 1):
         try:
             asyncio.run(store.ensure_bucket())
+            asyncio.run(exports.ensure_bucket())
             ensure_app_user(settings, app)
             ensure_seal_user(settings, sealer, app)
             ensure_removal_user(settings, remover, [app, sealer])
+            ensure_export_user(settings, exporter, [app, sealer, remover])
         except (BotoCoreError, ClientError, httpx.TransportError) as exc:
             if attempt == _BOOTSTRAP_ATTEMPTS:
                 raise
@@ -61,7 +68,10 @@ def bootstrap_storage() -> None:
             )
             time.sleep(2)
         else:
-            print(f"bucket {settings.objectstore_bucket}, app, seal and removal users ready")  # noqa: T201
+            print(  # noqa: T201
+                f"buckets {settings.objectstore_bucket} and its exports,"
+                " app, seal, removal and export users ready"
+            )
             return
 
 

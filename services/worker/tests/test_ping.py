@@ -32,4 +32,12 @@ def test_ping_returns_region(eager_app: None) -> None:
 
 
 def test_queues_declared() -> None:
-    assert QUEUES == ("default", "provisioning", "ingest", "extraction", "seal", "removal")
+    assert QUEUES == (
+        "default",
+        "provisioning",
+        "ingest",
+        "extraction",
+        "seal",
+        "removal",
+        "export",
+    )
