@@ -151,5 +151,43 @@ def test_only_the_main_worker_reconciles_on_start() -> None:
     assert len(worker_ready.receivers) == before + 1
     src = ROOT / "services" / "worker" / "src" / "sijil_worker"
     assert "reconcile_on_start=True" in (src / "main.py").read_text()
-    for entry in ("main_extraction.py", "main_seal.py"):
+    for entry in ("main_extraction.py", "main_seal.py", "main_removal.py"):
         assert "reconcile_on_start" not in (src / entry).read_text(), entry
+
+
+def test_removal_worker_consumes_only_removal_off_the_internet_with_no_socket() -> None:
+    block = _block("worker-removal")
+    raw = _key(block, "command")
+    assert raw is not None
+    command = json.loads(raw)
+    assert command[:5] == ["celery", "-A", "sijil_worker.main_removal", "worker", "-Q"]
+    assert _queues(command) == {"removal"}
+    assert command[command.index("--concurrency") + 1] == "1"
+    assert command[command.index("-n") + 1] == "removal@%h"
+    assert _key(block, "environment") == "*removal-env"
+    assert _key(block, "networks") == "[core]"  # no tenant, AI or published port
+    assert "ports" not in block
+    assert "docker.sock" not in block
+    assert "group_add" not in block
+
+
+def test_only_the_removal_worker_holds_the_removal_key() -> None:
+    """The product owner's ruling (2026-11-03): one single-purpose worker holds the key that
+    can delete an original; `migrate` and the test runner see it through the root-key anchor."""
+    env = _anchor("removal-env")
+    assert "SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY:?}" in env
+    assert "SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_REMOVAL_SECRET_KEY:?}" in env
+    assert "SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:" in env
+    for absent in (
+        "SIJIL_PROVISIONER_DATABASE_URL",
+        "SIJIL_MASTER_KEY",
+        "*objectstore-env",  # the app key
+        "SIJIL_OBJECTSTORE_APP_",
+        "SEAL_",
+    ):
+        assert absent not in env, absent
+    assert "SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY" in _anchor("objectstore-root-env")
+    for anchor in ("worker-env", "extraction-env", "seal-env", "sijil-env", "objectstore-env"):
+        assert "SIJIL_OBJECTSTORE_REMOVAL" not in _anchor(anchor), anchor
+    for service in ("control-plane", "worker", "worker-extraction", "worker-seal", "smtp", "beat"):
+        assert "SIJIL_OBJECTSTORE_REMOVAL" not in _block(service), service

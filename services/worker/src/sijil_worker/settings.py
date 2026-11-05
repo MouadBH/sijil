@@ -24,6 +24,15 @@ class SealSettings(StorageSettings, BrokerSettings):
     database_url: str
 
 
+class RemovalSettings(StorageSettings, BrokerSettings):
+    """The removal worker (`-Q removal`): the control-plane database as the app role, the
+    broker, and the object store through the removal key (SIJIL_OBJECTSTORE_ACCESS_KEY is that
+    key in its container: it deletes a version and reads its lock, nothing else). No master key,
+    no provisioner role, no tenant or AI settings, no app or seal key."""
+
+    database_url: str
+
+
 class ExtractionSettings(KeySettings, BrokerSettings):
     """What extraction and routing need, and nothing for provisioning: the extraction worker
     boots with this alone (least privilege: no provisioner role, no Docker settings)."""

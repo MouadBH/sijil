@@ -1,17 +1,17 @@
 """An in-memory `ObjectStore` with the semantics of the real object-locked bucket.
 
 Every put creates a new version (the bucket is versioned), retention can only move later,
-`seal` switches to COMPLIANCE and `governance_remove` refuses sealed versions. Tests read
+`seal` switches to COMPLIANCE and `remove_original` refuses an unexpired lock. Tests read
 `puts` and `objects` to assert what reached the store.
 """
 
 import itertools
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
-from sijil_core.storage import ObjectRef, ObjectStore
+from sijil_core.storage import ObjectRef, ObjectStore, RetentionActive
 
 CHUNK_BYTES = 1024 * 1024
 
@@ -31,8 +31,8 @@ class Put:
     size: int
 
 
-class SealedObjectError(PermissionError):
-    """The store refuses to remove a COMPLIANCE-locked version."""
+class LockedObjectError(PermissionError):
+    """The store refuses to delete a GOVERNANCE-locked version without the bypass."""
 
 
 class MemoryObjectStore(ObjectStore):
@@ -78,10 +78,15 @@ class MemoryObjectStore(ObjectStore):
         stored.mode = "COMPLIANCE"
         stored.retain_until = max(stored.retain_until, retain_until)
 
-    async def governance_remove(self, ref: ObjectRef) -> None:
-        stored = self._get(ref)
-        if stored.mode == "COMPLIANCE":
-            raise SealedObjectError(f"{ref.key}@{ref.version_id} is sealed")
+    async def remove_original(self, ref: ObjectRef, *, governance: bool) -> None:
+        stored = self.objects.get(ref)
+        if stored is None:
+            return  # absent: already removed
+        unexpired = stored.retain_until >= datetime.now(UTC).date()
+        if stored.mode == "COMPLIANCE" and unexpired:
+            raise RetentionActive(f"{ref.key}@{ref.version_id}")
+        if stored.mode == "GOVERNANCE" and unexpired and not governance:
+            raise LockedObjectError(f"{ref.key}@{ref.version_id} is locked")
         del self.objects[ref]
         self.removed.append(ref)
 

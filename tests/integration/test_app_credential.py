@@ -67,14 +67,16 @@ async def test_app_credential_puts_and_reads_but_never_destroys(
             )
         )
     _denied(lambda: app.client.put_object_legal_hold(**target, LegalHold={"Status": "ON"}))
+    for governance in (True, False):  # the removal path gets its own credential (M4)
+        with pytest.raises(ClientError) as raised:
+            await app.remove_original(ref, governance=governance)
+        assert raised.value.response["Error"]["Code"] == "AccessDenied"
     with pytest.raises(ClientError):
-        await app.governance_remove(ref)
-    with pytest.raises(ClientError):
-        await app.seal(ref, retain)  # the sealing path gets its own credential (M3/M4)
+        await app.seal(ref, retain)  # the sealing path gets its own credential (M3)
 
     # Still there, unchanged, with its lock: then the root key cleans up the test object.
     assert await root.head(ref) == len(data)
-    await root.governance_remove(ref)
+    await root.remove_original(ref, governance=True)
 
 
 @pytest.mark.parametrize("service", ["control-plane", "worker", "smtp", "beat"])
@@ -96,6 +98,8 @@ def test_running_services_hold_the_app_key_not_the_root_key(
     # The sealing key is the seal worker's alone (product-owner ruling): never the API's.
     assert os.environ["SIJIL_OBJECTSTORE_SEAL_SECRET_KEY"] not in env.values()
     assert not [name for name in env if name.startswith("SIJIL_OBJECTSTORE_SEAL_")]
+    # Nor the removal key, which is `worker-removal`'s alone (tests/integration/test_removal_key).
+    assert os.environ["SIJIL_OBJECTSTORE_REMOVAL_SECRET_KEY"] not in env.values()
 
 
 def test_seal_worker_holds_the_seal_key_and_nothing_more(

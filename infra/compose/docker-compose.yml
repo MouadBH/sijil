@@ -51,6 +51,9 @@ x-objectstore-root-env: &objectstore-root-env
   # The seal worker's credential (retention only), provisioned the same way.
   SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY: ${SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY:?}
   SIJIL_OBJECTSTORE_SEAL_SECRET_KEY: ${SIJIL_OBJECTSTORE_SEAL_SECRET_KEY:?}
+  # The removal worker's credential (delete a version, read its lock), provisioned the same way.
+  SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY: ${SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_REMOVAL_SECRET_KEY: ${SIJIL_OBJECTSTORE_REMOVAL_SECRET_KEY:?}
 
 x-worker-env: &worker-env
   <<: [*sijil-env, *objectstore-env]
@@ -91,6 +94,18 @@ x-seal-env: &seal-env
   SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
   SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY:?}
   SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_SEAL_SECRET_KEY:?}
+  SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
+
+# The removal worker (`sijil_worker.settings.RemovalSettings`): the database as the app role, the
+# broker, and the object store through the removal key (delete a version, read its lock: no
+# bytes, no retention change), which no other running service holds. No master key, no
+# provisioner role, no app or seal key.
+x-removal-env: &removal-env
+  <<: *sijil-env
+  SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+  SIJIL_OBJECTSTORE_ENDPOINT: http://objectstore:9000
+  SIJIL_OBJECTSTORE_ACCESS_KEY: ${SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY:?}
+  SIJIL_OBJECTSTORE_SECRET_KEY: ${SIJIL_OBJECTSTORE_REMOVAL_SECRET_KEY:?}
   SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
 
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
@@ -323,6 +338,23 @@ services:
       postgres: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
 
+  worker-removal:
+    # The original's removal (sijil.remove_original), after the control plane commits a removal
+    # or an approved deletion. The only running service holding the removal key; nothing else:
+    # no master key, no provisioner role, no app or seal key, no tenant or AI network, no
+    # published port, no Docker socket. The Paperless delete runs afterwards in `worker`.
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "sijil_worker.main_removal", "worker", "-Q", "removal", "--concurrency", "1", "-n", "removal@%h", "--loglevel", "INFO"]
+    environment: *removal-env
+    networks: [core]
+    depends_on:
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
   smtp:
     # Inbound email capture (CAP-1): archives mail per workspace address. No Docker socket and
     # no tenant networks: it needs only the database, the object store and the broker.
@@ -367,7 +399,7 @@ services:
       # tenant networks they create. The socket is root on the host; never do this in production.
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
-      # Root key: the store tests exercise seal and governance removal (bypass).
+      # Root key: the store tests exercise seal and removal (bypass); and every service key.
       <<: [*objectstore-root-env, *worker-env]
       UV_PROJECT_ENVIRONMENT: /opt/venv
       SIJIL_IT_T1_URL: http://paperless-t1:8000

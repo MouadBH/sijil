@@ -18,8 +18,10 @@ completes exactly once when it is called again:
    original to COMPLIANCE at the committed `retention_until`, and `sijil.mirror_fields`.
 
 Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
-provisional date: no key a running service holds can delete or shorten it, and the
-`requeue_unlocked` sweep and the drift check bound that window.
+provisional date: the app key this service holds can neither delete nor shorten it (only the
+seal worker's key could shorten it, and only the removal worker's could delete it, for a row in
+`removed`, which a sealed row never is), and the `requeue_unlocked` sweep and the drift check
+bound that window.
 
 A field edit holds the same ledger lock; it commits its `document.fields_edited` event first and
 its index write after (an applied edit is always audited; an index failure then answers 503

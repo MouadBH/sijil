@@ -1,8 +1,9 @@
 """Write-once original store with object lock (retention-lock layer 4, design §5.2a).
 
-Originals are put in GOVERNANCE mode while unsealed: only the Owner's pre-seal removal flow
-(`governance_remove`) may bypass it. `seal` switches the object to COMPLIANCE, which nobody can
-remove or shorten until the retain-until date.
+Originals are put in GOVERNANCE mode while unsealed: only the Owner's pre-seal removal
+(`remove_original(..., governance=True)`, the removal worker's key) may bypass it. `seal`
+switches the object to COMPLIANCE, which nobody can remove or shorten until the retain-until
+date; after it, `remove_original(..., governance=False)` deletes the version without a bypass.
 
 boto3 is synchronous, so every S3 call runs in `asyncio.to_thread`.
 """
@@ -46,6 +47,11 @@ class StorageSettings(CoreSettings):
     objectstore_bucket: str
 
 
+class RetentionActive(RuntimeError):
+    """`remove_original` refused before calling the store: the version is COMPLIANCE-locked
+    until today or later. Carries the object reference only."""
+
+
 @dataclass(frozen=True)
 class ObjectRef:
     key: str
@@ -80,8 +86,14 @@ class ObjectStore(Protocol):
         """
         ...
 
-    async def governance_remove(self, ref: ObjectRef) -> None:
-        """Delete an unsealed object, bypassing GOVERNANCE. Fails on a sealed one."""
+    async def remove_original(self, ref: ObjectRef, *, governance: bool) -> None:
+        """Delete the version: with `governance`, bypassing its GOVERNANCE lock (the pre-seal
+        removal); without, only once its lock has expired (after retention).
+
+        Reads the lock first and raises `RetentionActive`, sending no delete, when the version
+        is COMPLIANCE until today or later (the store refuses that delete too). An absent
+        version counts as already removed and returns normally.
+        """
         ...
 
     async def retention(self, ref: ObjectRef) -> tuple[str, date] | None:
@@ -96,6 +108,16 @@ def _end_of_day(day: date) -> datetime:
 
 def _error_code(exc: ClientError) -> str:
     return str(exc.response.get("Error", {}).get("Code", ""))
+
+
+def _retention_absent(exc: ClientError) -> bool:
+    """GetObjectRetention found no such version. RustFS 1.0.4 answers every absent version
+    (deleted, unknown version, unknown key) with 500 InternalError "Version not found: ...",
+    never a 404 (probed; pinned by tests/integration/test_removal_key.py)."""
+    if _error_code(exc) in _ABSENT_CODES:
+        return True
+    message = str(exc.response.get("Error", {}).get("Message", ""))
+    return _error_code(exc) == "InternalError" and message.startswith("Version not found")
 
 
 class S3ObjectStore(ObjectStore):
@@ -242,8 +264,8 @@ class S3ObjectStore(ObjectStore):
         if final_mode != "COMPLIANCE" or final_until < target:
             raise RuntimeError("seal did not result in COMPLIANCE at the requested date")
 
-    async def governance_remove(self, ref: ObjectRef) -> None:
-        await asyncio.to_thread(self._remove, ref)
+    async def remove_original(self, ref: ObjectRef, *, governance: bool) -> None:
+        await asyncio.to_thread(self._remove, ref, governance)
 
     async def retention(self, ref: ObjectRef) -> tuple[str, date] | None:
         return await asyncio.to_thread(self._retention, ref)
@@ -252,18 +274,33 @@ class S3ObjectStore(ObjectStore):
         try:
             mode, until = self._current(ref)
         except ClientError as exc:
-            if _error_code(exc) in _ABSENT_CODES:
+            if _retention_absent(exc):
                 return None
             raise
         return mode, until.astimezone(UTC).date()
 
-    def _remove(self, ref: ObjectRef) -> None:
-        self.client.delete_object(
-            Bucket=self.bucket,
-            Key=ref.key,
-            VersionId=ref.version_id,
-            BypassGovernanceRetention=True,
-        )
+    def _remove(self, ref: ObjectRef, governance: bool) -> None:
+        try:
+            mode, until = self._current(ref)
+        except ClientError as exc:
+            if _retention_absent(exc):
+                return  # already removed (a redelivery after a crash before the commit)
+            raise
+        if mode == "COMPLIANCE" and until.astimezone(UTC).date() >= datetime.now(UTC).date():
+            raise RetentionActive(f"{ref.key}@{ref.version_id}")
+        try:
+            if governance:
+                self.client.delete_object(
+                    Bucket=self.bucket,
+                    Key=ref.key,
+                    VersionId=ref.version_id,
+                    BypassGovernanceRetention=True,
+                )
+            else:  # after retention: no bypass flag at all
+                self.client.delete_object(Bucket=self.bucket, Key=ref.key, VersionId=ref.version_id)
+        except ClientError as exc:
+            if _error_code(exc) not in _ABSENT_CODES:
+                raise
 
 
-__all__ = ["ObjectRef", "ObjectStore", "S3ObjectStore", "StorageSettings"]
+__all__ = ["ObjectRef", "ObjectStore", "RetentionActive", "S3ObjectStore", "StorageSettings"]

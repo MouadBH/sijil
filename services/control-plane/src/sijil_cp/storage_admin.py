@@ -1,24 +1,31 @@
-"""The least-privilege object-store user every running service uses (retention-lock layer 4).
+"""The object-store users the running services hold, one per job (retention-lock layer 4).
 
-Only the one-shot `migrate` service holds the RustFS root key. It creates (idempotently) the user
-`SIJIL_OBJECTSTORE_APP_ACCESS_KEY` with a policy that can put, read and list originals and
-nothing else: no delete of any kind, no BypassGovernanceRetention, no legal hold, no bucket
-configuration. Putting an object with a lock needs `s3:PutObjectRetention` (S3 semantics, and
-RustFS 1.0.4 enforces it); without the bypass permission the store itself refuses to shorten a
-GOVERNANCE retention or replace it, so that grant can only ever extend a lock.
+Only the one-shot `migrate` service holds the RustFS root key. It creates (idempotently):
 
-It also creates the sealing user `SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY` (policy `sijil-seal`),
-which only the control plane holds: it can read and set an original's retention, with the
-`s3:BypassGovernanceRetention` that switching GOVERNANCE to COMPLIANCE needs (RustFS 1.0.4
-refuses the switch without it), and nothing else: it never reads or writes bytes and every delete
-is denied, so even with the bypass it cannot remove an original. A COMPLIANCE lock can be neither
-shortened nor replaced by anyone. Governance removal (M4) is not this credential either.
+- `SIJIL_OBJECTSTORE_APP_ACCESS_KEY` (policy `sijil-app`), which the control plane, the main
+  and extraction workers, smtp and beat hold: put, read and list originals and nothing else, no
+  delete of any kind, no BypassGovernanceRetention, no legal hold, no bucket configuration.
+  Putting an object with a lock needs `s3:PutObjectRetention` (S3 semantics, and RustFS 1.0.4
+  enforces it); without the bypass permission the store itself refuses to shorten a GOVERNANCE
+  retention or replace it, so that grant can only ever extend a lock.
+- `SIJIL_OBJECTSTORE_SEAL_ACCESS_KEY` (policy `sijil-seal`), which only `worker-seal` holds:
+  read and set an original's retention, with the `s3:BypassGovernanceRetention` that switching
+  GOVERNANCE to COMPLIANCE needs (RustFS 1.0.4 refuses the switch without it). It never reads or
+  writes bytes and every delete is denied. With the bypass it could also shorten or drop a
+  GOVERNANCE (unsealed) lock; it cannot touch a COMPLIANCE one.
+- `SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY` (policy `sijil-removal`), which only `worker-removal`
+  holds: read an original's retention and delete a version, with the bypass, so it can delete an
+  unsealed (GOVERNANCE) original or one whose lock has expired. It never reads or writes bytes,
+  never changes a retention, and the unversioned delete (a delete marker) is denied.
+
+Nobody, the root key included, can delete or shorten a COMPLIANCE lock before its date.
 
 RustFS 1.0.4 has a MinIO-style admin API under `/rustfs/admin/v3/` that takes plain JSON and
 S3 SigV4 signatures.
 """
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import httpx
@@ -63,6 +70,13 @@ SEAL_ALLOWED_OBJECT_ACTIONS = (
     # Replacing a GOVERNANCE retention by COMPLIANCE needs it; deletes stay denied below.
     "s3:BypassGovernanceRetention",
 )
+_BUCKET_CONFIGURATION = (
+    "s3:DeleteBucket",
+    "s3:PutBucketObjectLockConfiguration",
+    "s3:PutBucketVersioning",
+    "s3:PutBucketPolicy",
+    "s3:DeleteBucketPolicy",
+)
 SEAL_DENIED_ACTIONS = (
     "s3:PutObject",
     "s3:GetObject",
@@ -70,11 +84,24 @@ SEAL_DENIED_ACTIONS = (
     "s3:DeleteObject",
     "s3:DeleteObjectVersion",
     "s3:PutObjectLegalHold",
-    "s3:DeleteBucket",
-    "s3:PutBucketObjectLockConfiguration",
-    "s3:PutBucketVersioning",
-    "s3:PutBucketPolicy",
-    "s3:DeleteBucketPolicy",
+    *_BUCKET_CONFIGURATION,
+)
+
+REMOVAL_POLICY_NAME = "sijil-removal"
+REMOVAL_ALLOWED_OBJECT_ACTIONS = (
+    "s3:GetObjectRetention",  # the lock is read before deciding (RetentionActive)
+    "s3:DeleteObjectVersion",
+    # The pre-seal removal deletes under GOVERNANCE; a COMPLIANCE lock ignores the bypass.
+    "s3:BypassGovernanceRetention",
+)
+REMOVAL_DENIED_ACTIONS = (
+    "s3:PutObject",
+    "s3:GetObject",
+    "s3:GetObjectVersion",
+    "s3:PutObjectRetention",
+    "s3:PutObjectLegalHold",
+    "s3:DeleteObject",  # unversioned: a delete marker
+    *_BUCKET_CONFIGURATION,
 )
 
 
@@ -90,10 +117,22 @@ class AppCredentialSettings(BaseSettings):
 
 
 class SealCredentialSettings(BaseSettings):
-    """The control plane's sealing credential, as `migrate` provisions it."""
+    """The seal worker's credential (`worker-seal` alone holds it), as `migrate` provisions it."""
 
     model_config = SettingsConfigDict(
         env_prefix="SIJIL_OBJECTSTORE_SEAL_", extra="ignore", hide_input_in_errors=True
+    )
+
+    access_key: SecretStr
+    secret_key: SecretStr
+
+
+class RemovalCredentialSettings(BaseSettings):
+    """The removal worker's credential (`worker-removal` alone holds it), as `migrate`
+    provisions it."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SIJIL_OBJECTSTORE_REMOVAL_", extra="ignore", hide_input_in_errors=True
     )
 
     access_key: SecretStr
@@ -140,6 +179,26 @@ def seal_policy(bucket: str) -> dict[str, Any]:
                 "Sid": "NeverDestroyNorRead",
                 "Effect": "Deny",
                 "Action": list(SEAL_DENIED_ACTIONS),
+                "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
+            },
+        ],
+    }
+
+
+def removal_policy(bucket: str) -> dict[str, Any]:
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "RemoveVersion",
+                "Effect": "Allow",
+                "Action": list(REMOVAL_ALLOWED_OBJECT_ACTIONS),
+                "Resource": [f"arn:aws:s3:::{bucket}/*"],
+            },
+            {
+                "Sid": "NeverReadWriteNorRelock",
+                "Effect": "Deny",
+                "Action": list(REMOVAL_DENIED_ACTIONS),
                 "Resource": [f"arn:aws:s3:::{bucket}", f"arn:aws:s3:::{bucket}/*"],
             },
         ],
@@ -219,4 +278,22 @@ def ensure_seal_user(
     _ensure_user(
         root, access_key, seal.secret_key, SEAL_POLICY_NAME, seal_policy(root.objectstore_bucket),
         client,
+    )  # fmt: skip
+
+
+def ensure_removal_user(
+    root: StorageSettings,
+    removal: RemovalCredentialSettings,
+    others: Sequence[AppCredentialSettings | SealCredentialSettings],
+    client: httpx.Client | None = None,
+) -> None:
+    """Create or update the removal user, its policy and the binding. Safe to run repeatedly."""
+    access_key = removal.access_key.get_secret_value()
+    taken = {root.objectstore_access_key.get_secret_value()}
+    taken |= {other.access_key.get_secret_value() for other in others}
+    if access_key in taken:
+        raise ValueError("the removal credential must differ from every other credential")
+    _ensure_user(
+        root, access_key, removal.secret_key, REMOVAL_POLICY_NAME,
+        removal_policy(root.objectstore_bucket), client,
     )  # fmt: skip

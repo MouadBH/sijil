@@ -116,9 +116,9 @@ async def test_extend_retention_rejects_shortening(store: S3ObjectStore, tmp_pat
     assert _retention(store, ref)["RetainUntilDate"].date() == far + timedelta(days=1)
 
 
-async def test_governance_remove_deletes_unsealed(store: S3ObjectStore, tmp_path: Path) -> None:
+async def test_remove_original_deletes_unsealed(store: S3ObjectStore, tmp_path: Path) -> None:
     ref = await store.put_original(_key(), _file(tmp_path, b"x"), date.today() + timedelta(days=1))
-    await store.governance_remove(ref)
+    await store.remove_original(ref, governance=True)
     assert (await store.head(ref)) is None
 
 

@@ -38,6 +38,9 @@ check: lint typecheck test
 
 up:
 	test -f infra/compose/.env || cp infra/compose/.env.example infra/compose/.env
+	@# An .env from an earlier milestone gets the keys added since (e.g. the removal key, M4).
+	@awk -F= 'NR == FNR { have[$$1] = 1; next } /^[A-Z][A-Z0-9_]*=/ && !($$1 in have) { print; print "added " $$1 > "/dev/stderr" }' \
+		infra/compose/.env infra/compose/.env.example >> infra/compose/.env
 	$(COMPOSE) up -d --build
 
 # Plain `make down` only stops the compose services: provisioned tenants stay, because their

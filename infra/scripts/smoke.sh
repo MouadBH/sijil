@@ -171,6 +171,52 @@ case "$sock" in
   socket) fail "seal worker has the Docker socket" ;;
   *) fail "seal worker socket check could not run (exec failed)" ;;
 esac
+# The removal worker: the only holder of the removal key, consuming `removal`, on `core` only,
+# with no Docker socket and no app or seal key.
+ping_out=$(compose exec -T worker-removal celery -A sijil_worker.main_removal inspect ping \
+  --timeout 10 2>/dev/null)
+grep -A1 'removal@' <<<"$ping_out" | grep -q pong \
+  && pass "removal worker answers celery ping" || fail "removal worker ping"
+sock=$(compose exec -T worker-removal sh -c \
+  'if [ -S /var/run/docker.sock ]; then echo socket; else echo none; fi' 2>/dev/null | tr -d '\r')
+case "$sock" in
+  none) pass "removal worker has no Docker socket" ;;
+  socket) fail "removal worker has the Docker socket" ;;
+  *) fail "removal worker socket check could not run (exec failed)" ;;
+esac
+removal_id=$(compose ps -q worker-removal 2>/dev/null)
+nets=$(docker inspect "$removal_id" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' 2>/dev/null)
+[ "$nets" = "${project:-sijil}_core " ] \
+  && pass "removal worker is on the core network only" \
+  || fail "removal worker networks: '$nets' (only ${project:-sijil}_core expected)"
+# Prints the env names (never values), or "exec-failed".
+env_names() {
+  compose exec -T "$1" sh -c 'env | cut -d= -f1' 2>/dev/null | tr -d '\r' || echo exec-failed
+}
+names=$(env_names worker-removal)
+if grep -qx exec-failed <<<"$names" || ! grep -qx SIJIL_OBJECTSTORE_ACCESS_KEY <<<"$names"; then
+  fail "removal worker env check could not run (exec failed)"
+elif grep -Eq '^SIJIL_OBJECTSTORE_APP_|SEAL_' <<<"$names"; then
+  fail "removal worker holds an app or seal variable"
+else
+  pass "removal worker holds no app or seal variable"
+fi
+removal_key=$(sed -n 's/^SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY=//p' .env)
+held=$(compose exec -T worker-removal printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')
+[ -n "$removal_key" ] && [ "$held" = "$removal_key" ] \
+  && pass "removal worker uses the removal key" || fail "removal worker object-store key"
+for svc in worker worker-seal; do
+  names=$(env_names "$svc")
+  if grep -qx exec-failed <<<"$names" || [ -z "$names" ]; then
+    fail "$svc env check could not run (exec failed)"
+  elif grep -q '^SIJIL_OBJECTSTORE_REMOVAL_' <<<"$names" \
+    || [ "$(compose exec -T "$svc" printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')" = "$removal_key" ]; then
+    fail "$svc holds the removal key"
+  else
+    pass "$svc does not hold the removal key"
+  fi
+done
 
 # Inbound email: the SMTP receiver greets on its localhost-published port.
 banner=$(python3 - <<'PY' 2>/dev/null
