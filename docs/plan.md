@@ -400,6 +400,8 @@ Branch `m3-recognition`. Covers **REC-1, REC-2, REC-3, REC-4**.
 
 Branch `m4-retention`. Covers **ARC-3, ARC-5**.
 
+**Status: done** (tasks 4.1–4.6; the detailed plan is [docs/superpowers/plans/2026-11-03-m4-retention.md](superpowers/plans/2026-11-03-m4-retention.md); `test_lock_all_paths` in `make check` and `make itest`, `test_m4_acceptance` in `make itest`). Amended by the product owner: originals are deleted only by the separate `worker-removal` (the removal key) and exports are built and signed only by `worker-export` (the export key and the signing seed); the Paperless copy and index rows of a removed or deleted document are purged by the main worker with the tenant admin's credential. The lock suite also covers the approval of a deletion before retention ends and direct SQL on the index; a role refusal is the API's `403 forbidden`, audited `document.removal_refused`. `index.csv` uses `;` as its separator (French-locale Excel) and escapes formulas in free text.
+
 | Task | Deliverable | Acceptance tests |
 | --- | --- | --- |
 | 4.1 Presets | `RetentionPolicy(workspace_id, document_type, years, locked)`, seeded per country (MA 10, FR 10, DE 8/10, AE 5, SA 6, marked as working values) | `test_ma_preset_10_years`; `test_retention_until_end_of_fiscal_year_plus_years` |

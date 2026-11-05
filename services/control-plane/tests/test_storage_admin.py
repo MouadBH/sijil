@@ -12,10 +12,16 @@ from sijil_cp import cli
 from sijil_cp.storage_admin import (
     AdminError,
     AppCredentialSettings,
+    ExportCredentialSettings,
+    RemovalCredentialSettings,
     SealCredentialSettings,
     app_policy,
     ensure_app_user,
+    ensure_export_user,
+    ensure_removal_user,
     ensure_seal_user,
+    export_policy,
+    removal_policy,
     seal_policy,
 )
 
@@ -34,6 +40,14 @@ APP = AppCredentialSettings.model_construct(
 SEAL = SealCredentialSettings.model_construct(
     access_key=SecretStr("sijil-seal"), secret_key=SecretStr("seal-secret-456")
 )
+REMOVAL = RemovalCredentialSettings.model_construct(
+    access_key=SecretStr("sijil-removal"), secret_key=SecretStr("removal-secret-789")
+)
+EXPORT = ExportCredentialSettings.model_construct(
+    access_key=SecretStr("sijil-export"), secret_key=SecretStr("export-secret-012")
+)
+ORIGINALS = "arn:aws:s3:::sijil-originals-ma-cas"
+EXPORTS = "arn:aws:s3:::sijil-originals-ma-cas-exports"
 FORBIDDEN = {
     "s3:BypassGovernanceRetention",
     "s3:DeleteObject",
@@ -66,12 +80,15 @@ def test_policy_grants_put_read_list_only() -> None:
     }
     assert not any("*" in action for action in allowed)
     assert FORBIDDEN <= denied
-    assert not allowed & denied
     resources = {r for s in policy["Statement"] for r in s["Resource"]}
-    assert resources <= {
-        "arn:aws:s3:::sijil-originals-ma-cas",
-        "arn:aws:s3:::sijil-originals-ma-cas/*",
-    }
+    assert resources <= {ORIGINALS, f"{ORIGINALS}/*", f"{EXPORTS}/*"}
+    on_originals = [s for s in policy["Statement"] if f"{EXPORTS}/*" not in s["Resource"]]
+    assert not _actions({"Statement": on_originals}, "Allow") & FORBIDDEN
+    # On the exports bucket the app key (the control plane's download) only reads.
+    on_exports = [s for s in policy["Statement"] if f"{EXPORTS}/*" in s["Resource"]]
+    assert _actions({"Statement": on_exports}, "Allow") == {"s3:GetObject"}
+    assert {"s3:PutObject", "s3:DeleteObject"} <= _actions({"Statement": on_exports}, "Deny")
+    assert all(s["Resource"] == [f"{EXPORTS}/*"] for s in on_exports)
 
 
 def test_ensure_app_user_creates_policy_user_and_binding() -> None:
@@ -127,10 +144,28 @@ def test_bootstrap_storage_provisions_the_app_user(monkeypatch: pytest.MonkeyPat
         async def ensure_bucket(self) -> None:
             calls.append("bucket")
 
+    class FakeExports:
+        def __init__(self, settings: StorageSettings) -> None:
+            pass
+
+        async def ensure_bucket(self) -> None:
+            calls.append("exports bucket")
+
     monkeypatch.setattr(cli, "S3ObjectStore", FakeStore)
+    monkeypatch.setattr(cli, "S3ExportStore", FakeExports)
     monkeypatch.setattr(cli, "StorageSettings", lambda: ROOT)
     monkeypatch.setattr(cli, "AppCredentialSettings", lambda: APP)
     monkeypatch.setattr(cli, "SealCredentialSettings", lambda: SEAL)
+    monkeypatch.setattr(cli, "RemovalCredentialSettings", lambda: REMOVAL)
+    monkeypatch.setattr(cli, "ExportCredentialSettings", lambda: EXPORT)
+    monkeypatch.setattr(
+        cli,
+        "ensure_export_user",
+        lambda root, export, others: calls.append(
+            f"export {export.access_key.get_secret_value()}"
+            f" <> {sorted(o.access_key.get_secret_value() for o in others)}"
+        ),
+    )
     monkeypatch.setattr(
         cli, "ensure_app_user", lambda root, app: calls.append(f"user {app.access_key}")
     )
@@ -139,8 +174,23 @@ def test_bootstrap_storage_provisions_the_app_user(monkeypatch: pytest.MonkeyPat
         "ensure_seal_user",
         lambda root, seal, app: calls.append(f"seal {seal.access_key.get_secret_value()}"),
     )
+    monkeypatch.setattr(
+        cli,
+        "ensure_removal_user",
+        lambda root, removal, others: calls.append(
+            f"removal {removal.access_key.get_secret_value()}"
+            f" <> {sorted(o.access_key.get_secret_value() for o in others)}"
+        ),
+    )
     cli.bootstrap_storage()
-    assert calls == ["bucket", "user **********", "seal sijil-seal"]
+    assert calls == [
+        "bucket",
+        "exports bucket",
+        "user **********",
+        "seal sijil-seal",
+        "removal sijil-removal <> ['sijil-app', 'sijil-seal']",
+        "export sijil-export <> ['sijil-app', 'sijil-removal', 'sijil-seal']",
+    ]
 
 
 def test_bootstrap_storage_retries_while_the_admin_api_starts(
@@ -161,11 +211,16 @@ def test_bootstrap_storage_retries_while_the_admin_api_starts(
             raise httpx.ConnectError("starting")
 
     monkeypatch.setattr(cli, "S3ObjectStore", FakeStore)
+    monkeypatch.setattr(cli, "S3ExportStore", FakeStore)
     monkeypatch.setattr(cli, "StorageSettings", lambda: ROOT)
     monkeypatch.setattr(cli, "AppCredentialSettings", lambda: APP)
     monkeypatch.setattr(cli, "ensure_app_user", flaky)
+    monkeypatch.setattr(cli, "ExportCredentialSettings", lambda: EXPORT)
+    monkeypatch.setattr(cli, "ensure_export_user", lambda root, export, others: None)
     monkeypatch.setattr(cli, "SealCredentialSettings", lambda: SEAL)
     monkeypatch.setattr(cli, "ensure_seal_user", lambda root, seal, app: None)
+    monkeypatch.setattr(cli, "RemovalCredentialSettings", lambda: REMOVAL)
+    monkeypatch.setattr(cli, "ensure_removal_user", lambda root, removal, others: None)
     monkeypatch.setattr("sijil_cp.cli.time.sleep", lambda _s: None)
     cli.bootstrap_storage()
     assert len(attempts) == 2
@@ -229,4 +284,111 @@ def test_seal_credential_must_differ_from_root_and_app(access: str) -> None:
     )
     with respx.mock(assert_all_called=False) as router, pytest.raises(ValueError):
         ensure_seal_user(ROOT, same, APP)
+    assert router.calls.call_count == 0
+
+
+def test_removal_policy_allows_only_delete_version_and_bypass() -> None:
+    """The removal key deletes a version under GOVERNANCE (with the bypass) or once its lock
+    has expired, after reading its retention; nothing else: it never reads bytes, writes, or
+    changes a retention, and the unversioned delete (a delete marker) is denied."""
+    policy = removal_policy("sijil-originals-ma-cas")
+    allowed = _actions(policy, "Allow")
+    denied = _actions(policy, "Deny")
+    assert allowed == {
+        "s3:GetObjectRetention",
+        "s3:DeleteObjectVersion",
+        "s3:BypassGovernanceRetention",
+    }
+    assert denied == {
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObjectRetention",
+        "s3:PutObjectLegalHold",
+        "s3:DeleteObject",
+        "s3:DeleteBucket",
+        "s3:PutBucketObjectLockConfiguration",
+        "s3:PutBucketVersioning",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+    }
+    (allow,) = [s for s in policy["Statement"] if s["Effect"] == "Allow"]
+    assert allow["Resource"] == ["arn:aws:s3:::sijil-originals-ma-cas/*"]  # objects only
+    resources = {r for s in policy["Statement"] for r in s["Resource"]}
+    assert resources <= {
+        "arn:aws:s3:::sijil-originals-ma-cas",
+        "arn:aws:s3:::sijil-originals-ma-cas/*",
+    }
+
+
+def test_ensure_removal_user_creates_its_own_policy_user_and_binding() -> None:
+    with respx.mock(assert_all_called=True) as router:
+        policy = router.put(f"{ENDPOINT}/rustfs/admin/v3/add-canned-policy").respond(200)
+        user = router.put(f"{ENDPOINT}/rustfs/admin/v3/add-user").respond(200)
+        bind = router.put(f"{ENDPOINT}/rustfs/admin/v3/set-user-or-group-policy").respond(200)
+        ensure_removal_user(ROOT, REMOVAL, [APP, SEAL])
+    sent = policy.calls.last.request
+    assert sent.url.params["name"] == "sijil-removal"
+    assert json.loads(sent.content) == removal_policy("sijil-originals-ma-cas")
+    created = user.calls.last.request
+    assert created.url.params["accessKey"] == "sijil-removal"
+    assert json.loads(created.content) == {"secretKey": "removal-secret-789", "status": "enabled"}
+    bound = bind.calls.last.request.url.params
+    assert (bound["policyName"], bound["userOrGroup"]) == ("sijil-removal", "sijil-removal")
+
+
+@pytest.mark.parametrize("access", ["root-key", "sijil-app", "sijil-seal"])
+def test_removal_credential_must_differ_from_every_other(access: str) -> None:
+    same = RemovalCredentialSettings.model_construct(
+        access_key=SecretStr(access), secret_key=SecretStr("x")
+    )
+    with respx.mock(assert_all_called=False) as router, pytest.raises(ValueError):
+        ensure_removal_user(ROOT, same, [APP, SEAL])
+    assert router.calls.call_count == 0
+
+
+def test_export_policy_reads_originals_and_owns_exports_only() -> None:
+    """The export worker reads originals (never writes, deletes or relocks one) and puts, reads
+    and deletes the built exports; nothing else."""
+    policy = export_policy("sijil-originals-ma-cas")
+    by_resource: dict[str, set[str]] = {}
+    for statement in policy["Statement"]:
+        if statement["Effect"] == "Allow":
+            for resource in statement["Resource"]:
+                by_resource.setdefault(resource, set()).update(statement["Action"])
+    assert by_resource == {
+        f"{ORIGINALS}/*": {"s3:GetObject", "s3:GetObjectVersion"},
+        f"{EXPORTS}/*": {"s3:PutObject", "s3:GetObject", "s3:DeleteObject"},
+    }
+    on_originals = [s for s in policy["Statement"] if f"{ORIGINALS}/*" in s["Resource"]]
+    denied = _actions({"Statement": on_originals}, "Deny")
+    assert FORBIDDEN | {"s3:PutObject", "s3:PutObjectRetention"} <= denied
+    assert not denied & {"s3:GetObject", "s3:GetObjectVersion"}
+    resources = {r for s in policy["Statement"] for r in s["Resource"]}
+    assert resources <= {ORIGINALS, f"{ORIGINALS}/*", EXPORTS, f"{EXPORTS}/*"}
+
+
+def test_ensure_export_user_creates_its_own_policy_user_and_binding() -> None:
+    with respx.mock(assert_all_called=True) as router:
+        policy = router.put(f"{ENDPOINT}/rustfs/admin/v3/add-canned-policy").respond(200)
+        user = router.put(f"{ENDPOINT}/rustfs/admin/v3/add-user").respond(200)
+        bind = router.put(f"{ENDPOINT}/rustfs/admin/v3/set-user-or-group-policy").respond(200)
+        ensure_export_user(ROOT, EXPORT, [APP, SEAL, REMOVAL])
+    sent = policy.calls.last.request
+    assert sent.url.params["name"] == "sijil-export"
+    assert json.loads(sent.content) == export_policy("sijil-originals-ma-cas")
+    created = user.calls.last.request
+    assert created.url.params["accessKey"] == "sijil-export"
+    assert json.loads(created.content) == {"secretKey": "export-secret-012", "status": "enabled"}
+    bound = bind.calls.last.request.url.params
+    assert (bound["policyName"], bound["userOrGroup"]) == ("sijil-export", "sijil-export")
+
+
+@pytest.mark.parametrize("access", ["root-key", "sijil-app", "sijil-seal", "sijil-removal"])
+def test_export_credential_must_differ_from_every_other(access: str) -> None:
+    same = ExportCredentialSettings.model_construct(
+        access_key=SecretStr(access), secret_key=SecretStr("x")
+    )
+    with respx.mock(assert_all_called=False) as router, pytest.raises(ValueError):
+        ensure_export_user(ROOT, same, [APP, SEAL, REMOVAL])
     assert router.calls.call_count == 0

@@ -24,13 +24,22 @@ from sijil_core.paperless import (
     PaperlessError,
     PaperlessUnavailable,
 )
+from sijil_core.pending import EXPORT_PREFIX, PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
 from sijil_core.region import RegionMismatch
-from sijil_core.storage import S3ObjectStore, StorageSettings
+from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
     enqueue_drift_checks,
     record_check_failed,
+)
+from sijil_worker.eligibility import mark_eligible
+from sijil_worker.export import (
+    EXPORT_FAILED,
+    build_export,
+    expire_exports,
+    record_export_failed,
+    sweep_exports,
 )
 from sijil_worker.extract import (
     IngestInProgress,
@@ -50,9 +59,22 @@ from sijil_worker.lock import lock_sealed, requeue_unlocked
 from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
+from sijil_worker.purge import (
+    ConsumeInFlight,
+    PurgeIncomplete,
+    purge_document,
+    requeue_unpurged,
+)
 from sijil_worker.reconcile import reconcile_tenants
+from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
-from sijil_worker.settings import ExtractionSettings, SealSettings, WorkerSettings
+from sijil_worker.settings import (
+    ExportSettings,
+    ExtractionSettings,
+    RemovalSettings,
+    SealSettings,
+    WorkerSettings,
+)
 
 log = logging.getLogger(__name__)
 
@@ -221,6 +243,7 @@ async def _ingest(
             will_retry=will_retry,
             retry_after_s=retry_after_s,
             enqueue_extract=_send_extract,
+            enqueue_purge=_send_purge,
         )
     finally:
         await engine.dispose()
@@ -551,6 +574,22 @@ def drift_check_all_task() -> int:
     return asyncio.run(_drift_all())
 
 
+async def _mark_eligible() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await mark_eligible(make_sessionmaker(engine), settings=settings, now=utcnow())
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.mark_eligible")
+def mark_eligible_task() -> int:
+    """Nightly: mark this region's documents past retention eligible for deletion. It deletes
+    nothing (sijil_worker.eligibility)."""
+    return asyncio.run(_mark_eligible())
+
+
 # Mirror of a sealed document's fields into its Paperless: 30 s, 1 min ... capped at 15 min,
 # MIRROR_MAX_RETRIES times. Paperless keeps a copy only; the sealed record is ours already.
 MIRROR_MAX_RETRIES = 8
@@ -725,3 +764,418 @@ def requeue_unlocked_task() -> int:
     """Re-send the compliance lock for sealed rows still unlocked (a lost message, a store
     that was down). Runs on the main worker: it only reads the ledger and sends tasks."""
     return asyncio.run(_requeue_unlocked())
+
+
+# The original's removal (removal worker): 30 s, 1 min ... capped at 15 min, REMOVAL_MAX_RETRIES
+# times, for transient store or database errors (`is_lock_transient`). A final failure, once its
+# retries run out or at once for a refusal (AccessDenied, RetentionActive ...), is audited
+# `document.removal_failed` `{code}` and the state stays as it is. Its `remove:pending` key is
+# then kept for the full TTL (1 h) whether or not the audit could be written: the row is still
+# waiting, so a cleared key would have the sweep re-send (and re-audit) it every five minutes.
+REMOVAL_MAX_RETRIES = 8
+REMOVAL_BACKOFF_FACTOR_S = 30
+REMOVAL_BACKOFF_MAX_S = 900
+
+
+def removal_error_code(exc: BaseException) -> str:
+    """The machine code audited with `document.removal_failed`."""
+    if isinstance(exc, RetentionActive):
+        return "retention.locked"
+    return _store_code(exc)
+
+
+async def _with_remove_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(RemovalSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix=REMOVE_PREFIX))
+    finally:
+        await redis.aclose()
+
+
+def _pending_remove_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_remove_pending(op))
+    except Exception as exc:
+        log.warning("removal pending key update failed: %s", type(exc).__name__)
+
+
+async def _send_purge(ledger_id: UUID, workspace_id: UUID) -> None:
+    """`sijil.purge_document` (the Paperless copy and the index rows), by name: the main worker
+    runs it on `default`."""
+    current_app.send_task(
+        "sijil.purge_document",
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue="default",
+    )
+
+
+async def _remove_original(ledger_id: str, workspace_id: str) -> None:
+    settings = RemovalSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await remove_original(
+            UUID(ledger_id),
+            sessions=make_sessionmaker(engine),
+            store=S3ObjectStore(settings),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+            purge=_send_purge,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _removal_failed(ledger_id: str, workspace_id: str, code: str) -> bool:
+    settings = RemovalSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await record_removal_failed(
+            UUID(ledger_id),
+            UUID(workspace_id),
+            code,
+            sessions=make_sessionmaker(engine),
+            settings=settings,
+            now=utcnow(),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True, name="sijil.remove_original", queue="removal", max_retries=REMOVAL_MAX_RETRIES
+)
+def remove_original_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A removed or approved original deleted from the store (sijil_worker.removal)."""
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_remove_original(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_lock_transient(exc) and retries < REMOVAL_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=REMOVAL_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=REMOVAL_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_remove_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        code = removal_error_code(exc)
+        log.error("removal of document %s failed: %s", ledger_id, code)
+        try:
+            asyncio.run(_removal_failed(ledger_id, workspace_id, code))
+        except Exception as audit_exc:
+            log.error(
+                "removal failure of document %s not recorded: %s",
+                ledger_id, type(audit_exc).__name__,
+            )  # fmt: skip
+
+        async def keep(pending: PendingExtractions) -> None:
+            await pending.refresh(lid, PENDING_TTL_S)
+
+        _pending_remove_quietly(keep)
+        return
+    _pending_remove_quietly(clear)
+
+
+async def _requeue_unremoved() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ledger_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.remove_original",
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            queue="removal",
+        )
+
+    try:
+        return await requeue_unremoved(
+            make_sessionmaker(engine),
+            send,
+            region=settings.region,
+            pending=PendingExtractions(redis, prefix=REMOVE_PREFIX),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unremoved")
+def requeue_unremoved_task() -> int:
+    """Re-send the removal for `removed` and `deleting` rows whose original is not yet recorded
+    removed. Runs on the main worker: it only reads the ledger and sends tasks (no store key)."""
+    return asyncio.run(_requeue_unremoved())
+
+
+# The purge of a removed or deleted document's Paperless copy and index rows (main worker): 30 s,
+# 1 min ... capped at 15 min, PURGE_MAX_RETRIES times, for a workspace not active, Paperless or a
+# database down (`is_mirror_transient`). Once those run out the key is cleared, so the next sweep
+# may send it again. A permanent failure (e.g. Paperless refusing the admin) is logged by its
+# code only and its `purge:pending` key kept for the full TTL (1 h), so the sweep re-sends that
+# row at most hourly.
+# An upload that may still be consuming (ConsumeInFlight) is neither a failure nor a retry: the
+# purge is sent again by name after the countdown it chose (backing off from 1 min to 1 h,
+# sijil_worker.purge), a fresh message whose retries are untouched, its key kept meanwhile.
+PURGE_MAX_RETRIES = 8
+PURGE_BACKOFF_FACTOR_S = 30
+PURGE_BACKOFF_MAX_S = 900
+
+
+def is_purge_transient(exc: BaseException) -> bool:
+    """A workspace not active, Paperless or a database down, or a copy left in the trash."""
+    return isinstance(exc, PurgeIncomplete) or is_mirror_transient(exc)
+
+
+def _recheck_purge(lid: UUID, ledger_id: str, workspace_id: str, countdown: int) -> None:
+    async def wait(pending: PendingExtractions) -> None:
+        await pending.refresh(lid, countdown + PENDING_MARGIN_S)
+
+    _pending_purge_quietly(wait)
+    try:
+        current_app.send_task(
+            "sijil.purge_document",
+            kwargs={"ledger_id": ledger_id, "workspace_id": workspace_id},
+            queue="default",
+            countdown=countdown,
+        )
+    except Exception as exc:
+        # The key expires and the sweep sends it again.
+        log.warning("purge re-check of document %s not sent: %s", ledger_id, type(exc).__name__)
+
+
+def _purge_code(exc: BaseException) -> str:
+    if isinstance(exc, PaperlessError) and exc.status is not None:
+        return f"{type(exc).__name__}:{exc.status}"
+    return type(exc).__name__
+
+
+async def _with_purge_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(WorkerSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix=PURGE_PREFIX))
+    finally:
+        await redis.aclose()
+
+
+def _pending_purge_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_purge_pending(op))
+    except Exception as exc:
+        log.warning("purge pending key update failed: %s", type(exc).__name__)
+
+
+async def _purge(ledger_id: str, workspace_id: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        await purge_document(
+            UUID(ledger_id),
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.purge_document", queue="default", max_retries=PURGE_MAX_RETRIES)
+def purge_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A removed or deleted document purged from Paperless and the index (sijil_worker.purge)."""
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_purge(ledger_id, workspace_id))
+    except ConsumeInFlight as waiting:
+        _recheck_purge(lid, ledger_id, workspace_id, waiting.countdown)
+        return
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_purge_transient(exc) and retries < PURGE_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=PURGE_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=PURGE_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_purge_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        if is_purge_transient(exc):
+            _pending_purge_quietly(clear)
+            raise  # retries ran out: the next sweep may send it again
+        log.error("purge of document %s failed: %s", ledger_id, _purge_code(exc))
+
+        async def keep(pending: PendingExtractions) -> None:
+            await pending.refresh(lid, PENDING_TTL_S)
+
+        _pending_purge_quietly(keep)
+        return
+    _pending_purge_quietly(clear)
+
+
+async def _requeue_unpurged() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ledger_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.purge_document",
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            queue="default",
+        )
+
+    try:
+        return await requeue_unpurged(
+            make_sessionmaker(engine),
+            send,
+            region=settings.region,
+            pending=PendingExtractions(redis, prefix=PURGE_PREFIX),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unpurged")
+def requeue_unpurged_task() -> int:
+    """Re-send the purge for removed and deleted documents whose original is gone but that never
+    recorded `document.purged`. It only reads the ledger and the audit log and sends tasks."""
+    return asyncio.run(_requeue_unpurged())
+
+
+# A period export (export worker): 30 s, 1 min ... capped at 15 min, EXPORT_MAX_RETRIES times,
+# for a store or database that is unreachable or failing (`is_lock_transient`); the job stays
+# `building` meanwhile and the retry builds it again from a fresh snapshot. A final failure is
+# recorded `failed` with `export.error` and audited `export.failed`; a hash mismatch is recorded
+# by `build_export` itself (`export.hash_mismatch`).
+EXPORT_MAX_RETRIES = 6
+EXPORT_BACKOFF_FACTOR_S = 30
+EXPORT_BACKOFF_MAX_S = 900
+
+
+async def _build_export(job_id: str) -> None:
+    settings = ExportSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        await build_export(
+            UUID(job_id),
+            sessions=sessions,
+            index=engines,
+            originals=S3ObjectStore(settings),
+            exports=S3ExportStore(settings),
+            settings=settings,
+            seed=settings.signing_seed(),
+            now=utcnow(),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _export_failed(job_id: str, code: str) -> bool:
+    settings = ExportSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await record_export_failed(
+            UUID(job_id), code, sessions=make_sessionmaker(engine), settings=settings, now=utcnow()
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.build_export", queue="export", max_retries=EXPORT_MAX_RETRIES)
+def build_export_task(self: "Task[Any, Any]", job_id: str) -> None:
+    """A period export built, signed and stored (sijil_worker.export)."""
+    try:
+        asyncio.run(_build_export(job_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_lock_transient(exc) and retries < EXPORT_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=EXPORT_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=EXPORT_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        log.error("export %s failed: %s", job_id, _store_code(exc))
+        try:
+            asyncio.run(_export_failed(job_id, EXPORT_FAILED))
+        except Exception as audit_exc:
+            log.error("export %s failure not recorded: %s", job_id, type(audit_exc).__name__)
+
+
+async def _expire_exports() -> int:
+    settings = ExportSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await expire_exports(
+            make_sessionmaker(engine), S3ExportStore(settings), settings=settings, now=utcnow()
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.expire_exports", queue="export")
+def expire_exports_task() -> int:
+    """Daily, on the export worker (the only one that can delete an export): exports ready for
+    more than 7 days are deleted and marked `expired`."""
+    return asyncio.run(_expire_exports())
+
+
+async def _sweep_exports() -> tuple[int, int]:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(job_id: UUID) -> None:
+        current_app.send_task("sijil.build_export", kwargs={"job_id": str(job_id)}, queue="export")
+
+    try:
+        return await sweep_exports(
+            make_sessionmaker(engine),
+            send,
+            pending=PendingExtractions(redis, prefix=EXPORT_PREFIX),
+            region=settings.region,
+            now=utcnow(),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.sweep_exports")
+def sweep_exports_task() -> tuple[int, int]:
+    """Every 300 s: re-send lost exports and fail abandoned builds (sijil_worker.export). Runs
+    on the main worker: it reads and updates jobs and sends tasks, and holds no export key."""
+    return asyncio.run(_sweep_exports())

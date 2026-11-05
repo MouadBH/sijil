@@ -2,8 +2,10 @@
 
 `accept_file` streams the bytes to a spool file while hashing and counting them, sniffs the
 type, puts the original into the object store (GOVERNANCE lock), records it in the ledger
-(unique per workspace + SHA-256), audits it in the same transaction, and enqueues ingest only
-after the commit. Paperless is not on this path: a down tenant never blocks acceptance.
+(unique per workspace + SHA-256 among live rows: a removed or deleted document's bytes are
+archived again as a new row and a new object version, its tombstone untouched), audits it in
+the same transaction, and enqueues ingest only after the commit. Paperless is not on this path:
+a down tenant never blocks acceptance.
 
 Nothing about the file but its hashes, size and kind reaches the shared database: no filename,
 subject or sender.
@@ -22,12 +24,14 @@ from pathlib import Path
 from typing import IO, Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import audit
 from sijil_core.db.models import (
+    LIVE_LEDGER_ROW,
+    TERMINAL_STATES,
     ActorType,
     DocumentLedger,
     DocumentSource,
@@ -36,7 +40,11 @@ from sijil_core.db.models import (
     Workspace,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES, sniff
-from sijil_core.retention import provisional_retain_until, region_local_date
+from sijil_core.retention import (
+    lowest_policy_years,
+    provisional_retain_until,
+    region_local_date,
+)
 from sijil_core.storage import ObjectStore
 from sijil_core.tenancy import tenant_ref
 
@@ -44,7 +52,6 @@ logger = logging.getLogger(__name__)
 
 # Incoming chunks are batched to this size before one threaded write + hash.
 _WRITE_BYTES = 1024 * 1024
-_UNIQUE = "uq_document_ledger_workspace_sha256"
 
 Enqueue = Callable[[UUID, UUID], Awaitable[None]]
 
@@ -56,7 +63,8 @@ class Accepted:
 
 @dataclass(frozen=True)
 class Duplicate:
-    """The workspace already holds these exact bytes, as `document_id`."""
+    """The workspace already holds these exact bytes, as `document_id` (a live row: a tombstone
+    never makes a duplicate)."""
 
     document_id: UUID
 
@@ -137,7 +145,9 @@ async def _spool(chunks: AsyncIterator[bytes]) -> _Spooled:
 async def _existing_id(db: AsyncSession, workspace_id: UUID, sha256: str) -> UUID | None:
     found: UUID | None = await db.scalar(
         select(DocumentLedger.id).where(
-            DocumentLedger.workspace_id == workspace_id, DocumentLedger.sha256 == sha256
+            DocumentLedger.workspace_id == workspace_id,
+            DocumentLedger.sha256 == sha256,
+            DocumentLedger.state.not_in(TERMINAL_STATES),
         )
     )
     return found
@@ -175,7 +185,6 @@ async def accept_file(
     store: ObjectStore,
     enqueue: Enqueue,
     workspace: Workspace,
-    country: str,
     region: str,
     chunks: AsyncIterator[bytes],
     source: DocumentSource,
@@ -211,7 +220,11 @@ async def accept_file(
                 return Duplicate(existing)
         # The arrival date is the region's civil date: a UTC date would cut a year of
         # retention from files arriving just after local midnight on 1 January.
-        retain_until = provisional_retain_until(region_local_date(now, region), country)
+        # Provisional: the type is not known yet, so the workspace's lowest period across types;
+        # routing and sealing raise it to the type's own (a lock is only ever extended).
+        async with sessions() as db:
+            years = await lowest_policy_years(db, workspace_id)
+        retain_until = provisional_retain_until(region_local_date(now, region), years)
         # Before the ledger row: a row must never point at an object that is not there. The key
         # is content-addressed, so a racer that loses below only added an identical version.
         ref = await store.put_original(
@@ -240,12 +253,15 @@ async def accept_file(
                 retention_until=retain_until,
                 ingested_at=now,
             )
-            .on_conflict_do_nothing(constraint=_UNIQUE)
+            .on_conflict_do_nothing(
+                index_elements=[DocumentLedger.workspace_id, DocumentLedger.sha256],
+                index_where=text(LIVE_LEDGER_ROW),
+            )
             .returning(DocumentLedger.id)
         )
         if document_id is None:
             # A concurrent accept of the same bytes committed first (the insert waited for it),
-            # so a fresh read in this READ COMMITTED transaction sees its row.
+            # so a fresh read in this READ COMMITTED transaction sees its live row.
             existing = await _existing_id(db, workspace_id, spooled.sha256)
             if existing is None:  # ledger rows are never deleted (trigger); defensive only
                 raise RuntimeError("ledger conflict without a conflicting row")

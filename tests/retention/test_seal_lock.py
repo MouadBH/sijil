@@ -50,12 +50,12 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, fields_digest
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.paperless import SERVICE_PERMISSIONS
-from sijil_core.storage import ObjectRef, S3ObjectStore, StorageSettings
+from sijil_core.storage import ObjectRef, RetentionActive, S3ObjectStore, StorageSettings
 from sijil_worker.extract import _route
 from sijil_worker.lock import lock_sealed
 from sijil_worker.settings import WorkerSettings
 from tests.support.index_db import throwaway_index_db
-from tests.support.memory_store import MemoryObjectStore, SealedObjectError
+from tests.support.memory_store import MemoryObjectStore
 from tests.support.sealing import (
     INVOICE,
     PROVISIONAL,
@@ -295,8 +295,8 @@ async def test_object_lock_cannot_shorten_after_seal(
     with pytest.raises(ValueError):
         await memory_store.extend_retention(ref, PROVISIONAL - timedelta(days=1))
     await memory_store.seal(ref, date(2027, 12, 31))  # a later, shorter seal keeps the date
-    with pytest.raises(SealedObjectError):
-        await memory_store.governance_remove(ref)
+    with pytest.raises(RetentionActive):
+        await memory_store.remove_original(ref, governance=True)
     assert (stored(memory_store, row).mode, stored(memory_store, row).retain_until) == (
         "COMPLIANCE",
         PROVISIONAL,

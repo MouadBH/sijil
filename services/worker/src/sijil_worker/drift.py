@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sijil_core import audit
 from sijil_core.crypto import DecryptionError, Envelope, KeyService, open_envelope
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     CredentialKind,
     DocumentLedger,
@@ -172,7 +173,11 @@ async def _page(
             DocumentLedger.object_locked_at,
             DocumentLedger.retention_until,
         )
-        .where(DocumentLedger.workspace_id == workspace_id)
+        .where(
+            DocumentLedger.workspace_id == workspace_id,
+            # Removed, deleting or deleted: the original and the Paperless copy go by design.
+            DocumentLedger.state.not_in(TERMINAL_STATES),
+        )
         .order_by(DocumentLedger.id)
         .limit(BATCH_SIZE)
     )

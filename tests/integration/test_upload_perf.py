@@ -103,7 +103,7 @@ async def _remove_originals(workspace_id: uuid.UUID) -> None:
     finally:
         await engine.dispose()
     for ref in refs:
-        await store.governance_remove(ref)
+        await store.remove_original(ref, governance=True)
 
 
 async def test_upload_p95_under_2s(

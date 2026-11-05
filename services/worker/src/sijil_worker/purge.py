@@ -1,0 +1,430 @@
+"""A removed or deleted document's Paperless copies and index rows, purged once its original is
+gone.
+
+The removal worker sends `sijil.purge_document` (queue `default`, this main worker: it holds the
+master key and the index database settings) after it recorded `original_removed_at`; ingest
+sends it again when it stops on a removed row after an upload. `purge_document`:
+
+1. asserts the region before anything else is read or sent;
+2. proceeds only for a ledger row in `removed` or `deleted` with `original_removed_at` set: any
+   other row, or a forged or early message, is logged and left alone;
+3. works in Paperless with the tenant admin's credential (a token obtained with its password):
+   the service user has no delete right and keeps none;
+4. when the ledger recorded no Paperless id and an upload may still be consuming, stops with
+   ConsumeInFlight, before deleting or recording anything: a copy could appear after a purge
+   that found none. "May still be consuming" is a recorded consume task Paperless still runs,
+   or, with no task known, an ingest claim or a pending retry within CONSUME_WINDOW (an upload
+   whose task id was never recorded: ingest stopped on the removal, or failed, right after
+   it). The task sends the purge again later without spending a retry, after a countdown that
+   backs off with the time waited so far, from RECHECK_MIN (1 min) to RECHECK_MAX (1 h).
+   Paperless tasks carry no date, so the wait is bounded by our own clock: CONSUME_BOUND (24 h)
+   from the later of the removal and the ingest claim. Past it, a STARTED task counts as dead
+   (a Paperless restart mid-consume leaves one so for good): the checksum and trash lookups
+   decide, and the purge is recorded with `consume_unresolved`, with a warning. A PENDING task
+   (the tenant's consumer down: the copy may still be made) is checked again hourly with an
+   error logged, and never recorded purged;
+5. finds every copy: the ledger's id, the document a finished consume task produced, every live
+   document with this SHA-256 (all pages: 3.4.1 keeps duplicates), and every trashed document
+   with ingest's file name `{sha256[:12]}.{ext}` (the trash has no checksum filter). A listed
+   row counts only when it is a copy (`paperless.is_copy_of`: its `checksum` is this SHA-256,
+   or, when the payload carries none, its file name is ingest's), never on Paperless's filter
+   alone: one it ignores answers every document. More than MAX_MATCHES (10) copies is not a
+   tenant this understands: TooManyMatches (not transient: an error logged, nothing deleted or
+   recorded, the sweep sends it again an hour later);
+   the same bytes may be archived again after a removal (0013): a live row with this SHA-256
+   keeps the copy it recorded, and while it has recorded none and its ingest may still run
+   (it adopts any copy with this checksum), the purge waits (ConsumeInFlight), deleting nothing;
+6. deletes the live ones (a 404 counts as deleted) and empties each from the trash (400: not in
+   it, i.e. emptied already), then lists the trash again: a copy still there raises
+   PurgeIncomplete (transient), so `document.purged` is recorded only once Paperless keeps none;
+7. purges the index rows (`index.purge_document`, the sealed row too only for `deleted`);
+8. audits `document.purged` `{paperless}`: whether Paperless held a copy this run removed
+   (plus `consume_unresolved: true` when a dead consume task was given up on).
+
+Every step is idempotent, so a retry or a second message repeats it harmlessly. A workspace that
+is not active (paused, hibernated, closing) raises WorkspaceNotActive, retried later; Paperless
+down raises PaperlessUnavailable likewise. Nothing here touches the object store.
+`requeue_unpurged` re-sends the purge for rows that never recorded `document.purged`.
+"""
+
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Final
+from uuid import UUID
+
+from sqlalchemy import String, cast, exists, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from sijil_core import audit
+from sijil_core import index as index_db
+from sijil_core.crypto import Envelope, KeyService, open_envelope
+from sijil_core.db.models import (
+    TERMINAL_STATES,
+    ActorType,
+    AuditEvent,
+    CredentialKind,
+    DocumentLedger,
+    DocumentState,
+    IngestState,
+    Organisation,
+    TenantCredential,
+    Workspace,
+    WorkspaceState,
+)
+from sijil_core.filetypes import FileKind
+from sijil_core.index import IndexEngines, credential_context
+from sijil_core.ingest import Enqueue
+from sijil_core.paperless import PaperlessClient, PaperlessError
+from sijil_core.region import RegionMismatch, assert_region
+from sijil_core.settings import CoreSettings
+from sijil_worker.ingest import (
+    CLAIM_LEASE,
+    MissingCredential,
+    WorkspaceNotActive,
+    upload_filename,
+)
+from sijil_worker.pending import PendingExtractions
+from sijil_worker.runtime.base import ADMIN_USERNAME
+
+log = logging.getLogger(__name__)
+
+PURGED: Final = "document.purged"
+REQUEUE_BATCH: Final = 50
+# How long after an ingest claim (or a failure) its upload may still be consuming: ingest's own
+# lease, its poll timeout plus margin.
+CONSUME_WINDOW: Final = CLAIM_LEASE
+_PURGEABLE = (DocumentState.removed, DocumentState.deleted)
+_TASK_DONE = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
+CONSUME_BOUND: Final = timedelta(hours=24)
+RECHECK_MIN: Final = timedelta(minutes=1)
+RECHECK_MAX: Final = timedelta(hours=1)
+# More copies than this and the purge refuses (TooManyMatches): never a bulk delete.
+MAX_MATCHES: Final = 10
+
+
+class ConsumeInFlight(Exception):  # noqa: N818 - a state, not an error
+    """An upload of this document may still be consuming in Paperless: purge again after
+    `countdown` seconds."""
+
+    def __init__(self, countdown: int = int(RECHECK_MIN.total_seconds())) -> None:
+        super().__init__(f"consume in flight, check again in {countdown}s")
+        self.countdown = countdown
+
+
+class PurgeIncomplete(Exception):  # noqa: N818
+    """A copy is still in Paperless's trash after it was emptied. Transient: purge again."""
+
+
+class TooManyMatches(Exception):  # noqa: N818
+    """More than MAX_MATCHES Paperless documents are copies of this one: nothing is deleted.
+    Not transient: the task logs it, and the sweep sends the purge again later."""
+
+    def __init__(self, count: int) -> None:
+        super().__init__(f"{count} copies in Paperless, more than {MAX_MATCHES}")
+        self.count = count
+
+
+@dataclass(frozen=True)
+class _Target:
+    ledger_id: UUID
+    workspace: Workspace
+    paperless_url: str
+    admin_password: str
+    paperless_doc_id: int | None
+    sha256: str
+    filename: str
+    sealed: bool
+    ingest_state: IngestState
+    task_id: str | None
+    claimed_at: datetime | None
+    next_attempt_at: datetime | None
+    decided_at: datetime | None  # the removal (or the approved deletion)
+    # Live rows with the same bytes (archived again after this one's removal, 0013): the copies
+    # they recorded, and whether one has recorded none yet while its ingest may still run.
+    kept: frozenset[int]
+    sibling_unsettled: bool
+
+
+async def _target(
+    sessions: async_sessionmaker[AsyncSession],
+    keys: KeyService,
+    settings: CoreSettings,
+    ledger_id: UUID,
+    workspace_id: UUID,
+) -> _Target | None:
+    async with sessions() as session:
+        found = (
+            await session.execute(
+                select(DocumentLedger, Workspace, Organisation.region)
+                .join(Workspace, Workspace.id == DocumentLedger.workspace_id)
+                .join(Organisation, Organisation.id == Workspace.org_id)
+                .where(DocumentLedger.id == ledger_id)
+            )
+        ).first()
+        if found is None or found[1].id != workspace_id:
+            raise LookupError("document not found")
+        ledger, workspace, region = found
+        try:
+            assert_region(region, settings)
+        except RegionMismatch:
+            log.warning("purge of document %s skipped: region %s not served", ledger_id, region)
+            return None
+        if ledger.state not in _PURGEABLE or ledger.original_removed_at is None:
+            log.info(
+                "purge of document %s skipped: state %s, original removed at %s",
+                ledger_id, ledger.state.value, ledger.original_removed_at,
+            )  # fmt: skip
+            return None
+        if workspace.state is not WorkspaceState.active or not workspace.paperless_url:
+            raise WorkspaceNotActive  # transient: paused, hibernated or closing, retried later
+        kind = CredentialKind.admin_password
+        credential = await session.scalar(
+            select(TenantCredential).where(
+                TenantCredential.workspace_id == workspace.id, TenantCredential.kind == kind
+            )
+        )
+        if credential is None:
+            raise MissingCredential("no admin password")
+        password = open_envelope(
+            Envelope.from_bytes(credential.envelope),
+            keys,
+            credential_context(workspace.id, kind),
+        ).decode()
+        siblings = (
+            await session.execute(
+                select(DocumentLedger.paperless_doc_id, DocumentLedger.ingest_state).where(
+                    DocumentLedger.workspace_id == workspace.id,
+                    DocumentLedger.sha256 == ledger.sha256,
+                    DocumentLedger.id != ledger.id,
+                    DocumentLedger.state.not_in(TERMINAL_STATES),
+                )
+            )
+        ).all()
+        return _Target(
+            ledger_id=ledger_id,
+            workspace=workspace,
+            paperless_url=workspace.paperless_url,
+            admin_password=password,
+            paperless_doc_id=ledger.paperless_doc_id,
+            sha256=ledger.sha256,
+            filename=upload_filename(ledger.sha256, FileKind(ledger.content_kind)),
+            sealed=ledger.state is DocumentState.deleted,
+            ingest_state=ledger.ingest_state,
+            task_id=ledger.paperless_task_id,
+            claimed_at=ledger.ingest_claimed_at,
+            next_attempt_at=ledger.ingest_next_attempt_at,
+            decided_at=ledger.removed_at or ledger.deletion_approved_at,
+            kept=frozenset(d for d, _ in siblings if d is not None),
+            sibling_unsettled=any(
+                d is None and st in (IngestState.queued, IngestState.sending) for d, st in siblings
+            ),
+        )
+
+
+def _recent_upload(target: _Target, now: datetime) -> bool:
+    """An ingest claim, or a failure after which a retry is pending, within CONSUME_WINDOW: an
+    upload sent then may still be consuming. A retry is recorded `now + countdown`, so a failure
+    within the window has its next attempt after `now - CONSUME_WINDOW`."""
+    if target.ingest_state not in (IngestState.queued, IngestState.sending):
+        return False
+    since = now - CONSUME_WINDOW
+    return (target.claimed_at is not None and target.claimed_at > since) or (
+        target.next_attempt_at is not None and target.next_attempt_at > since
+    )
+
+
+def _waited(target: _Target, now: datetime) -> timedelta:
+    """How long the purge has waited on a consume: since the later of the removal and the
+    ingest claim, on our own clock."""
+    marks = [at for at in (target.decided_at, target.claimed_at) if at is not None]
+    return now - max(marks) if marks else timedelta(0)
+
+
+def _recheck_in(waited: timedelta) -> int:
+    """As long again as waited so far, from RECHECK_MIN to RECHECK_MAX."""
+    return int(min(max(waited, RECHECK_MIN), RECHECK_MAX).total_seconds())
+
+
+@dataclass
+class _Found:
+    ids: set[int]
+    consume_unresolved: bool = False
+
+
+async def _copies(client: PaperlessClient, target: _Target, now: datetime) -> _Found:
+    """Every live copy Paperless holds (see the module docstring, steps 4 and 5), but those a
+    live row with the same bytes recorded."""
+    if target.sibling_unsettled:
+        log.info(
+            "purge of document %s waits: its bytes, archived again, are still being ingested",
+            target.ledger_id,
+        )
+        raise ConsumeInFlight(_recheck_in(_waited(target, now)))
+    found = _Found(ids=set())
+    if target.paperless_doc_id is not None:
+        found.ids.add(target.paperless_doc_id)
+    else:
+        waited = _waited(target, now)
+        task = await client.task(target.task_id) if target.task_id else None
+        if task is not None and task.known and task.status not in _TASK_DONE:
+            if waited < CONSUME_BOUND:
+                raise ConsumeInFlight(_recheck_in(waited))
+            if task.status == "PENDING":
+                log.error(
+                    "purge of document %s waits: its consume task is still pending after %s",
+                    target.ledger_id, waited,
+                )  # fmt: skip
+                raise ConsumeInFlight(int(RECHECK_MAX.total_seconds()))
+            log.warning(
+                "purge of document %s gives up on its consume task (%s after %s): purging",
+                target.ledger_id, task.status, waited,
+            )  # fmt: skip
+            found.consume_unresolved = True
+        elif task is not None and task.status == "SUCCESS" and task.related_document is not None:
+            found.ids.add(task.related_document)
+        elif _recent_upload(target, now):
+            raise ConsumeInFlight(_recheck_in(waited))
+    found.ids.update(await client.documents_with_checksum(target.sha256, filename=target.filename))
+    found.ids -= target.kept
+    return found
+
+
+async def _trashed(client: PaperlessClient, target: _Target) -> set[int]:
+    return {
+        d.id
+        for d in await client.trashed_documents()
+        if d.is_copy_of(target.sha256, target.filename) and d.id not in target.kept
+    }
+
+
+async def _purge_paperless(
+    target: _Target, paperless: Callable[..., PaperlessClient], now: datetime
+) -> dict[str, bool]:
+    """The `document.purged` data: `paperless`, whether Paperless held a copy (live or in its
+    trash) that this run removed, and `consume_unresolved` when a dead task was given up on."""
+    async with paperless(target.paperless_url) as anonymous:
+        token = await anonymous.obtain_token(ADMIN_USERNAME, target.admin_password)
+    async with paperless(target.paperless_url, token=token) as client:
+        found = await _copies(client, target, now)
+        matches = len(found.ids | await _trashed(client, target))
+        if matches > MAX_MATCHES:
+            log.error(
+                "purge of document %s refused: %d copies in Paperless, more than %d",
+                target.ledger_id, matches, MAX_MATCHES,
+            )  # fmt: skip
+            raise TooManyMatches(matches)
+        deleted: set[int] = set()
+        for doc_id in sorted(found.ids):
+            try:
+                await client.delete_document(doc_id)
+            except PaperlessError as exc:
+                if exc.status != 404:
+                    raise
+                continue  # absent: deleted already, perhaps still in the trash (found below)
+            deleted.add(doc_id)
+        emptied: set[int] = set()
+        for doc_id in sorted(deleted | await _trashed(client, target)):
+            try:
+                await client.empty_trash([doc_id])
+            except PaperlessError as exc:
+                if exc.status != 400:
+                    raise
+                continue  # not in the trash: emptied already
+            emptied.add(doc_id)
+        ours = deleted | emptied
+        if any(
+            d.id in ours
+            or (d.is_copy_of(target.sha256, target.filename) and d.id not in target.kept)
+            for d in await client.trashed_documents()
+        ):
+            raise PurgeIncomplete
+        data = {"paperless": bool(ours)}
+        if found.consume_unresolved:
+            data["consume_unresolved"] = True
+        return data
+
+
+async def purge_document(
+    ledger_id: UUID,
+    *,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: KeyService,
+    index: IndexEngines,
+    paperless: Callable[..., PaperlessClient],
+    settings: CoreSettings,
+    now: datetime,
+    workspace_id: UUID,
+) -> bool:
+    """See the module docstring. True when this run purged; False when there was nothing to do
+    here. ConsumeInFlight, Paperless, index and database errors propagate for the caller."""
+    target = await _target(sessions, keys, settings, ledger_id, workspace_id)
+    if target is None:
+        return False
+    data = await _purge_paperless(target, paperless, now)
+    # After Paperless: a failure there leaves everything for the retry to find again.
+    async with (await index.engine(target.workspace)).begin() as conn:
+        await index_db.purge_document(conn, ledger_id, sealed=target.sealed)
+    async with sessions() as session:
+        await audit.append(
+            session,
+            workspace_id=workspace_id,
+            action=PURGED,
+            actor_type=ActorType.system,
+            actor_id=None,
+            target_type="document",
+            target_id=str(ledger_id),
+            data=data,
+            now=now,
+        )
+        await session.commit()
+    return True
+
+
+async def requeue_unpurged(
+    sessions: async_sessionmaker[AsyncSession],
+    send: Enqueue,
+    *,
+    region: str,
+    pending: PendingExtractions,
+    limit: int = REQUEUE_BATCH,
+) -> int:
+    """Re-send `purge_document` for this region's `removed` and `deleted` rows whose original
+    is removed but that never recorded `document.purged` (a lost message, Paperless down for
+    longer than the retries), in active workspaces only (any other would only retry), oldest
+    removal first, at most `limit`, skipping those in flight (`purge:pending:<id>`). A failed
+    send is logged and the sweep goes on. Returns how many were sent."""
+    purged = exists().where(
+        AuditEvent.workspace_id == DocumentLedger.workspace_id,
+        AuditEvent.action == PURGED,
+        AuditEvent.target_type == "document",
+        AuditEvent.target_id == cast(DocumentLedger.id, String),
+    )
+    async with sessions() as session:
+        rows = (
+            await session.execute(
+                select(DocumentLedger.id, DocumentLedger.workspace_id)
+                .join(Workspace, Workspace.id == DocumentLedger.workspace_id)
+                .join(Organisation, Organisation.id == Workspace.org_id)
+                .where(
+                    Organisation.region == region,
+                    Workspace.state == WorkspaceState.active,
+                    DocumentLedger.state.in_(_PURGEABLE),
+                    DocumentLedger.original_removed_at.is_not(None),
+                    ~purged,
+                )
+                .order_by(DocumentLedger.original_removed_at, DocumentLedger.id)
+                .limit(limit * 10)
+            )
+        ).all()
+    sent = 0
+    for ledger_id, ws_id in rows:
+        if sent >= limit:
+            break
+        try:
+            if await pending.send(send, ledger_id, ws_id):
+                sent += 1
+        except Exception as exc:
+            log.warning("purge re-send of document %s failed: %s", ledger_id, type(exc).__name__)
+    return sent

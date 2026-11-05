@@ -36,6 +36,7 @@ from sijil_core.db.models import (
     Organisation,
     OrgType,
     TenantCredential,
+    User,
     Workspace,
     WorkspaceState,
 )
@@ -44,6 +45,7 @@ from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.ollama import OllamaClient, OllamaUnavailable
 from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
 from sijil_core.storage import ObjectRef
+from sijil_worker import extract as extract_module
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.extract import (
@@ -1743,3 +1745,46 @@ async def test_eval_computes_without_writing_anything(
     }
     assert {r.reason for r in results if r.doc == "absent.pdf"} == {"not_in_ledger"}
     assert all(r.correct for r in results if r.doc == "f.pdf")
+
+
+async def test_a_document_removed_during_extraction_leaves_no_index_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Owner removes the document while the model runs, and the removal and its purge finish
+    before extraction writes its row. `_route` re-checks the ledger under its lock after the
+    write: a terminal row gets its index rows purged, and is neither routed nor named."""
+    ledger = await make_ledger(db, ready)
+    original_ask = extract_module._ask
+    removed: list[bool] = []
+
+    async def ask_then_remove(*args: Any, **kwargs: Any) -> Any:
+        if not removed:
+            async with sessions() as session:
+                await session.execute(
+                    text(
+                        "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+                        " removed_by = :u, removal_reason = 'Déposé par erreur (SAMPLE)'"
+                        " WHERE id = :id"
+                    ),
+                    {"id": ledger.id, "u": user.id},
+                )
+                await session.commit()
+            removed.append(True)
+        return await original_ask(*args, **kwargs)
+
+    monkeypatch.setattr(extract_module, "_ask", ask_then_remove)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+        assert _patches(router) == []
+    assert (await reload(db, ledger)).state is DocumentState.removed
+    assert await fields_of(engines, ready, ledger.id) is None
+    assert await runs_of(engines, ready, ledger.id) == []
+    routed = {"document.filed", "document.needs_review"}
+    assert routed.isdisjoint(await actions(db, ready))

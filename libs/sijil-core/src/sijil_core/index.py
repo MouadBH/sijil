@@ -6,7 +6,8 @@ by a role of the same name. The control plane and the ledger never hold values, 
 A row of `document_fields` is frozen once sealed, at the database level (trigger
 `document_fields_frozen`): the error message carries the machine code `retention.locked`, which
 this module raises as `RetentionLocked` so callers can answer 409. `extraction_run` is evidence
-of what each model run said and is append-only.
+of what each model run said and is append-only, like `correction_note` (v2). The one DELETE
+the triggers allow is `purge_document`'s.
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -19,7 +20,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import URL, select, text
 from sqlalchemy.exc import DBAPIError
@@ -38,7 +39,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 MAX_ENGINES: Final = 32
 LOCKED_CODE: Final = "retention.locked"
 # SQLSTATE the triggers raise it with (custom class "SJ": Sijil).
@@ -97,6 +98,76 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         FOR EACH ROW EXECUTE FUNCTION extraction_run_append_only()""",
         """CREATE TRIGGER extraction_run_no_truncate BEFORE TRUNCATE ON extraction_run
         FOR EACH STATEMENT EXECUTE FUNCTION extraction_run_append_only()""",
+    ),
+    # v2: correction notes, and the one DELETE allowed: `purge_document`'s, gated per ledger id.
+    2: (
+        """CREATE TABLE correction_note (
+        id uuid PRIMARY KEY,
+        ledger_id uuid NOT NULL,
+        field text NOT NULL,
+        value text,
+        reason text NOT NULL,
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL
+    )""",
+        "CREATE INDEX correction_note_ledger ON correction_note (ledger_id)",
+        """CREATE OR REPLACE FUNCTION document_fields_frozen() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'TRUNCATE' THEN
+            RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+        END IF;
+        IF TG_OP = 'DELETE' THEN
+            IF current_setting('sijil.purge', true) IS DISTINCT FROM OLD.ledger_id::text
+               OR (OLD.sealed_at IS NOT NULL
+                   AND current_setting('sijil.purge_sealed', true)
+                       IS DISTINCT FROM OLD.ledger_id::text) THEN
+                RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+            END IF;
+            RETURN OLD;
+        END IF;
+        IF OLD.sealed_at IS NOT NULL THEN
+            RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+        END IF;
+        RETURN NEW;
+    END $$""",
+        """CREATE FUNCTION index_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            IF current_setting('sijil.purge', true) IS NOT DISTINCT FROM OLD.ledger_id::text THEN
+                RETURN OLD;
+            END IF;
+        END IF;
+        RAISE EXCEPTION 'index.append_only' USING ERRCODE = 'SJ002';
+    END $$""",
+        "DROP TRIGGER extraction_run_append_only ON extraction_run",
+        "DROP TRIGGER extraction_run_no_truncate ON extraction_run",
+        "DROP FUNCTION extraction_run_append_only()",
+        *(
+            sql
+            for table in ("extraction_run", "correction_note")
+            for sql in (
+                f"""CREATE TRIGGER {table}_append_only BEFORE UPDATE OR DELETE ON {table}
+        FOR EACH ROW EXECUTE FUNCTION index_append_only()""",
+                f"""CREATE TRIGGER {table}_no_truncate BEFORE TRUNCATE ON {table}
+        FOR EACH STATEMENT EXECUTE FUNCTION index_append_only()""",
+            )
+        ),
+        # One statement, so one transaction even on an AUTOCOMMIT connection; the gate is
+        # opened for this ledger id only and closed again before it returns.
+        """CREATE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
     ),
 }
 
@@ -369,6 +440,114 @@ async def _seal(
             raise RetentionLocked from exc
         raise
     return _row(result.mappings().one())
+
+
+@dataclass(frozen=True, kw_only=True)
+class Correction:
+    """One correction note, column for column. `value` None means "the field is empty"."""
+
+    id: UUID
+    ledger_id: UUID
+    field: str
+    value: str | None
+    reason: str
+    created_by: UUID
+    created_at: datetime
+
+
+async def add_correction(
+    conn: AsyncConnection,
+    ledger_id: UUID,
+    field_name: str,
+    value: str | None,
+    reason: str,
+    *,
+    created_by: UUID,
+    now: datetime,
+) -> Correction:
+    """Appends a note (the table is append-only); the sealed `document_fields` row is not
+    touched."""
+    note = Correction(
+        id=uuid4(),
+        ledger_id=ledger_id,
+        field=field_name,
+        value=value,
+        reason=reason,
+        created_by=created_by,
+        created_at=now,
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO correction_note (id, ledger_id, field, value, reason, created_by, "
+            "created_at) VALUES (:id, :ledger_id, :field, :value, :reason, :created_by, "
+            ":created_at)"
+        ),
+        {
+            "id": note.id,
+            "ledger_id": ledger_id,
+            "field": field_name,
+            "value": value,
+            "reason": reason,
+            "created_by": created_by,
+            "created_at": now,
+        },
+    )
+    return note
+
+
+async def read_corrections(conn: AsyncConnection, ledger_id: UUID) -> list[Correction]:
+    """The document's notes, newest first."""
+    result = await conn.execute(
+        text(
+            "SELECT id, ledger_id, field, value, reason, created_by, created_at "
+            "FROM correction_note WHERE ledger_id = :id ORDER BY created_at DESC, id DESC"
+        ),
+        {"id": ledger_id},
+    )
+    return [Correction(**dict(m)) for m in result.mappings()]
+
+
+def effective_fields(
+    row: FieldsRow, corrections: list[Correction]
+) -> dict[str, tuple[str | None, bool]]:
+    """Each field's value and whether a note corrects it: the latest note per field wins.
+    `corrections` is in `read_corrections` order (newest first)."""
+    effective: dict[str, tuple[str | None, bool]] = {
+        name: (value, False) for name, value in row.values.items()
+    }
+    seen: set[str] = set()
+    for note in corrections:
+        if note.field not in seen:
+            seen.add(note.field)
+            effective[note.field] = (note.value, True)
+    return effective
+
+
+async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
+    """Deletes the document's `document_fields`, `extraction_run` and `correction_note` rows,
+    all or nothing, through the schema's `purge_document()` function. Idempotent.
+
+    The index triggers refuse every DELETE but one whose ledger id the GUC `sijil.purge` names,
+    which the function sets with `set_config(..., true)` (`SET LOCAL`) and clears again before
+    it returns. A sealed `document_fields` row also needs `sijil.purge_sealed`, set only with
+    `sealed=True`; without it the purge raises `RetentionLocked` and deletes nothing. It is one
+    statement, so this holds on an AUTOCOMMIT connection too.
+
+    The caller owns the ledger state: removal purges an unsealed document, an approved
+    deletion (ledger `deleting`) a sealed one with `sealed=True`. The services connect as the
+    index role, which owns the tables and could drop the triggers anyway (backlog: a separate
+    owner), so this GUC gate is no weaker than the triggers were: it stops a stray DELETE, and a
+    plain DELETE or TRUNCATE is refused as before.
+    """
+    try:
+        await conn.execute(
+            text("SELECT purge_document(CAST(:id AS uuid), CAST(:sealed AS boolean))"),
+            {"id": ledger_id, "sealed": sealed},
+        )
+    except DBAPIError as exc:
+        if _locked(exc):
+            raise RetentionLocked from exc
+        raise
 
 
 async def find_possible_duplicates(

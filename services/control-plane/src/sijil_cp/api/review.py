@@ -18,8 +18,10 @@ completes exactly once when it is called again:
    original to COMPLIANCE at the committed `retention_until`, and `sijil.mirror_fields`.
 
 Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
-provisional date: no key a running service holds can delete or shorten it, and the
-`requeue_unlocked` sweep and the drift check bound that window.
+provisional date: the app key this service holds can neither delete nor shorten it (only the
+seal worker's key could shorten it, and only the removal worker's could delete it, for a row in
+`removed`, which a sealed row never is), and the `requeue_unlocked` sweep and the drift check
+bound that window.
 
 A field edit holds the same ledger lock; it commits its `document.fields_edited` event first and
 its index write after (an applied edit is always audited; an index failure then answers 503
@@ -58,7 +60,8 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, parse_field
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
-from sijil_core.retention import REGION_TZ, fiscal_retain_until, retention_basis
+from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
+from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
@@ -111,6 +114,21 @@ class ReviewItem(BaseModel):
 class FieldsOut(ReviewItem):
     sealed_at: datetime | None
     fields_sha256: str | None
+
+
+class CorrectionOut(BaseModel):
+    field: str
+    value: str | None
+    reason: str
+    created_by: UUID
+    created_at: datetime
+
+
+class FieldsDetail(FieldsOut):
+    """`GET …/fields`: the sealed values as they were, and the correction notes beside them
+    (newest first)."""
+
+    corrections: list[CorrectionOut]
 
 
 class ReviewPage(BaseModel):
@@ -214,12 +232,6 @@ def _decode_batch_cursor(cursor: str) -> tuple[datetime, UUID]:
     return _decode_cursor(cursor, ("body", "cursor"))
 
 
-async def _read(engines: IndexEngines, workspace: Workspace, ledger_id: UUID) -> FieldsRow | None:
-    # The region was asserted by `require_workspace` before anything of the workspace is read.
-    async with (await engines.engine(workspace)).connect() as conn:
-        return await index_db.read_fields(conn, ledger_id)
-
-
 async def _locked_ledger(db: AsyncSession, workspace: Workspace, doc_id: UUID) -> DocumentLedger:
     """The ledger row, locked FOR UPDATE until the caller's transaction ends."""
     ledger = await db.scalar(
@@ -284,10 +296,16 @@ async def review_queue(
     )
 
 
-@router.get("/workspaces/{workspace_id}/documents/{doc_id}/fields", response_model=FieldsOut)
+@router.get(
+    "/workspaces/{workspace_id}/documents/{doc_id}/fields",
+    response_model=FieldsDetail | TombstoneOut,
+    response_model_exclude_unset=True,
+)
 async def get_fields(
     doc_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
-) -> FieldsOut:
+) -> FieldsDetail | TombstoneOut:
+    """The fields, or for a removed or deleted document its tombstone, as GET …/documents/{id}
+    answers: never the values, which stay in the index only until the purge."""
     workspace = ctx.workspace
     ledger = await db.scalar(
         select(DocumentLedger).where(
@@ -296,7 +314,13 @@ async def get_fields(
     )
     if ledger is None:
         raise ApiError("document.not_found", 404)
-    row = await _read(_engines(request), workspace, ledger.id)
+    dead = ledger.state in TOMBSTONES
+    row: FieldsRow | None = None
+    notes: list[index_db.Correction] = []
+    if not dead:
+        async with (await _engines(request).engine(workspace)).connect() as conn:
+            row = await index_db.read_fields(conn, ledger.id)
+            notes = await index_db.read_corrections(conn, ledger.id)
     await audit.append(
         db,
         workspace_id=workspace.id,
@@ -309,7 +333,12 @@ async def get_fields(
         now=now,
     )
     await db.commit()
-    return _full(ledger, row)
+    if dead:
+        return tombstone(ledger, ctx.role)
+    return FieldsDetail(
+        **_full(ledger, row).model_dump(),
+        corrections=[CorrectionOut.model_validate(n, from_attributes=True) for n in notes],
+    )
 
 
 def _parsed(raw: Mapping[str, str | None]) -> dict[str, str | None]:
@@ -400,7 +429,6 @@ class _Sealer:
 
     engine: AsyncEngine
     workspace_id: UUID
-    country: str
     region: str
     user_id: UUID
     ip: str | None
@@ -411,12 +439,15 @@ def _missing(row: FieldsRow) -> list[str]:
     return sorted(n for n in _required(row.document_type) if row.values.get(n) is None)
 
 
-def _final_retention(ledger: DocumentLedger, row: FieldsRow, sealer: _Sealer) -> date:
+async def _final_retention(
+    db: AsyncSession, ledger: DocumentLedger, row: FieldsRow, sealer: _Sealer
+) -> date:
     """The later of the ledger's retention and the fiscal year of the shared basis (a plausible
     document date, else the arrival date, never after today): a COMPLIANCE lock can never be
     shortened, so an implausible year never locks an original for longer."""
     basis = retention_basis(row.values.get("date"), ledger.ingested_at, sealer.region, sealer.now)
-    return max(ledger.retention_until, fiscal_retain_until(basis, sealer.country))
+    years = await policy_years(db, sealer.workspace_id, row.document_type)
+    return max(ledger.retention_until, fiscal_retain_until(basis, years))
 
 
 async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger) -> FieldsOut:
@@ -436,7 +467,7 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
     digest = fields_digest(row.values)
     if row.sealed_at is not None and row.fields_sha256 != digest:
         raise ApiError(LOCKED, 409)
-    final = _final_retention(ledger, row, sealer)
+    final = await _final_retention(db, ledger, row, sealer)
     # The index row frozen, in its own committed transaction. The digest is recomputed from the
     # row it locks, so values that changed since the read above are refused, never sealed
     # under a stale hash. On a retry it is already sealed with this hash: its stored
@@ -527,7 +558,6 @@ async def _sealer(
     return _Sealer(
         engine=engine,
         workspace_id=workspace.id,
-        country=org.country,
         region=org.region,
         user_id=user.id,
         ip=_ip(request),

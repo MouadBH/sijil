@@ -63,6 +63,7 @@ from sijil_core.confidence import (
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     AuditEvent,
     CredentialKind,
@@ -80,7 +81,12 @@ from sijil_core.ingest import Enqueue
 from sijil_core.ollama import OllamaBadOutput, OllamaClient
 from sijil_core.paperless import PaperlessClient
 from sijil_core.region import RegionMismatch, assert_region
-from sijil_core.retention import fiscal_retain_until, region_local_date, retention_basis
+from sijil_core.retention import (
+    fiscal_retain_until,
+    policy_years,
+    region_local_date,
+    retention_basis,
+)
 from sijil_core.storage import ObjectRef
 from sijil_core.text import normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
@@ -563,7 +569,7 @@ async def _route(
     async with sessions() as session:
         found = (
             await session.execute(
-                select(DocumentLedger, Organisation.region, Organisation.country)
+                select(DocumentLedger, Organisation.region)
                 .join(Workspace, Workspace.id == DocumentLedger.workspace_id)
                 .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(DocumentLedger.id == row.ledger_id)
@@ -572,7 +578,16 @@ async def _route(
         ).first()
         if found is None:
             return None
-        ledger, region, country = found
+        ledger, region = found
+        if ledger.state in TERMINAL_STATES:
+            # Removed while the model ran: its purge may already have run, before this row was
+            # written. The removal committed before that purge, and this check runs after the
+            # write under the ledger lock, so the row written here is purged now. (Its index
+            # row was never sealed: the ledger was still `received` when extraction began.)
+            async with (await index.engine(workspace)).begin() as conn:
+                await index_db.purge_document(conn, row.ledger_id)
+            log.info("extraction of document %s stopped: removed", row.ledger_id)
+            return None
         if ledger.state is not DocumentState.received:
             return None
         confidence, flags = await _flags_and_scores(index, workspace, row)
@@ -580,7 +595,8 @@ async def _route(
         # Only a plausible date may raise retention (the same basis as the seal): an object
         # lock is never shortened, so a misread year must not lock the original for longer.
         basis = retention_basis(row.values.get("date"), ledger.ingested_at, region, now)
-        target = max(ledger.retention_until, fiscal_retain_until(basis, country))
+        years = await policy_years(session, workspace.id, row.document_type)
+        target = max(ledger.retention_until, fiscal_retain_until(basis, years))
         if target > ledger.retention_until:
             try:
                 await store.extend_retention(

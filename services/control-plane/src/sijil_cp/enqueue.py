@@ -14,6 +14,10 @@ INGEST_TASK = ("sijil.ingest_document", "ingest")
 MIRROR_TASK = ("sijil.mirror_fields", "default")
 # The seal worker: the only holder of the key that switches an original to COMPLIANCE.
 LOCK_TASK = ("sijil.lock_sealed", "seal")
+# The removal worker: the only holder of the key that can delete an original.
+REMOVE_TASK = ("sijil.remove_original", "removal")
+# The export worker: the only holder of the export key and the region's signing seed.
+EXPORT_TASK = ("sijil.build_export", "export")
 
 
 class Enqueuer(Protocol):
@@ -29,6 +33,14 @@ class Enqueuer(Protocol):
 
     def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
         """Switch a sealed original to COMPLIANCE (seal worker, queue `seal`)."""
+        ...
+
+    def send_remove(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        """Delete a removed original from the store (removal worker, queue `removal`)."""
+        ...
+
+    def send_export(self, job_id: UUID) -> None:
+        """Build a period export (export worker, queue `export`)."""
         ...
 
 
@@ -54,6 +66,13 @@ class CeleryEnqueuer:
 
     def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self._send_document(LOCK_TASK, ledger_id, workspace_id)
+
+    def send_remove(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self._send_document(REMOVE_TASK, ledger_id, workspace_id)
+
+    def send_export(self, job_id: UUID) -> None:
+        name, queue = EXPORT_TASK
+        self._app.send_task(name, kwargs={"job_id": str(job_id)}, queue=queue)
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task

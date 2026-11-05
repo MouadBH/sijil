@@ -202,7 +202,6 @@ async def test_unsealed_row_hash_is_set_once(
 
 SEAL_INCONSISTENT = {
     "state = 'sealed'": "sealed state without sealed_at",
-    "sealed_at = now()": "sealed_at without the state or the hash",
     "sealed_at = now(), state = 'sealed'": "sealed without a hash",
     "fields_sha256 = repeat('f', 64)": "a hash on an unsealed row",
     "sealed_by = :u": "sealed_by without sealed_at",
@@ -223,6 +222,17 @@ async def test_seal_columns_consistent(
             text(f"UPDATE document_ledger SET {assignment}"),  # noqa: S608
             {"u": user.id} if ":u" in assignment else {},
         )
+
+
+async def test_sealed_at_without_the_sealed_state_refused_by_trigger(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace
+) -> None:
+    """0011: `sealed_at` is written only together with the state `sealed` (the trigger refuses
+    it before the CHECK, which now accepts a seal on a deleting row)."""
+    db.add(ledger(workspace.id))
+    await db.commit()
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await owner_conn.execute(text("UPDATE document_ledger SET sealed_at = now()"))
 
 
 async def test_seal_consistency_check_on_insert(db: AsyncSession, workspace: Workspace) -> None:
@@ -359,6 +369,99 @@ async def test_ledger_unique_per_workspace_sha(db: AsyncSession, workspace: Work
         await db.commit()
 
 
+_TO_TERMINAL = {
+    DocumentState.removed: [
+        "state = 'removed', removed_at = now(), removed_by = :u, removal_reason = :reason"
+    ],
+    DocumentState.deleting: [
+        "state = 'sealed', fields_sha256 = repeat('f', 64), sealed_at = now(), sealed_by = :u",
+        "state = 'deleting', deletion_approved_at = now(), deletion_approved_by = :u",
+    ],
+}
+_TO_TERMINAL[DocumentState.deleted] = [
+    *_TO_TERMINAL[DocumentState.deleting],
+    "original_removed_at = now()",
+    "state = 'deleted', deleted_at = now()",
+]
+
+
+async def _tombstone(
+    db: AsyncSession, workspace: Workspace, user: User, state: DocumentState
+) -> uuid.UUID:
+    """A row brought to `state` through the transitions 0011 allows (its retention long over)."""
+    row = ledger(workspace.id, retention_until=date(2020, 12, 31))
+    db.add(row)
+    await db.commit()
+    row_id = row.id
+    for assignment in _TO_TERMINAL[state]:
+        await db.execute(
+            text(f"UPDATE document_ledger SET {assignment} WHERE id = :id"),  # noqa: S608
+            {"id": row_id, "u": user.id, "reason": "Déposé par erreur (SAMPLE)"},
+        )
+        await db.commit()
+    return row_id
+
+
+@pytest.mark.parametrize(
+    "state", [DocumentState.removed, DocumentState.deleting, DocumentState.deleted]
+)
+async def test_ledger_unique_only_among_live_rows(
+    db: AsyncSession, workspace: Workspace, user: User, state: DocumentState
+) -> None:
+    """0013: a tombstone's hash may be archived again, once: two live rows never share it."""
+    await _tombstone(db, workspace, user, state)
+    db.add(ledger(workspace.id, object_version_id="v2"))
+    await db.commit()
+    db.add(ledger(workspace.id, object_version_id="v3"))
+    with pytest.raises(IntegrityError, match="uq_document_ledger_workspace_sha256_live"):
+        await db.commit()
+
+
+async def test_0013_downgrade_refuses_shared_hashes_and_keeps_every_row(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """Down to 0012 the full unique constraint would not hold while a tombstone and a live row
+    share a hash: the downgrade refuses, in its own transaction, rather than drop either row, and
+    the partial index stays."""
+    await _tombstone(db, workspace, user, DocumentState.removed)
+    db.add(ledger(workspace.id, object_version_id="v2"))
+    await db.commit()
+    await db.close()
+    with pytest.raises(subprocess.CalledProcessError):
+        _alembic(migrated_db.owner_url, "downgrade", "0012")
+    assert await owner_conn.scalar(text("SELECT count(*) FROM document_ledger")) == 2
+    assert "uq_document_ledger_workspace_sha256" not in await _constraint_names(owner_conn)
+    assert await _has_live_index(owner_conn)
+
+
+async def _has_live_index(conn: AsyncConnection) -> bool:
+    found = await conn.scalar(
+        text("SELECT count(*) FROM pg_indexes WHERE indexname = :n"),
+        {"n": "uq_document_ledger_workspace_sha256_live"},
+    )
+    return bool(found)
+
+
+async def test_0013_downgrade_restores_the_full_constraint(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """With no hash shared, down to 0012 brings back 0004's constraint over every row, and the
+    tombstone stays."""
+    await _tombstone(db, workspace, user, DocumentState.removed)
+    await db.close()
+    _alembic(migrated_db.owner_url, "downgrade", "0012")
+    try:
+        assert "uq_document_ledger_workspace_sha256" in await _constraint_names(owner_conn)
+        assert not await _has_live_index(owner_conn)
+        assert await owner_conn.scalar(text("SELECT count(*) FROM document_ledger")) == 1
+    finally:
+        _alembic(migrated_db.owner_url, "upgrade", "head")
+    assert "uq_document_ledger_workspace_sha256" not in await _constraint_names(owner_conn)
+    assert await _has_live_index(owner_conn)
+
+
 def audit(workspace_id: uuid.UUID) -> AuditEvent:
     return AuditEvent(
         workspace_id=workspace_id,
@@ -431,3 +534,78 @@ async def test_0009_downgrade_to_0008_keeps_the_0008_guards(
     finally:
         _alembic(migrated_db.owner_url, "upgrade", "head")
     assert "object_locked_at" in await _columns(owner_conn)
+
+
+TERMINAL_COLUMNS = {
+    "removed_at",
+    "removed_by",
+    "removal_reason",
+    "deletion_eligible_at",
+    "deletion_approved_at",
+    "deletion_approved_by",
+    "deleted_at",
+    "original_removed_at",
+}
+
+
+async def _has_region_today(conn: AsyncConnection) -> bool:
+    found = await conn.scalar(
+        text("SELECT count(*) FROM pg_proc WHERE proname = 'sijil_region_today'")
+    )
+    return bool(found)
+
+
+async def _has_insert_guard(conn: AsyncConnection) -> bool:
+    trigger = await conn.scalar(
+        text("SELECT count(*) FROM pg_trigger WHERE tgname = 'document_ledger_insert_guard'")
+    )
+    function = await conn.scalar(
+        text("SELECT count(*) FROM pg_proc WHERE proname = 'document_ledger_insert_guard'")
+    )
+    return bool(trigger) and bool(function)
+
+
+async def test_0011_downgrade_restores_0009_guard(
+    db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
+    migrated_db: Any,
+) -> None:  # fmt: skip
+    """Down to 0010 (whose function is 0009's): the terminal columns, CHECKs, the INSERT guard
+    and `sijil_region_today()` are gone, the sealed row is frozen again in every state (no way to
+    `deleting`), and the seal CHECK is 0008's (a seal only on a sealed row)."""
+    db.add(ledger(workspace.id))
+    db.add(ledger(workspace.id, sha=f"{9:064x}"))
+    await db.commit()
+    await db.close()
+    await owner_conn.execute(text(SEAL_SQL + " WHERE sha256 = :sha"), {"u": user.id, "sha": SHA})
+    _alembic(migrated_db.owner_url, "downgrade", "0010")
+    try:
+        assert not TERMINAL_COLUMNS & await _columns(owner_conn)
+        names = await _constraint_names(owner_conn)
+        assert "ck_document_ledger_terminal_consistent" not in names
+        assert "ck_document_ledger_removal_reason_length" not in names
+        assert {
+            "ck_document_ledger_seal_consistent",
+            "ck_document_ledger_object_locked_after_seal",
+        } <= names
+        assert not await _has_region_today(owner_conn)
+        assert not await _has_insert_guard(owner_conn)
+        for assignment in (*SEALED_FROZEN, "state = 'deleting'", "state = 'deleted'"):
+            with pytest.raises(DBAPIError, match="ledger.immutable"):
+                await owner_conn.execute(
+                    text(f"UPDATE document_ledger SET {assignment} WHERE sha256 = :sha"),  # noqa: S608
+                    {"sha": SHA},
+                )
+        # 0009's trigger lets an unsealed row change state; 0008's CHECK refuses the seal on it.
+        with pytest.raises(IntegrityError, match="ck_document_ledger_seal_consistent"):
+            await owner_conn.execute(
+                text(
+                    "UPDATE document_ledger SET state = 'deleting', sealed_at = now(), "
+                    "fields_sha256 = repeat('f', 64) WHERE sha256 = :sha"
+                ),
+                {"sha": f"{9:064x}"},
+            )
+    finally:
+        _alembic(migrated_db.owner_url, "upgrade", "head")
+    assert TERMINAL_COLUMNS <= await _columns(owner_conn)
+    assert await _has_region_today(owner_conn)
+    assert await _has_insert_guard(owner_conn)

@@ -24,6 +24,7 @@ from sijil_core.db.models import (
     UserSession,
 )
 from sijil_core.region import assert_region
+from sijil_core.retention import preset_policies
 from sijil_cp.api.workspaces import WorkspaceOut, new_workspace, workspace_out
 from sijil_cp.auth import ratelimit
 from sijil_cp.deps import (
@@ -159,6 +160,7 @@ async def create_org(
     workspace = new_workspace(org.id, body.name)
     db.add(workspace)
     await db.flush()
+    db.add_all(preset_policies(workspace.id, org.country))
     job = Job(kind=JobKind.provision_workspace, workspace_id=workspace.id)
     db.add(job)
     await db.commit()

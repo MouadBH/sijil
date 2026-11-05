@@ -38,6 +38,13 @@ check: lint typecheck test
 
 up:
 	test -f infra/compose/.env || cp infra/compose/.env.example infra/compose/.env
+	@# An .env from an earlier milestone gets the keys added since (e.g. the removal key, M4),
+	@# after a newline if its last line has none (else the first key would join that line).
+	@[ -z "$$(tail -c 1 infra/compose/.env)" ] || echo >> infra/compose/.env
+	@awk -F= 'NR == FNR { have[$$1] = 1; next } /^[A-Z][A-Z0-9_]*=/ && !($$1 in have) { print; print "added " $$1 > "/dev/stderr" }' \
+		infra/compose/.env infra/compose/.env.example >> infra/compose/.env
+	@# The region's export signing pair: generated once, never overwritten.
+	infra/scripts/ensure-signing-key.sh infra/compose/.env
 	$(COMPOSE) up -d --build
 
 # Plain `make down` only stops the compose services: provisioned tenants stay, because their
