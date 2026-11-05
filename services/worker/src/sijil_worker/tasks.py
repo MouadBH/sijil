@@ -24,8 +24,9 @@ from sijil_core.paperless import (
     PaperlessError,
     PaperlessUnavailable,
 )
+from sijil_core.pending import PENDING_TTL_S, REMOVE_PREFIX
 from sijil_core.region import RegionMismatch
-from sijil_core.storage import S3ObjectStore, StorageSettings
+from sijil_core.storage import RetentionActive, S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -51,8 +52,14 @@ from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
 from sijil_worker.reconcile import reconcile_tenants
+from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
-from sijil_worker.settings import ExtractionSettings, SealSettings, WorkerSettings
+from sijil_worker.settings import (
+    ExtractionSettings,
+    RemovalSettings,
+    SealSettings,
+    WorkerSettings,
+)
 
 log = logging.getLogger(__name__)
 
@@ -725,3 +732,156 @@ def requeue_unlocked_task() -> int:
     """Re-send the compliance lock for sealed rows still unlocked (a lost message, a store
     that was down). Runs on the main worker: it only reads the ledger and sends tasks."""
     return asyncio.run(_requeue_unlocked())
+
+
+# The original's removal (removal worker): 30 s, 1 min ... capped at 15 min, REMOVAL_MAX_RETRIES
+# times, for transient store or database errors (`is_lock_transient`). A final failure, once its
+# retries run out or at once for a refusal (AccessDenied, RetentionActive ...), is audited
+# `document.removal_failed` `{code}` and the state stays as it is. Its `remove:pending` key is
+# then kept for the full TTL (1 h) whether or not the audit could be written: the row is still
+# waiting, so a cleared key would have the sweep re-send (and re-audit) it every five minutes.
+REMOVAL_MAX_RETRIES = 8
+REMOVAL_BACKOFF_FACTOR_S = 30
+REMOVAL_BACKOFF_MAX_S = 900
+
+
+def removal_error_code(exc: BaseException) -> str:
+    """The machine code audited with `document.removal_failed`."""
+    if isinstance(exc, RetentionActive):
+        return "retention.locked"
+    return _store_code(exc)
+
+
+async def _with_remove_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(RemovalSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix=REMOVE_PREFIX))
+    finally:
+        await redis.aclose()
+
+
+def _pending_remove_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_remove_pending(op))
+    except Exception as exc:
+        log.warning("removal pending key update failed: %s", type(exc).__name__)
+
+
+async def _send_purge(ledger_id: UUID, workspace_id: UUID) -> None:
+    """`sijil.purge_document` (the Paperless copy and the index rows), by name: the main worker
+    runs it on `default`."""
+    current_app.send_task(
+        "sijil.purge_document",
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue="default",
+    )
+
+
+async def _remove_original(ledger_id: str, workspace_id: str) -> None:
+    settings = RemovalSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await remove_original(
+            UUID(ledger_id),
+            sessions=make_sessionmaker(engine),
+            store=S3ObjectStore(settings),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+            purge=_send_purge,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _removal_failed(ledger_id: str, workspace_id: str, code: str) -> bool:
+    settings = RemovalSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await record_removal_failed(
+            UUID(ledger_id),
+            UUID(workspace_id),
+            code,
+            sessions=make_sessionmaker(engine),
+            settings=settings,
+            now=utcnow(),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True, name="sijil.remove_original", queue="removal", max_retries=REMOVAL_MAX_RETRIES
+)
+def remove_original_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A removed or approved original deleted from the store (sijil_worker.removal)."""
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    try:
+        asyncio.run(_remove_original(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_lock_transient(exc) and retries < REMOVAL_MAX_RETRIES:
+            countdown = get_exponential_backoff_interval(
+                factor=REMOVAL_BACKOFF_FACTOR_S,
+                retries=retries,
+                maximum=REMOVAL_BACKOFF_MAX_S,
+                full_jitter=True,
+            )
+
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_remove_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        code = removal_error_code(exc)
+        log.error("removal of document %s failed: %s", ledger_id, code)
+        try:
+            asyncio.run(_removal_failed(ledger_id, workspace_id, code))
+        except Exception as audit_exc:
+            log.error(
+                "removal failure of document %s not recorded: %s",
+                ledger_id, type(audit_exc).__name__,
+            )  # fmt: skip
+
+        async def keep(pending: PendingExtractions) -> None:
+            await pending.refresh(lid, PENDING_TTL_S)
+
+        _pending_remove_quietly(keep)
+        return
+    _pending_remove_quietly(clear)
+
+
+async def _requeue_unremoved() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ledger_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.remove_original",
+            kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+            queue="removal",
+        )
+
+    try:
+        return await requeue_unremoved(
+            make_sessionmaker(engine),
+            send,
+            region=settings.region,
+            pending=PendingExtractions(redis, prefix=REMOVE_PREFIX),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.requeue_unremoved")
+def requeue_unremoved_task() -> int:
+    """Re-send the removal for `removed` and `deleting` rows whose original is not yet recorded
+    removed. Runs on the main worker: it only reads the ledger and sends tasks (no store key)."""
+    return asyncio.run(_requeue_unremoved())

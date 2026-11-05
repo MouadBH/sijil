@@ -11,7 +11,8 @@ RECONCILE_INTERVAL_S = 300
 REQUEUE_INGEST_INTERVAL_S = 300
 REQUEUE_EXTRACT_INTERVAL_S = 600
 REQUEUE_UNLOCKED_INTERVAL_S = 300
-QUEUES = ("default", "provisioning", "ingest", "extraction", "seal")
+REQUEUE_UNREMOVED_INTERVAL_S = 300
+QUEUES = ("default", "provisioning", "ingest", "extraction", "seal", "removal")
 
 
 def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -> Celery:
@@ -44,6 +45,10 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "task": "sijil.requeue_unlocked",
                 "schedule": REQUEUE_UNLOCKED_INTERVAL_S,
             },
+            "requeue-unremoved": {
+                "task": "sijil.requeue_unremoved",
+                "schedule": REQUEUE_UNREMOVED_INTERVAL_S,
+            },
             "drift-check-nightly": {
                 "task": "sijil.drift_check_all",
                 "schedule": crontab(hour=2, minute=30),
@@ -52,8 +57,8 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
     )
 
     if reconcile_on_start:
-        # The main worker only (it has the Docker socket): the extraction and seal workers
-        # never ask for a reconcile.
+        # The main worker only (it has the Docker socket): the extraction, seal and removal
+        # workers never ask for a reconcile.
         @worker_ready.connect(weak=False)
         def _reconcile_on_start(**_: Any) -> None:
             app.send_task("sijil.reconcile_tenants")
