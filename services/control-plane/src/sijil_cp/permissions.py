@@ -32,12 +32,15 @@ class Action(StrEnum):
     documents_remove = "documents_remove"
     documents_export = "documents_export"
     retention_manage = "retention_manage"
+    # Approving the deletion of documents past retention (design §5.4): the Owner's only.
+    retention_approve_deletion = "retention_approve_deletion"
     audit_read = "audit_read"
 
 
 MATRIX: dict[Role, frozenset[Action]] = {
     Role.owner: frozenset(Action),
-    Role.admin: frozenset(Action) - {Action.org_update, Action.documents_remove},
+    Role.admin: frozenset(Action)
+    - {Action.org_update, Action.documents_remove, Action.retention_approve_deletion},
     Role.member: frozenset(
         {
             Action.workspace_read,
