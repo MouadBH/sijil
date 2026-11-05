@@ -901,12 +901,11 @@ def requeue_unremoved_task() -> int:
 # code only and its `purge:pending` key kept for the full TTL (1 h), so the sweep re-sends that
 # row at most hourly.
 # An upload that may still be consuming (ConsumeInFlight) is neither a failure nor a retry: the
-# purge is sent again by name after CONSUME_RECHECK_S, a fresh message whose retries are
-# untouched, its key kept meanwhile. It ends once the consume window is over.
+# purge is sent again by name after the countdown it chose (backing off from 1 min to 1 h,
+# sijil_worker.purge), a fresh message whose retries are untouched, its key kept meanwhile.
 PURGE_MAX_RETRIES = 8
 PURGE_BACKOFF_FACTOR_S = 30
 PURGE_BACKOFF_MAX_S = 900
-CONSUME_RECHECK_S = 60
 
 
 def is_purge_transient(exc: BaseException) -> bool:
@@ -914,9 +913,9 @@ def is_purge_transient(exc: BaseException) -> bool:
     return isinstance(exc, PurgeIncomplete) or is_mirror_transient(exc)
 
 
-def _recheck_purge(lid: UUID, ledger_id: str, workspace_id: str) -> None:
+def _recheck_purge(lid: UUID, ledger_id: str, workspace_id: str, countdown: int) -> None:
     async def wait(pending: PendingExtractions) -> None:
-        await pending.refresh(lid, CONSUME_RECHECK_S + PENDING_MARGIN_S)
+        await pending.refresh(lid, countdown + PENDING_MARGIN_S)
 
     _pending_purge_quietly(wait)
     try:
@@ -924,7 +923,7 @@ def _recheck_purge(lid: UUID, ledger_id: str, workspace_id: str) -> None:
             "sijil.purge_document",
             kwargs={"ledger_id": ledger_id, "workspace_id": workspace_id},
             queue="default",
-            countdown=CONSUME_RECHECK_S,
+            countdown=countdown,
         )
     except Exception as exc:
         # The key expires and the sweep sends it again.
@@ -985,8 +984,8 @@ def purge_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: st
 
     try:
         asyncio.run(_purge(ledger_id, workspace_id))
-    except ConsumeInFlight:
-        _recheck_purge(lid, ledger_id, workspace_id)
+    except ConsumeInFlight as waiting:
+        _recheck_purge(lid, ledger_id, workspace_id, waiting.countdown)
         return
     except Exception as exc:
         retries = int(self.request.retries or 0)

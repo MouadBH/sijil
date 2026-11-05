@@ -137,9 +137,11 @@ async def _document(
     task_id: str | None = None,
     claimed_at: datetime | None = None,
     next_attempt_at: datetime | None = None,
+    removed_at: datetime = NOW - timedelta(hours=1),
 ) -> DocumentLedger:
     """A row brought to `state` through the transitions 0011 allows, with its index row
-    (sealed for a sealed or deleted document). The ingest columns say how far ingest got."""
+    (sealed for a sealed or deleted document). The ingest columns say how far ingest got;
+    `removed_at` is on the test's frozen clock (NOW), as the purge's bound is."""
     sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     sealed = state in (DocumentState.sealed, DocumentState.deleted)
     row = DocumentLedger(
@@ -171,11 +173,11 @@ async def _document(
             await index.seal_fields(
                 conn, row.id, fields_sha256=fields_digest(VALUES), sealed_at=NOW
             )
-    params = {"id": row.id, "u": user.id, "reason": REASON}
+    params = {"id": row.id, "u": user.id, "reason": REASON, "at": removed_at}
     if state is DocumentState.removed:
         await db.execute(
             text(
-                "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+                "UPDATE document_ledger SET state = 'removed', removed_at = :at,"
                 " removed_by = :u, removal_reason = :reason WHERE id = :id"
             ),
             params,
@@ -445,6 +447,99 @@ async def test_a_finished_task_names_the_copy_the_ledger_never_recorded(
     assert (fake.live, fake.trash) == ({}, {})
 
 
+# A consume task Paperless never finishes: the wait is bounded by our clock (tasks carry no
+# date), 24 h from the later of the removal and the ingest claim.
+
+
+async def _stuck(
+    db: AsyncSession, engines: IndexEngines, ws: Workspace, user: User, fake: FakePaperless,
+    *, status: str, removed: timedelta, claimed: timedelta,
+) -> DocumentLedger:  # fmt: skip
+    """A removed row whose upload's task Paperless reports `status`, removed and claimed that
+    long before NOW, with its copy findable by checksum."""
+    row = await _document(
+        db, engines, ws, user, DocumentState.removed, paperless_doc_id=None,
+        ingest_state=IngestState.sending, task_id=TASK_ID, claimed_at=NOW - claimed,
+        removed_at=NOW - removed,
+    )  # fmt: skip
+    fake.tasks[TASK_ID] = {"task_id": TASK_ID, "status": status}
+    fake.add(DOC_ID, row.sha256)
+    return row
+
+
+@pytest.mark.parametrize(
+    ("removed", "claimed", "bounded"),
+    [
+        (timedelta(hours=23), timedelta(hours=30), False),  # the removal is the later
+        (timedelta(hours=30), timedelta(hours=23), False),  # the claim is the later
+        (timedelta(hours=25), timedelta(hours=30), True),
+        (timedelta(hours=24), timedelta(hours=24), True),  # exactly 24 h: the bound is reached
+    ],
+)
+async def test_a_started_consume_is_waited_for_at_most_24_hours(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, caplog: pytest.LogCaptureFixture,
+    removed: timedelta, claimed: timedelta, bounded: bool,
+) -> None:  # fmt: skip
+    """Past the bound a STARTED task counts as dead (a Paperless restart mid-consume leaves it
+    so for good): the checksum and the trash decide, the purge is recorded with
+    `consume_unresolved`, and a warning is logged."""
+    row = await _stuck(db, engines, ready, user, fake, status="started", removed=removed,
+                       claimed=claimed)  # fmt: skip
+    if not bounded:
+        with pytest.raises(ConsumeInFlight):
+            await _purge(row, sessions, keys, engines)
+        assert DOC_ID in fake.live
+        assert await _events(db, ready) == []
+        return
+    with caplog.at_level("WARNING", logger="sijil_worker.purge"):
+        assert await _purge(row, sessions, keys, engines)
+    assert (fake.live, fake.trash) == ({}, {})
+    assert await _index_row(engines, ready, row.id) is None
+    [event] = [e for e in await _events(db, ready) if e.action == "document.purged"]
+    assert event.data == {"paperless": True, "consume_unresolved": True}
+    assert any(r.levelname == "WARNING" and "consume" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "countdown"),
+    [
+        (timedelta(seconds=10), 60),  # never sooner than a minute
+        (timedelta(minutes=10), 600),  # then as long again as it has waited so far
+        (timedelta(hours=3), 3600),  # never longer than an hour
+        (timedelta(hours=23, minutes=59), 3600),
+    ],
+)
+async def test_the_re_check_backs_off_from_a_minute_to_an_hour(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, elapsed: timedelta, countdown: int,
+) -> None:  # fmt: skip
+    row = await _stuck(db, engines, ready, user, fake, status="started", removed=elapsed,
+                       claimed=elapsed + timedelta(hours=1))  # fmt: skip
+    with pytest.raises(ConsumeInFlight) as waiting:
+        await _purge(row, sessions, keys, engines)
+    assert waiting.value.countdown == countdown
+
+
+async def test_a_pending_consume_past_the_bound_is_checked_hourly_and_never_recorded(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """PENDING is a consumer that is down, not a task that died: the copy may still be made,
+    so past the bound it is checked again hourly, with an error logged, and never recorded
+    purged (STARTED, at the same age, is: see above)."""
+    row = await _stuck(db, engines, ready, user, fake, status="pending",
+                       removed=timedelta(hours=30), claimed=timedelta(hours=30))  # fmt: skip
+    with caplog.at_level("ERROR", logger="sijil_worker.purge"):
+        with pytest.raises(ConsumeInFlight) as waiting:
+            await _purge(row, sessions, keys, engines)
+    assert waiting.value.countdown == 3600
+    assert any(r.levelname == "ERROR" for r in caplog.records)
+    assert not any(method == "DELETE" for method, _ in fake.methods())
+    assert await _index_row(engines, ready, row.id) is not None
+    assert await _events(db, ready) == []
+
+
 @pytest.mark.parametrize("state", [WorkspaceState.hibernated, WorkspaceState.closing])
 async def test_a_workspace_not_active_is_retried_later(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
@@ -666,14 +761,14 @@ def test_a_done_purge_clears_its_key(
 def test_a_consume_in_flight_is_checked_again_without_spending_a_retry(
     eager_app: Any, key: RecordingPending, monkeypatch: pytest.MonkeyPatch, retries_before: int
 ) -> None:
-    """Sent again by name with a countdown (a fresh message, its retries untouched), its key kept
-    past the countdown; nothing audited, nothing logged as a failure."""
+    """Sent again by name after the countdown the purge chose (a fresh message, its retries
+    untouched), its key kept past the countdown; nothing audited, nothing logged as a failure."""
     calls: list[str] = []
     sent: list[tuple[str, dict[str, Any]]] = []
 
     async def purge(ledger_id: str, workspace_id: str) -> None:
         calls.append(ledger_id)
-        raise ConsumeInFlight
+        raise ConsumeInFlight(countdown=600)
 
     def send_task(name: str, **options: Any) -> None:
         sent.append((name, options))
@@ -683,9 +778,6 @@ def test_a_consume_in_flight_is_checked_again_without_spending_a_retry(
     tasks.purge_document_task.apply(kwargs=ARGS, retries=retries_before)
     assert len(calls) == 1
     assert sent == [
-        (
-            "sijil.purge_document",
-            {"kwargs": ARGS, "queue": "default", "countdown": tasks.CONSUME_RECHECK_S},
-        )
+        ("sijil.purge_document", {"kwargs": ARGS, "queue": "default", "countdown": 600})
     ]
-    assert key.ops == [f"refresh {tasks.CONSUME_RECHECK_S + tasks.PENDING_MARGIN_S}"]
+    assert key.ops == [f"refresh {600 + tasks.PENDING_MARGIN_S}"]

@@ -15,7 +15,14 @@ sends it again when it stops on a removed row after an upload. `purge_document`:
    that found none. "May still be consuming" is a recorded consume task Paperless still runs,
    or, with no task known, an ingest claim or a pending retry within CONSUME_WINDOW (an upload
    whose task id was never recorded: ingest stopped on the removal, or failed, right after
-   it). The task sends the purge again later without spending a retry;
+   it). The task sends the purge again later without spending a retry, after a countdown that
+   backs off with the time waited so far, from RECHECK_MIN (1 min) to RECHECK_MAX (1 h).
+   Paperless tasks carry no date, so the wait is bounded by our own clock: CONSUME_BOUND (24 h)
+   from the later of the removal and the ingest claim. Past it, a STARTED task counts as dead
+   (a Paperless restart mid-consume leaves one so for good): the checksum and trash lookups
+   decide, and the purge is recorded with `consume_unresolved`, with a warning. A PENDING task
+   (the tenant's consumer down: the copy may still be made) is checked again hourly with an
+   error logged, and never recorded purged;
 5. finds every copy: the ledger's id, the document a finished consume task produced, every live
    document with this SHA-256 (all pages: 3.4.1 keeps duplicates), and every trashed document
    with ingest's file name `{sha256[:12]}.{ext}` (the trash has no checksum filter);
@@ -23,7 +30,8 @@ sends it again when it stops on a removed row after an upload. `purge_document`:
    it, i.e. emptied already), then lists the trash again: a copy still there raises
    PurgeIncomplete (transient), so `document.purged` is recorded only once Paperless keeps none;
 7. purges the index rows (`index.purge_document`, the sealed row too only for `deleted`);
-8. audits `document.purged` `{paperless}`: whether Paperless held a copy this run removed.
+8. audits `document.purged` `{paperless}`: whether Paperless held a copy this run removed
+   (plus `consume_unresolved: true` when a dead consume task was given up on).
 
 Every step is idempotent, so a retry or a second message repeats it harmlessly. A workspace that
 is not active (paused, hibernated, closing) raises WorkspaceNotActive, retried later; Paperless
@@ -34,7 +42,7 @@ down raises PaperlessUnavailable likewise. Nothing here touches the object store
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID
 
@@ -80,10 +88,18 @@ REQUEUE_BATCH: Final = 50
 CONSUME_WINDOW: Final = CLAIM_LEASE
 _PURGEABLE = (DocumentState.removed, DocumentState.deleted)
 _TASK_DONE = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
+CONSUME_BOUND: Final = timedelta(hours=24)
+RECHECK_MIN: Final = timedelta(minutes=1)
+RECHECK_MAX: Final = timedelta(hours=1)
 
 
 class ConsumeInFlight(Exception):  # noqa: N818 - a state, not an error
-    """An upload of this document may still be consuming in Paperless: purge later."""
+    """An upload of this document may still be consuming in Paperless: purge again after
+    `countdown` seconds."""
+
+    def __init__(self, countdown: int = int(RECHECK_MIN.total_seconds())) -> None:
+        super().__init__(f"consume in flight, check again in {countdown}s")
+        self.countdown = countdown
 
 
 class PurgeIncomplete(Exception):  # noqa: N818
@@ -92,6 +108,7 @@ class PurgeIncomplete(Exception):  # noqa: N818
 
 @dataclass(frozen=True)
 class _Target:
+    ledger_id: UUID
     workspace: Workspace
     paperless_url: str
     admin_password: str
@@ -103,6 +120,7 @@ class _Target:
     task_id: str | None
     claimed_at: datetime | None
     next_attempt_at: datetime | None
+    decided_at: datetime | None  # the removal (or the approved deletion)
 
 
 async def _target(
@@ -151,6 +169,7 @@ async def _target(
             credential_context(workspace.id, kind),
         ).decode()
         return _Target(
+            ledger_id=ledger_id,
             workspace=workspace,
             paperless_url=workspace.paperless_url,
             admin_password=password,
@@ -162,6 +181,7 @@ async def _target(
             task_id=ledger.paperless_task_id,
             claimed_at=ledger.ingest_claimed_at,
             next_attempt_at=ledger.ingest_next_attempt_at,
+            decided_at=ledger.removed_at or ledger.deletion_approved_at,
         )
 
 
@@ -177,21 +197,52 @@ def _recent_upload(target: _Target, now: datetime) -> bool:
     )
 
 
-async def _copies(client: PaperlessClient, target: _Target, now: datetime) -> set[int]:
+def _waited(target: _Target, now: datetime) -> timedelta:
+    """How long the purge has waited on a consume: since the later of the removal and the
+    ingest claim, on our own clock."""
+    marks = [at for at in (target.decided_at, target.claimed_at) if at is not None]
+    return now - max(marks) if marks else timedelta(0)
+
+
+def _recheck_in(waited: timedelta) -> int:
+    """As long again as waited so far, from RECHECK_MIN to RECHECK_MAX."""
+    return int(min(max(waited, RECHECK_MIN), RECHECK_MAX).total_seconds())
+
+
+@dataclass
+class _Found:
+    ids: set[int]
+    consume_unresolved: bool = False
+
+
+async def _copies(client: PaperlessClient, target: _Target, now: datetime) -> _Found:
     """Every live copy Paperless holds (see the module docstring, steps 4 and 5)."""
-    ids: set[int] = set()
+    found = _Found(ids=set())
     if target.paperless_doc_id is not None:
-        ids.add(target.paperless_doc_id)
+        found.ids.add(target.paperless_doc_id)
     else:
+        waited = _waited(target, now)
         task = await client.task(target.task_id) if target.task_id else None
         if task is not None and task.known and task.status not in _TASK_DONE:
-            raise ConsumeInFlight
-        if task is not None and task.status == "SUCCESS" and task.related_document is not None:
-            ids.add(task.related_document)
+            if waited < CONSUME_BOUND:
+                raise ConsumeInFlight(_recheck_in(waited))
+            if task.status == "PENDING":
+                log.error(
+                    "purge of document %s waits: its consume task is still pending after %s",
+                    target.ledger_id, waited,
+                )  # fmt: skip
+                raise ConsumeInFlight(int(RECHECK_MAX.total_seconds()))
+            log.warning(
+                "purge of document %s gives up on its consume task (%s after %s): purging",
+                target.ledger_id, task.status, waited,
+            )  # fmt: skip
+            found.consume_unresolved = True
+        elif task is not None and task.status == "SUCCESS" and task.related_document is not None:
+            found.ids.add(task.related_document)
         elif _recent_upload(target, now):
-            raise ConsumeInFlight
-    ids.update(await client.documents_with_checksum(target.sha256))
-    return ids
+            raise ConsumeInFlight(_recheck_in(waited))
+    found.ids.update(await client.documents_with_checksum(target.sha256))
+    return found
 
 
 async def _trashed(client: PaperlessClient, filename: str) -> set[int]:
@@ -200,14 +251,15 @@ async def _trashed(client: PaperlessClient, filename: str) -> set[int]:
 
 async def _purge_paperless(
     target: _Target, paperless: Callable[..., PaperlessClient], now: datetime
-) -> bool:
-    """True when Paperless held a copy (live or in its trash) that this run removed."""
+) -> dict[str, bool]:
+    """The `document.purged` data: `paperless`, whether Paperless held a copy (live or in its
+    trash) that this run removed, and `consume_unresolved` when a dead task was given up on."""
     async with paperless(target.paperless_url) as anonymous:
         token = await anonymous.obtain_token(ADMIN_USERNAME, target.admin_password)
     async with paperless(target.paperless_url, token=token) as client:
-        live = await _copies(client, target, now)
+        found = await _copies(client, target, now)
         deleted: set[int] = set()
-        for doc_id in sorted(live):
+        for doc_id in sorted(found.ids):
             try:
                 await client.delete_document(doc_id)
             except PaperlessError as exc:
@@ -230,7 +282,10 @@ async def _purge_paperless(
             for d in await client.trashed_documents()
         ):
             raise PurgeIncomplete
-        return bool(ours)
+        data = {"paperless": bool(ours)}
+        if found.consume_unresolved:
+            data["consume_unresolved"] = True
+        return data
 
 
 async def purge_document(
@@ -249,7 +304,7 @@ async def purge_document(
     target = await _target(sessions, keys, settings, ledger_id, workspace_id)
     if target is None:
         return False
-    in_paperless = await _purge_paperless(target, paperless, now)
+    data = await _purge_paperless(target, paperless, now)
     # After Paperless: a failure there leaves everything for the retry to find again.
     async with (await index.engine(target.workspace)).begin() as conn:
         await index_db.purge_document(conn, ledger_id, sealed=target.sealed)
@@ -262,7 +317,7 @@ async def purge_document(
             actor_id=None,
             target_type="document",
             target_id=str(ledger_id),
-            data={"paperless": in_paperless},
+            data=data,
             now=now,
         )
         await session.commit()
