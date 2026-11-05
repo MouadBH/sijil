@@ -86,6 +86,21 @@ async def test_removal_key_deletes_governance_version(
     await removal.remove_original(ref, governance=True)
     await removal.remove_original(ObjectRef(_key(), ref.version_id), governance=True)
     await removal.remove_original(ObjectRef(ref.key, str(uuid.uuid4())), governance=False)
+    assert await root.head(ref) is None
+
+
+async def test_an_already_deleted_version_still_ends_removed(
+    app: S3ObjectStore, removal: S3ObjectStore, root: S3ObjectStore, tmp_path: Path
+) -> None:
+    """Deleted behind the worker's back (or by a run that crashed before its commit): the
+    absent read still sends the versioned delete, which RustFS answers 204, with and without
+    the bypass."""
+    for governance in (True, False):
+        ref = await _put(app, tmp_path)
+        await root.remove_original(ref, governance=True)
+        assert await root.head(ref) is None
+        await removal.remove_original(ref, governance=governance)
+        assert await root.head(ref) is None
 
 
 async def test_removal_key_deletes_an_expired_lock_without_the_bypass(

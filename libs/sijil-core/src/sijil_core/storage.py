@@ -91,8 +91,9 @@ class ObjectStore(Protocol):
         removal); without, only once its lock has expired (after retention).
 
         Reads the lock first and raises `RetentionActive`, sending no delete, when the version
-        is COMPLIANCE until today or later (the store refuses that delete too). An absent
-        version counts as already removed and returns normally.
+        is COMPLIANCE until today or later (the store refuses that delete too). A read that
+        finds no version still sends the versioned delete: the store's success, or its
+        NoSuchVersion/NoSuchKey, counts as removed; any refusal propagates.
         """
         ...
 
@@ -283,11 +284,14 @@ class S3ObjectStore(ObjectStore):
         try:
             mode, until = self._current(ref)
         except ClientError as exc:
-            if _retention_absent(exc):
-                return  # already removed (a redelivery after a crash before the commit)
-            raise
-        if mode == "COMPLIANCE" and until.astimezone(UTC).date() >= datetime.now(UTC).date():
-            raise RetentionActive(f"{ref.key}@{ref.version_id}")
+            if not _retention_absent(exc):
+                raise
+            # Absent by the read alone is never trusted (a misread 500, a changed message, a
+            # wrong version id): the versioned delete below is sent anyway, and the store's
+            # answer decides. A COMPLIANCE version the read missed is still refused by the store.
+        else:
+            if mode == "COMPLIANCE" and until.astimezone(UTC).date() >= datetime.now(UTC).date():
+                raise RetentionActive(f"{ref.key}@{ref.version_id}")
         try:
             if governance:
                 self.client.delete_object(

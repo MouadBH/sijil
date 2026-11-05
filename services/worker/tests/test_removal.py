@@ -411,14 +411,40 @@ async def test_remove_original_before_seal_bypasses_governance(
         ("InternalError", 500, "Version not found: sijil-originals-ma-cas/k/abc-v1"),
     ],
 )
-async def test_remove_original_of_an_absent_version_returns(
-    stubbed: tuple[S3ObjectStore, Stubber], code: str, status: int, message: str
-) -> None:
+@pytest.mark.parametrize("governance", [True, False])
+async def test_an_absent_read_still_sends_the_versioned_delete(
+    stubbed: tuple[S3ObjectStore, Stubber], code: str, status: int, message: str,
+    governance: bool,
+) -> None:  # fmt: skip
+    """The read alone never decides that an original is gone (a misread 500, a changed message,
+    a wrong version id): the versioned delete is sent anyway and the store's answer decides."""
     store, stub = stubbed
     stub.add_client_error(
         "get_object_retention", code, service_message=message, http_status_code=status
     )
+    bypass = {"BypassGovernanceRetention": True} if governance else {}
+    stub.add_response("delete_object", {}, {**TARGET, **bypass})
+    await store.remove_original(REF, governance=governance)
+
+
+@pytest.mark.parametrize("code", ["NoSuchVersion", "NoSuchKey"])
+async def test_an_absent_delete_counts_as_removed(
+    stubbed: tuple[S3ObjectStore, Stubber], code: str
+) -> None:
+    store, stub = stubbed
+    stub.add_client_error("get_object_retention", "NoSuchVersion", http_status_code=404)
+    stub.add_client_error("delete_object", code, http_status_code=404)
     await store.remove_original(REF, governance=True)
+
+
+async def test_a_refused_delete_after_an_absent_read_propagates(
+    stubbed: tuple[S3ObjectStore, Stubber],
+) -> None:
+    store, stub = stubbed
+    stub.add_client_error("get_object_retention", "NoSuchVersion", http_status_code=404)
+    stub.add_client_error("delete_object", "AccessDenied", http_status_code=403)
+    with pytest.raises(ClientError):
+        await store.remove_original(REF, governance=False)
 
 
 async def test_retention_of_an_absent_version_is_none(
