@@ -89,7 +89,9 @@ async def put_policy(
         raise ApiError("not_found", 404)
     row = (await _policies(db, ctx, lock=True))[document_type]
     if row.locked and body.years < row.preset_years:
-        raise ApiError(BELOW_PRESET, 422)
+        raise ApiError(
+            BELOW_PRESET, 422, {"document_type": document_type, "minimum": row.preset_years}
+        )
     previous = row.years
     row.years = body.years
     await audit.append(

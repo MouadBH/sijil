@@ -97,6 +97,7 @@ async def test_put_policy_below_preset_is_422(make_actor: MakeActor, db: AsyncSe
     r = await alice.client.put(f"{base}/receipt", json={"years": 9})
     assert r.status_code == 422
     assert _code(r) == "retention.policy_below_preset"
+    assert (r.json()["document_type"], r.json()["minimum"]) == ("receipt", 10)
     assert await _changes(db, workspace_id) == []
     listed = await alice.client.get(base)
     assert {p["document_type"]: p["years"] for p in listed.json()}["receipt"] == 10
