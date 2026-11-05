@@ -8,6 +8,7 @@ import csv
 import hashlib
 import io
 import os
+import uuid
 import zipfile
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -16,6 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
+from redis.asyncio import Redis
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import (
@@ -44,9 +46,11 @@ from sijil_core.export_report import (
     verify_zip,
 )
 from sijil_core.fields import FIELD_NAMES
+from sijil_core.pending import EXPORT_PREFIX
 from sijil_core.storage import ObjectRef
 from sijil_worker import tasks
-from sijil_worker.export import build_export, expire_exports
+from sijil_worker.export import build_export, expire_exports, sweep_exports
+from sijil_worker.pending import PendingExtractions
 from sijil_worker.settings import ExportSettings
 from tests.support.exports import OneIndex, add_exportable
 from tests.support.exports import invoice_values as _values
@@ -98,8 +102,16 @@ def exports() -> MemoryExportStore:
     return MemoryExportStore()
 
 
-async def _job(db: AsyncSession, ws: Workspace, user: User, period: str = "2026-10") -> ExportJob:
-    job = ExportJob(workspace_id=ws.id, period=period, requested_by=user.id)
+async def _job(
+    db: AsyncSession,
+    ws: Workspace,
+    user: User,
+    period: str = "2026-10",
+    *,
+    age: timedelta | None = None,
+) -> ExportJob:
+    created = NOW - (age or timedelta(minutes=1))
+    job = ExportJob(workspace_id=ws.id, period=period, requested_by=user.id, created_at=created)
     db.add(job)
     await db.flush()
     await audit.append(
@@ -482,3 +494,95 @@ async def test_index_csv_escapes_formulas_in_free_text_only(
     )
     assert all(r["state"] in ("sealed", "filed") and r["date"] == "2026-10-02" for r in rows)
     assert verify_zip(path, public_key(SEED)).ok  # the escaped file is the one signed
+
+
+class Sent:
+    def __init__(self) -> None:
+        self.jobs: list[uuid.UUID] = []
+
+    async def __call__(self, job_id: uuid.UUID) -> None:
+        self.jobs.append(job_id)
+
+
+async def _sweep(sessions: Any, redis: Redis, sent: Sent) -> tuple[int, int]:
+    return await sweep_exports(
+        sessions, sent, pending=PendingExtractions(redis, prefix=EXPORT_PREFIX),
+        region="ma-cas", now=NOW,
+    )  # fmt: skip
+
+
+async def _set_state(db: AsyncSession, job: ExportJob, state: str) -> None:
+    await db.execute(
+        text("UPDATE export_job SET state = :s WHERE id = :id"), {"s": state, "id": job.id}
+    )
+    await db.commit()
+
+
+async def test_sweep_resends_a_job_queued_for_more_than_10_minutes_once(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User, redis: Redis
+) -> None:
+    stuck = await _job(db, workspace, user, age=timedelta(minutes=11))
+    fresh = await _job(db, workspace, user, age=timedelta(minutes=5))
+    done = await _job(db, workspace, user, age=timedelta(hours=3))
+    await _set_state(db, done, "failed")
+    sent = Sent()
+    assert await _sweep(sessions, redis, sent) == (1, 0)
+    assert sent.jobs == [stuck.id]
+    assert await redis.ttl(f"export:pending:{stuck.id}") > 3500  # claimed before the send
+    assert await _sweep(sessions, redis, sent) == (0, 0)  # the key holds it for an hour
+    assert sent.jobs == [stuck.id]
+    assert (await _fresh(db, fresh)).state is ExportState.queued
+
+
+async def test_sweep_releases_the_claim_when_the_send_fails(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User, redis: Redis
+) -> None:
+    stuck = await _job(db, workspace, user, age=timedelta(minutes=11))
+
+    async def broken(_job_id: uuid.UUID) -> None:
+        raise ConnectionError("broker down")
+
+    assert await sweep_exports(
+        sessions, broken, pending=PendingExtractions(redis, prefix=EXPORT_PREFIX),
+        region="ma-cas", now=NOW,
+    ) == (0, 0)  # fmt: skip
+    assert await redis.exists(f"export:pending:{stuck.id}") == 0
+
+
+async def test_sweep_fails_a_job_building_for_more_than_an_hour_unless_a_build_runs(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User, redis: Redis
+) -> None:
+    dead = await _job(db, workspace, user, age=timedelta(hours=2))
+    running = await _job(db, workspace, user, age=timedelta(hours=2))
+    young = await _job(db, workspace, user, age=timedelta(minutes=30))
+    for job in (dead, running, young):
+        await _set_state(db, job, "building")
+    async with sessions() as build:  # a build of `running` holds its lock
+        await build.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended('export:' || :id, 0))"),
+            {"id": str(running.id)},
+        )
+        assert await _sweep(sessions, redis, Sent()) == (0, 1)
+        await build.rollback()
+    failed = await _fresh(db, dead)
+    assert (failed.state, failed.error_code) == (ExportState.failed, "export.error")
+    assert (await _fresh(db, running)).state is ExportState.building
+    assert (await _fresh(db, young)).state is ExportState.building
+    event = (await _events(db, workspace))[-1]
+    assert (event.action, event.target_id, event.data) == (
+        "export.failed", str(dead.id), {"period": "2026-10", "code": "export.error"},
+    )  # fmt: skip
+
+
+async def test_a_resent_job_never_builds_twice(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex, redis: Redis,
+) -> None:  # fmt: skip
+    """The sweep's re-send of a job whose first message arrives too: one build, one ZIP."""
+    job = await _job(db, workspace, user, age=timedelta(minutes=11))
+    sent = Sent()
+    await _sweep(sessions, redis, sent)
+    assert sent.jobs == [job.id]
+    assert await _build(job, sessions, idx, memory_store, exports)  # the first message
+    assert not await _build(job, sessions, idx, memory_store, exports)  # the re-send
+    assert len(await _events(db, workspace)) == 2  # requested, ready

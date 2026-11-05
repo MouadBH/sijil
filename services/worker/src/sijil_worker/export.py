@@ -27,6 +27,12 @@ region's Ed25519 signing seed, reaches no tenant network and has no Docker socke
 
 `expire_exports` (daily) deletes exports ready for more than 7 days, sets them `expired` and
 audits `export.expired` `{period}` for each.
+
+`sweep_exports` (every 300 s, main worker) re-sends `sijil.build_export` for jobs `queued` for
+more than 10 minutes (a lost message), claiming `export:pending:<id>` (1 h) before each send;
+and fails, with `export.error` audited `export.failed`, jobs `building` for more than an hour
+whose build lock is free (the build died). A job holding the lock is a build still running and
+is left alone; a re-send of a job being built takes no lock and does nothing.
 """
 
 import base64
@@ -36,7 +42,7 @@ import io
 import logging
 import tempfile
 import zipfile
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -75,12 +81,17 @@ from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.retention import retention_basis
 from sijil_core.settings import CoreSettings
 from sijil_core.storage import ObjectRef
+from sijil_worker.pending import PendingExtractions
 
 log = logging.getLogger(__name__)
 
 HASH_MISMATCH: Final = "export.hash_mismatch"
 EXPORT_FAILED: Final = "export.error"
 EXPIRY: Final = timedelta(days=7)
+STALE_QUEUED: Final = timedelta(minutes=10)
+STALE_BUILDING: Final = timedelta(hours=1)
+SWEEP_BATCH: Final = 50
+_BUILD_LOCK: Final = "SELECT pg_try_advisory_xact_lock(hashtextextended('export:' || :id, 0))"
 INCLUDED: Final = (
     DocumentState.received,
     DocumentState.needs_review,
@@ -311,10 +322,7 @@ async def build_export(
     build, and a delivery that cannot take it leaves the job alone (it would otherwise
     overwrite the ZIP the running build is about to record)."""
     async with sessions() as guard:
-        held = await guard.scalar(
-            text("SELECT pg_try_advisory_xact_lock(hashtextextended('export:' || :id, 0))"),
-            {"id": str(job_id)},
-        )
+        held = await guard.scalar(text(_BUILD_LOCK), {"id": str(job_id)})
         if not held:
             log.info("export %s skipped: another build of it is running", job_id)
             return False
@@ -510,3 +518,74 @@ async def expire_exports(
             await session.commit()
         expired += 1
     return expired
+
+
+async def _stale(
+    sessions: async_sessionmaker[AsyncSession],
+    state: ExportState,
+    before: datetime,
+    region: str,
+    limit: int,
+) -> list[UUID]:
+    # `created_at` stands for when a job went stale: a `building` job also needs its build lock
+    # free to be failed, so a long build that is still running is never cut short.
+    async with sessions() as session:
+        return list(
+            await session.scalars(
+                select(ExportJob.id)
+                .join(Workspace, Workspace.id == ExportJob.workspace_id)
+                .join(Organisation, Organisation.id == Workspace.org_id)
+                .where(
+                    Organisation.region == region,
+                    ExportJob.state == state,
+                    ExportJob.created_at < before,
+                )
+                .order_by(ExportJob.created_at, ExportJob.id)
+                .limit(limit)
+            )
+        )
+
+
+async def _fail_if_abandoned(
+    sessions: async_sessionmaker[AsyncSession], job_id: UUID, now: datetime
+) -> bool:
+    async with sessions() as session:
+        if not await session.scalar(text(_BUILD_LOCK), {"id": str(job_id)}):
+            return False  # a build of it is running
+        job = await session.get(ExportJob, job_id, with_for_update=True)
+        if job is None or job.state is not ExportState.building:
+            return False
+        job.state = ExportState.failed
+        job.error_code = EXPORT_FAILED
+        await _audit(session, job, "export.failed", now, code=EXPORT_FAILED)
+        await session.commit()
+    log.error("export %s failed: its build stopped without finishing", job_id)
+    return True
+
+
+async def sweep_exports(
+    sessions: async_sessionmaker[AsyncSession],
+    send: Callable[[UUID], Awaitable[None]],
+    *,
+    pending: PendingExtractions,
+    region: str,
+    now: datetime,
+    limit: int = SWEEP_BATCH,
+) -> tuple[int, int]:
+    """See the module docstring. Returns (re-sent, failed). A failed send releases its claim
+    and is logged; the sweep goes on."""
+    resent = 0
+    for job_id in await _stale(sessions, ExportState.queued, now - STALE_QUEUED, region, limit):
+        if not await pending.claim(job_id):
+            continue
+        try:
+            await send(job_id)
+        except Exception as exc:
+            await pending.clear(job_id)
+            log.warning("export %s re-send failed: %s", job_id, type(exc).__name__)
+            continue
+        resent += 1
+    failed = 0
+    for job_id in await _stale(sessions, ExportState.building, now - STALE_BUILDING, region, limit):
+        failed += await _fail_if_abandoned(sessions, job_id, now)
+    return resent, failed

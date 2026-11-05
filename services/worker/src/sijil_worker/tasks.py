@@ -24,7 +24,7 @@ from sijil_core.paperless import (
     PaperlessError,
     PaperlessUnavailable,
 )
-from sijil_core.pending import PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
+from sijil_core.pending import EXPORT_PREFIX, PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
 from sijil_core.region import RegionMismatch
 from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
@@ -39,6 +39,7 @@ from sijil_worker.export import (
     build_export,
     expire_exports,
     record_export_failed,
+    sweep_exports,
 )
 from sijil_worker.extract import (
     IngestInProgress,
@@ -1150,3 +1151,31 @@ def expire_exports_task() -> int:
     """Daily, on the export worker (the only one that can delete an export): exports ready for
     more than 7 days are deleted and marked `expired`."""
     return asyncio.run(_expire_exports())
+
+
+async def _sweep_exports() -> tuple[int, int]:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(job_id: UUID) -> None:
+        current_app.send_task("sijil.build_export", kwargs={"job_id": str(job_id)}, queue="export")
+
+    try:
+        return await sweep_exports(
+            make_sessionmaker(engine),
+            send,
+            pending=PendingExtractions(redis, prefix=EXPORT_PREFIX),
+            region=settings.region,
+            now=utcnow(),
+        )
+    finally:
+        await redis.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.sweep_exports")
+def sweep_exports_task() -> tuple[int, int]:
+    """Every 300 s: re-send lost exports and fail abandoned builds (sijil_worker.export). Runs
+    on the main worker: it reads and updates jobs and sends tasks, and holds no export key."""
+    return asyncio.run(_sweep_exports())

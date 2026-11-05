@@ -13,6 +13,7 @@ REQUEUE_EXTRACT_INTERVAL_S = 600
 REQUEUE_UNLOCKED_INTERVAL_S = 300
 REQUEUE_UNREMOVED_INTERVAL_S = 300
 REQUEUE_UNPURGED_INTERVAL_S = 300
+SWEEP_EXPORTS_INTERVAL_S = 300
 QUEUES = ("default", "provisioning", "ingest", "extraction", "seal", "removal", "export")
 
 
@@ -53,6 +54,10 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
             "requeue-unpurged": {
                 "task": "sijil.requeue_unpurged",
                 "schedule": REQUEUE_UNPURGED_INTERVAL_S,
+            },
+            "sweep-exports": {
+                "task": "sijil.sweep_exports",
+                "schedule": SWEEP_EXPORTS_INTERVAL_S,
             },
             # Marks only: nothing is deleted without an Owner's approval (sijil_worker.eligibility).
             "mark-eligible-nightly": {

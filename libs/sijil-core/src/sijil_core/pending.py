@@ -14,6 +14,8 @@ LOCK_PREFIX: Final = "lock"
 EXTRACT_PREFIX: Final = "extract"
 REMOVE_PREFIX: Final = "remove"
 PURGE_PREFIX: Final = "purge"
+# Keyed by export job id, not a document: `export:pending:<job_id>`.
+EXPORT_PREFIX: Final = "export"
 
 
 def pending_key(ledger_id: UUID, prefix: str = EXTRACT_PREFIX) -> str:

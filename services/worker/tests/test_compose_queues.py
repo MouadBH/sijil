@@ -256,3 +256,5 @@ def test_the_daily_expiry_runs_on_the_export_worker() -> None:
     entry = make_celery(settings).conf.beat_schedule["expire-exports-daily"]
     assert entry["task"] == "sijil.expire_exports"
     assert entry["options"] == {"queue": "export"}
+    sweep = make_celery(settings).conf.beat_schedule["sweep-exports"]
+    assert (sweep["task"], sweep["schedule"]) == ("sijil.sweep_exports", 300)
