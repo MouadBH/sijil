@@ -105,7 +105,8 @@ async def test_export_key_owns_the_exports_bucket_and_the_app_key_only_reads_it(
     assert await _read(app_exports.open_export(key)) == path.read_bytes()
     _denied(lambda: app_exports.client.put_object(Bucket=app_exports.bucket, Key=key, Body=b"x"))
     _denied(lambda: app_exports.client.delete_object(Bucket=app_exports.bucket, Key=key))
-    status = exports.client.get_bucket_versioning(Bucket=exports.bucket).get("Status")
+    root = S3ExportStore(_settings(None))  # the export key cannot read bucket settings
+    status = root.client.get_bucket_versioning(Bucket=root.bucket).get("Status")
     assert status not in ("Enabled", "Suspended")  # an expired export really goes
     await exports.delete_export(key)
     with pytest.raises(ClientError):

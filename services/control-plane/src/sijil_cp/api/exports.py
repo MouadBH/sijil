@@ -102,16 +102,16 @@ def _ip(request: Request) -> str | None:
 
 
 def _checked_period(raw: str | None, workspace: Workspace, region: str, now: datetime) -> str:
+    period = raw or ""
     try:
-        start, end = period_bounds(raw or "")
+        start, end = period_bounds(period)
     except ValueError:
         raise ApiError(PERIOD_INVALID, 422) from None
     if start > region_local_date(now, region):
         raise ApiError(PERIOD_INVALID, 422)
     if end < region_local_date(workspace.created_at, region):
         raise ApiError(PERIOD_INVALID, 422)
-    assert raw is not None  # noqa: S101 - period_bounds("") raised above
-    return raw
+    return period
 
 
 async def _job(db: AsyncSession, workspace: Workspace, export_id: UUID) -> ExportJob:
@@ -141,7 +141,7 @@ async def request_export(
     settings: CpSettings = request.app.state.settings
     workspace = ctx.workspace
     period = _checked_period(body.period, workspace, settings.region, now)
-    job = ExportJob(workspace_id=workspace.id, period=period, requested_by=user.id)
+    job = ExportJob(workspace_id=workspace.id, period=period, requested_by=user.id, created_at=now)
     db.add(job)
     await db.flush()
     await audit.append(
