@@ -34,7 +34,7 @@ Sijil is a hosted compliance archive for Moroccan SMEs, built beside an **unmodi
 | `apps/site` | Next.js 15 marketing site, static export |
 | `packages/i18n` | Message catalogues + `locales`, `dirFor()` |
 | `services/control-plane` | `sijil_cp`: FastAPI, SQLAlchemy 2 (async), Alembic |
-| `services/worker` | `sijil_worker`: Celery (queues `default`, `provisioning`, `ingest`, `extraction`, `seal`). Compose runs it as `worker` (everything but `extraction` and `seal`; Docker socket), `worker-extraction` (`extraction`, concurrency 1, the model), `worker-seal` (`seal`, the only holder of the sealing key, `core` network only), `smtp` and `beat` |
+| `services/worker` | `sijil_worker`: Celery (queues `default`, `provisioning`, `ingest`, `extraction`, `seal`, `removal`, `export`). Compose runs it as `worker` (`default`, `provisioning`, `ingest`; Docker socket; purges removed documents in Paperless and the index), `worker-extraction` (`extraction`, concurrency 1, the model), `worker-seal` (`seal`, the only holder of the sealing key), `worker-removal` (`removal`, concurrency 1, the only holder of the removal key: the only service that deletes an original), `worker-export` (`export`, the only holder of the export key and the region's signing seed), `smtp` and `beat`. The seal, removal and export workers are on the `core` network only |
 | `libs/sijil-core` | `sijil_core`: anything both Python services use (settings, region, crypto, Paperless client) |
 | `infra/compose` | Local stack; tenants live on the internal `tenants` network with no published ports |
 | `fixtures/` | **Sample data only**, fictitious companies and ICE numbers |
@@ -51,12 +51,15 @@ make models     # pull the extraction model (qwen3:4b) into the ollama volume, o
 make seed       # 12 SAMPLE invoices (6 via the API, 6 by email) into the SAMPLE workspace; idempotent,
                 # prints the workspace id, then waits until all are routed and prints filed/review counts
 make eval WS=…  # per-field extraction accuracy (fr, ar, all) on the SAMPLE set in workspace WS; read-only
-make itest      # integration tests in the compose `tests` runner, except `slow` (includes the M1/M2 acceptance)
+make itest      # integration tests in the compose `tests` runner, except `slow` (includes the M1/M2/M4 acceptance
+                # and the lock suite's Paperless and object-store paths)
 make acceptance # the `slow` integration tests: the M3 acceptance (18 documents through the model, up to 45 min)
 make down ARGS=-v
 ```
 
 - Single Python test: `uv run pytest path/to/test.py::test_name -v`.
+- The retention-lock suite: `uv run pytest tests/retention -v` (needs `SIJIL_TEST_DATABASE_URL`); its `test_lock_all_paths.py` is the role × path matrix.
+- An export ZIP: `sijil-cp export verify <zip> [--against-ledger]` prints `ok` or one problem code per line.
 - Single JS test: `pnpm --filter web exec vitest run path`.
 - Mark a model-bound integration test `@pytest.mark.slow` so `make itest` stays usable day to day.
 - An integration test that creates a workspace appends its id to the `created_workspaces` fixture (or uses the t1 `harness`), which marks it `closing` at teardown: only `active` workspaces extract.
