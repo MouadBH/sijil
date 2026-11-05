@@ -10,6 +10,7 @@ from sijil_core.storage import S3ObjectStore
 from sijil_cp import __version__
 from sijil_cp.api import (
     auth,
+    corrections,
     documents,
     health,
     jobs,
@@ -78,6 +79,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(jobs.router)
     v1.include_router(documents.router)
     v1.include_router(review.router)
+    v1.include_router(corrections.router)
     v1.include_router(retention.router)
     v1.include_router(removal.router)
     app.include_router(v1)

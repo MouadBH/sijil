@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import URL, select, text
 from sqlalchemy.exc import DBAPIError
@@ -440,6 +440,87 @@ async def _seal(
             raise RetentionLocked from exc
         raise
     return _row(result.mappings().one())
+
+
+@dataclass(frozen=True, kw_only=True)
+class Correction:
+    """One correction note, column for column. `value` None means "the field is empty"."""
+
+    id: UUID
+    ledger_id: UUID
+    field: str
+    value: str | None
+    reason: str
+    created_by: UUID
+    created_at: datetime
+
+
+async def add_correction(
+    conn: AsyncConnection,
+    ledger_id: UUID,
+    field_name: str,
+    value: str | None,
+    reason: str,
+    *,
+    created_by: UUID,
+    now: datetime,
+) -> Correction:
+    """Appends a note (the table is append-only); the sealed `document_fields` row is not
+    touched."""
+    note = Correction(
+        id=uuid4(),
+        ledger_id=ledger_id,
+        field=field_name,
+        value=value,
+        reason=reason,
+        created_by=created_by,
+        created_at=now,
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO correction_note (id, ledger_id, field, value, reason, created_by, "
+            "created_at) VALUES (:id, :ledger_id, :field, :value, :reason, :created_by, "
+            ":created_at)"
+        ),
+        {
+            "id": note.id,
+            "ledger_id": ledger_id,
+            "field": field_name,
+            "value": value,
+            "reason": reason,
+            "created_by": created_by,
+            "created_at": now,
+        },
+    )
+    return note
+
+
+async def read_corrections(conn: AsyncConnection, ledger_id: UUID) -> list[Correction]:
+    """The document's notes, newest first."""
+    result = await conn.execute(
+        text(
+            "SELECT id, ledger_id, field, value, reason, created_by, created_at "
+            "FROM correction_note WHERE ledger_id = :id ORDER BY created_at DESC, id DESC"
+        ),
+        {"id": ledger_id},
+    )
+    return [Correction(**dict(m)) for m in result.mappings()]
+
+
+def effective_fields(
+    row: FieldsRow, corrections: list[Correction]
+) -> dict[str, tuple[str | None, bool]]:
+    """Each field's value and whether a note corrects it: the latest note per field wins.
+    `corrections` is in `read_corrections` order (newest first)."""
+    effective: dict[str, tuple[str | None, bool]] = {
+        name: (value, False) for name, value in row.values.items()
+    }
+    seen: set[str] = set()
+    for note in corrections:
+        if note.field not in seen:
+            seen.add(note.field)
+            effective[note.field] = (note.value, True)
+    return effective
 
 
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:

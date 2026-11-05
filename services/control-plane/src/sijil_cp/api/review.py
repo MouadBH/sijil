@@ -116,6 +116,21 @@ class FieldsOut(ReviewItem):
     fields_sha256: str | None
 
 
+class CorrectionOut(BaseModel):
+    field: str
+    value: str | None
+    reason: str
+    created_by: UUID
+    created_at: datetime
+
+
+class FieldsDetail(FieldsOut):
+    """`GET …/fields`: the sealed values as they were, and the correction notes beside them
+    (newest first)."""
+
+    corrections: list[CorrectionOut]
+
+
 class ReviewPage(BaseModel):
     items: list[ReviewItem]
     next_cursor: str | None
@@ -217,12 +232,6 @@ def _decode_batch_cursor(cursor: str) -> tuple[datetime, UUID]:
     return _decode_cursor(cursor, ("body", "cursor"))
 
 
-async def _read(engines: IndexEngines, workspace: Workspace, ledger_id: UUID) -> FieldsRow | None:
-    # The region was asserted by `require_workspace` before anything of the workspace is read.
-    async with (await engines.engine(workspace)).connect() as conn:
-        return await index_db.read_fields(conn, ledger_id)
-
-
 async def _locked_ledger(db: AsyncSession, workspace: Workspace, doc_id: UUID) -> DocumentLedger:
     """The ledger row, locked FOR UPDATE until the caller's transaction ends."""
     ledger = await db.scalar(
@@ -289,12 +298,12 @@ async def review_queue(
 
 @router.get(
     "/workspaces/{workspace_id}/documents/{doc_id}/fields",
-    response_model=FieldsOut | TombstoneOut,
+    response_model=FieldsDetail | TombstoneOut,
     response_model_exclude_unset=True,
 )
 async def get_fields(
     doc_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
-) -> FieldsOut | TombstoneOut:
+) -> FieldsDetail | TombstoneOut:
     """The fields, or for a removed or deleted document its tombstone, as GET …/documents/{id}
     answers: never the values, which stay in the index only until the purge."""
     workspace = ctx.workspace
@@ -306,7 +315,12 @@ async def get_fields(
     if ledger is None:
         raise ApiError("document.not_found", 404)
     dead = ledger.state in TOMBSTONES
-    row = None if dead else await _read(_engines(request), workspace, ledger.id)
+    row: FieldsRow | None = None
+    notes: list[index_db.Correction] = []
+    if not dead:
+        async with (await _engines(request).engine(workspace)).connect() as conn:
+            row = await index_db.read_fields(conn, ledger.id)
+            notes = await index_db.read_corrections(conn, ledger.id)
     await audit.append(
         db,
         workspace_id=workspace.id,
@@ -319,7 +333,12 @@ async def get_fields(
         now=now,
     )
     await db.commit()
-    return tombstone(ledger, ctx.role) if dead else _full(ledger, row)
+    if dead:
+        return tombstone(ledger, ctx.role)
+    return FieldsDetail(
+        **_full(ledger, row).model_dump(),
+        corrections=[CorrectionOut.model_validate(n, from_attributes=True) for n in notes],
+    )
 
 
 def _parsed(raw: Mapping[str, str | None]) -> dict[str, str | None]:
