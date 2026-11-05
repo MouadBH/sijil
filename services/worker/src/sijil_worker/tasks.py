@@ -33,6 +33,7 @@ from sijil_worker.drift import (
     enqueue_drift_checks,
     record_check_failed,
 )
+from sijil_worker.eligibility import mark_eligible
 from sijil_worker.extract import (
     IngestInProgress,
     extract_document,
@@ -563,6 +564,22 @@ async def _drift_all() -> int:
 def drift_check_all_task() -> int:
     """Nightly: fan out one drift check per active workspace of this region."""
     return asyncio.run(_drift_all())
+
+
+async def _mark_eligible() -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await mark_eligible(make_sessionmaker(engine), settings=settings, now=utcnow())
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.mark_eligible")
+def mark_eligible_task() -> int:
+    """Nightly: mark this region's documents past retention eligible for deletion. It deletes
+    nothing (sijil_worker.eligibility)."""
+    return asyncio.run(_mark_eligible())
 
 
 # Mirror of a sealed document's fields into its Paperless: 30 s, 1 min ... capped at 15 min,

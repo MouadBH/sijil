@@ -54,6 +54,11 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "task": "sijil.requeue_unpurged",
                 "schedule": REQUEUE_UNPURGED_INTERVAL_S,
             },
+            # Marks only: nothing is deleted without an Owner's approval (sijil_worker.eligibility).
+            "mark-eligible-nightly": {
+                "task": "sijil.mark_eligible",
+                "schedule": crontab(hour=2, minute=0),
+            },
             "drift-check-nightly": {
                 "task": "sijil.drift_check_all",
                 "schedule": crontab(hour=2, minute=30),
