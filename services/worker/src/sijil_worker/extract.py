@@ -63,6 +63,7 @@ from sijil_core.confidence import (
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     AuditEvent,
     CredentialKind,
@@ -578,6 +579,15 @@ async def _route(
         if found is None:
             return None
         ledger, region = found
+        if ledger.state in TERMINAL_STATES:
+            # Removed while the model ran: its purge may already have run, before this row was
+            # written. The removal committed before that purge, and this check runs after the
+            # write under the ledger lock, so the row written here is purged now. (Its index
+            # row was never sealed: the ledger was still `received` when extraction began.)
+            async with (await index.engine(workspace)).begin() as conn:
+                await index_db.purge_document(conn, row.ledger_id)
+            log.info("extraction of document %s stopped: removed", row.ledger_id)
+            return None
         if ledger.state is not DocumentState.received:
             return None
         confidence, flags = await _flags_and_scores(index, workspace, row)
