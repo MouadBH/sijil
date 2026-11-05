@@ -295,7 +295,8 @@ class DocumentLedger(Base):
     document_ledger_immutable trigger (retention layer 3); once sealed, `fields_sha256`, `state`
     and `retention_until` are frozen too (0008), and `object_locked_at` is set once (0009).
     The terminal states (0011) keep the row as a tombstone: `removed` (before seal only) and
-    `deleted` are frozen; a sealed row moves only to `deleting`, once its retention is over.
+    `deleted` are frozen; a sealed row moves only to `deleting`, once its retention is over;
+    no row is inserted in a terminal state (document_ledger_insert_guard).
     """
 
     __tablename__ = "document_ledger"
@@ -314,7 +315,11 @@ class DocumentLedger(Base):
         CheckConstraint(
             "(state = 'removed') = (removed_at IS NOT NULL) "
             "AND (state IN ('deleting', 'deleted')) = (deletion_approved_at IS NOT NULL) "
-            "AND (state = 'deleted') = (deleted_at IS NOT NULL)",
+            "AND (state = 'deleted') = (deleted_at IS NOT NULL) "
+            "AND (removed_at IS NULL) = (removed_by IS NULL) "
+            "AND (removed_at IS NULL) = (removal_reason IS NULL) "
+            "AND (deletion_approved_at IS NULL) = (deletion_approved_by IS NULL) "
+            "AND (state <> 'deleted' OR original_removed_at IS NOT NULL)",
             name="terminal_consistent",
         ),
         CheckConstraint(

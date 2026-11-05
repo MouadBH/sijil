@@ -17,9 +17,13 @@ deleted: it stays as a tombstone (`sha256`, `object_key`, `object_version_id` ne
 `ck_document_ledger_seal_consistent` is redefined: a seal (`sealed_at`) may sit on a `sealed`,
 `deleting` or `deleted` row, and a `sealed` row still needs one.
 
-`sijil_region_today()` reads the zone from the GUC `sijil.region_tz` and defaults to the zone
-of SIJIL_REGION ('Africa/Casablanca' for ma-cas), written into the function here: the owner
-role may not `ALTER DATABASE ... SET` a custom parameter (PostgreSQL 15+ asks a superuser).
+`sijil_region_today()` is today in the zone of SIJIL_REGION ('Africa/Casablanca' for ma-cas),
+compiled into the function: no session setting moves it (a session-settable zone would let
+any role approve a deletion up to a week early).
+
+A BEFORE INSERT guard refuses a row born `removed`, `deleting` or `deleted`, and the terminal
+CHECK keeps each state's columns together: the removal trio and the approval pair are all set
+or all NULL, and `deleted` carries `original_removed_at`.
 
 Revision ID: 0011
 Revises: 0010
@@ -135,7 +139,11 @@ _TERMINAL_CHECK = "ck_document_ledger_terminal_consistent"
 _TERMINAL = (
     "(state = 'removed') = (removed_at IS NOT NULL) "
     "AND (state IN ('deleting', 'deleted')) = (deletion_approved_at IS NOT NULL) "
-    "AND (state = 'deleted') = (deleted_at IS NOT NULL)"
+    "AND (state = 'deleted') = (deleted_at IS NOT NULL) "
+    "AND (removed_at IS NULL) = (removed_by IS NULL) "
+    "AND (removed_at IS NULL) = (removal_reason IS NULL) "
+    "AND (deletion_approved_at IS NULL) = (deletion_approved_by IS NULL) "
+    "AND (state <> 'deleted' OR original_removed_at IS NOT NULL)"
 )
 _REASON_CHECK = "ck_document_ledger_removal_reason_length"
 
@@ -186,13 +194,30 @@ def _function_0011() -> str:
     """
 
 
-def _region_today(default_tz: str) -> str:
+def _region_today(tz: str) -> str:
+    # The zone is a literal: nothing a session sets (a GUC, its TimeZone) moves the date.
     return f"""
         CREATE FUNCTION sijil_region_today() RETURNS date LANGUAGE sql STABLE AS $$
-          SELECT (now() AT TIME ZONE coalesce(
-            nullif(current_setting('sijil.region_tz', true), ''), '{default_tz}'))::date
+          SELECT (now() AT TIME ZONE '{tz}')::date
         $$
     """
+
+
+# The UPDATE trigger never sees an INSERT: a row is born live, never in a terminal state.
+_INSERT_GUARD = """
+    CREATE FUNCTION document_ledger_insert_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.state IN ('removed', 'deleting', 'deleted') THEN
+        RAISE EXCEPTION 'ledger.immutable';
+      END IF;
+      RETURN NEW;
+    END $$
+"""
+_INSERT_TRIGGER = """
+    CREATE TRIGGER document_ledger_insert_guard BEFORE INSERT ON document_ledger
+    FOR EACH ROW EXECUTE FUNCTION document_ledger_insert_guard()
+"""
 
 
 def upgrade() -> None:
@@ -210,6 +235,8 @@ def upgrade() -> None:
     # An unknown region fails the migration rather than guess a calendar.
     op.execute(_region_today(_REGION_TZ[os.environ.get("SIJIL_REGION", "ma-cas")]))
     op.execute(_function_0011())
+    op.execute(_INSERT_GUARD)
+    op.execute(_INSERT_TRIGGER)
     op.drop_constraint(op.f(_SEAL_CHECK), "document_ledger", type_="check")
     op.create_check_constraint(op.f(_SEAL_CHECK), "document_ledger", _SEAL_0011)
     op.create_check_constraint(op.f(_TERMINAL_CHECK), "document_ledger", _TERMINAL)
@@ -225,6 +252,8 @@ def downgrade() -> None:
     op.create_check_constraint(op.f(_SEAL_CHECK), "document_ledger", _SEAL_0008)
     # The function first: 0009's never mentions the columns, which then go.
     op.execute(_function_0009())
+    op.execute("DROP TRIGGER document_ledger_insert_guard ON document_ledger")
+    op.execute("DROP FUNCTION document_ledger_insert_guard()")
     op.execute("DROP FUNCTION sijil_region_today()")
     for name in _ACTORS:
         op.drop_column("document_ledger", name)

@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 
 from sijil_core.db.models import (
     DocumentLedger,
@@ -356,3 +356,139 @@ async def test_ledger_row_never_deleted(
     with pytest.raises(DBAPIError, match="ledger.immutable"):
         await owner_conn.execute(text("DELETE FROM document_ledger WHERE id = :id"), {"id": row_id})
     assert await _state(db, row_id) == state
+
+
+# Fix round 1: the region date ignores the session; no INSERT lands in a terminal state. ------
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "SET sijil.region_tz = 'UTC-167'",
+        "SET TIME ZONE 'UTC-167'",
+        "SET sijil.region_tz = 'Pacific/Kiritimati'",
+    ],
+)
+async def test_session_cannot_move_the_region_date(
+    db: AsyncSession, ws: uuid.UUID, uid: uuid.UUID, setting: str
+) -> None:
+    """A session that pretends to be a week ahead still cannot approve a deletion whose
+    retention ends today in Casablanca: the zone is compiled into `sijil_region_today()`."""
+    row_id = await _add(db, ws, retention_until=_today())
+    await db.execute(text(setting))
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await db.execute(
+            text(f"UPDATE document_ledger SET {APPROVE} WHERE id = :id"),  # noqa: S608
+            {"id": row_id, "u": uid},
+        )
+    await db.rollback()
+    await db.execute(text(setting))
+    assert await db.scalar(text("SELECT sijil_region_today()")) == _today()
+    await db.rollback()
+    assert await _state(db, row_id) == "filed"
+
+
+INSERT = (
+    "INSERT INTO document_ledger (id, workspace_id, sha256, md5, size_bytes, content_kind, "
+    "source, object_key, object_version_id, state, ingest_state, retention_until, ingested_at, "
+    "removed_at, removed_by, removal_reason, deletion_approved_at, deletion_approved_by, "
+    "deleted_at, original_removed_at) VALUES (:id, :ws, :sha, repeat('d', 32), 10, 'pdf', "
+    "'upload', :key, 'v1', :state, 'consumed', '2020-12-31', now(), "
+    ":removed_at, :removed_by, :reason, :approved_at, :approved_by, :deleted_at, :gone_at)"
+)
+
+
+def _insert_params(ws: uuid.UUID, state: str, **over: Any) -> dict[str, Any]:
+    sha = uuid.uuid4().hex * 2
+    params: dict[str, Any] = {
+        "id": uuid.uuid4(),
+        "ws": ws,
+        "sha": sha,
+        "key": f"t/{sha}",
+        "state": state,
+        "removed_at": None,
+        "removed_by": None,
+        "reason": None,
+        "approved_at": None,
+        "approved_by": None,
+        "deleted_at": None,
+        "gone_at": None,
+    }
+    return params | over
+
+
+def _terminal_insert(ws: uuid.UUID, uid: uuid.UUID, state: DocumentState) -> dict[str, Any]:
+    """A row in `state` with every column that state carries: only the INSERT guard refuses."""
+    now = datetime.now(UTC)
+    if state == DocumentState.removed:
+        return _insert_params(ws, state, removed_at=now, removed_by=uid, reason=REASON)
+    over: dict[str, Any] = {"approved_at": now, "approved_by": uid}
+    if state == DocumentState.deleted:
+        over |= {"deleted_at": now, "gone_at": now}
+    return _insert_params(ws, state, **over)
+
+
+@pytest.mark.parametrize(
+    "state", [DocumentState.removed, DocumentState.deleting, DocumentState.deleted]
+)
+async def test_insert_never_lands_in_a_terminal_state(
+    db: AsyncSession, owner_conn: AsyncConnection, ws: uuid.UUID, uid: uuid.UUID,
+    state: DocumentState,
+) -> None:  # fmt: skip
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await db.execute(text(INSERT), _terminal_insert(ws, uid, state))
+    await db.rollback()
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await owner_conn.execute(text(INSERT), _terminal_insert(ws, uid, state))
+    # Control: the same INSERT in a live state is accepted.
+    await db.execute(text(INSERT), _insert_params(ws, "filed"))
+    await db.commit()
+
+
+@pytest.mark.parametrize("column", ["removed_by", "reason", "approved_by", "approved_at"])
+async def test_terminal_columns_never_stray_onto_a_live_row(
+    db: AsyncSession, ws: uuid.UUID, uid: uuid.UUID, column: str
+) -> None:
+    """CHECK: the removal trio and the approval pair are all set or all NULL, so none of them
+    sits alone on a live row (an INSERT, which the UPDATE trigger never sees)."""
+    value = {"removed_by": uid, "reason": REASON, "approved_by": uid}.get(column, datetime.now(UTC))
+    with pytest.raises(DBAPIError, match="ck_document_ledger_terminal_consistent"):
+        await db.execute(text(INSERT), _insert_params(ws, "filed", **{column: value}))
+    await db.rollback()
+
+
+_NOW = datetime(2026, 11, 5, 10, 0, tzinfo=UTC)
+CHECK_ONLY = {
+    "deleted without original_removed_at": {
+        "state": "deleted", "approved_at": _NOW, "deleted_at": _NOW,
+    },
+    "removed without removed_by": {"state": "removed", "removed_at": _NOW, "reason": REASON},
+    "removed without removal_reason": {"state": "removed", "removed_at": _NOW},
+    "deleting without deletion_approved_by": {"state": "deleting", "approved_at": _NOW},
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("case", sorted(CHECK_ONLY))
+async def test_check_alone_requires_the_terminal_columns(
+    migrated_db: Any, ws: uuid.UUID, uid: uuid.UUID, case: str
+) -> None:
+    """With the INSERT guard disabled (the DDL is rolled back), the CHECK by itself still
+    refuses a terminal row missing one of its columns."""
+    params = dict(CHECK_ONLY[case])
+    if case.startswith("deleted"):
+        params["approved_by"] = uid
+    if case == "removed without removal_reason":
+        params["removed_by"] = uid
+    state = params.pop("state")
+    engine = create_async_engine(migrated_db.owner_url)
+    try:
+        async with engine.connect() as conn:
+            trans = await conn.begin()
+            await conn.execute(
+                text("ALTER TABLE document_ledger DISABLE TRIGGER document_ledger_insert_guard")
+            )
+            with pytest.raises(DBAPIError, match="ck_document_ledger_terminal_consistent"):
+                await conn.execute(text(INSERT), _insert_params(ws, state, **params))
+            await trans.rollback()
+    finally:
+        await engine.dispose()

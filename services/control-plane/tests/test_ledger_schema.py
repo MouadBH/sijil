@@ -462,12 +462,22 @@ async def _has_region_today(conn: AsyncConnection) -> bool:
     return bool(found)
 
 
+async def _has_insert_guard(conn: AsyncConnection) -> bool:
+    trigger = await conn.scalar(
+        text("SELECT count(*) FROM pg_trigger WHERE tgname = 'document_ledger_insert_guard'")
+    )
+    function = await conn.scalar(
+        text("SELECT count(*) FROM pg_proc WHERE proname = 'document_ledger_insert_guard'")
+    )
+    return bool(trigger) and bool(function)
+
+
 async def test_0011_downgrade_restores_0009_guard(
     db: AsyncSession, owner_conn: AsyncConnection, workspace: Workspace, user: User,
     migrated_db: Any,
 ) -> None:  # fmt: skip
-    """Down to 0010 (whose function is 0009's): the terminal columns, CHECKs and
-    `sijil_region_today()` are gone, the sealed row is frozen again in every state (no way to
+    """Down to 0010 (whose function is 0009's): the terminal columns, CHECKs, the INSERT guard
+    and `sijil_region_today()` are gone, the sealed row is frozen again in every state (no way to
     `deleting`), and the seal CHECK is 0008's (a seal only on a sealed row)."""
     db.add(ledger(workspace.id))
     db.add(ledger(workspace.id, sha=f"{9:064x}"))
@@ -485,6 +495,7 @@ async def test_0011_downgrade_restores_0009_guard(
             "ck_document_ledger_object_locked_after_seal",
         } <= names
         assert not await _has_region_today(owner_conn)
+        assert not await _has_insert_guard(owner_conn)
         for assignment in (*SEALED_FROZEN, "state = 'deleting'", "state = 'deleted'"):
             with pytest.raises(DBAPIError, match="ledger.immutable"):
                 await owner_conn.execute(
@@ -504,3 +515,4 @@ async def test_0011_downgrade_restores_0009_guard(
         _alembic(migrated_db.owner_url, "upgrade", "head")
     assert TERMINAL_COLUMNS <= await _columns(owner_conn)
     assert await _has_region_today(owner_conn)
+    assert await _has_insert_guard(owner_conn)
