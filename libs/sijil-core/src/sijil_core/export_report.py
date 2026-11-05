@@ -23,7 +23,9 @@ import calendar
 import hashlib
 import json
 import re
+import struct
 import zipfile
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -151,12 +153,40 @@ def _signature_ok(report: bytes, sig_file: bytes, public: bytes) -> bool:
     return True
 
 
-def _entry_sha256(zf: zipfile.ZipFile, name: str) -> str:
+# What reading one damaged entry raises: a bad CRC or local header (BadZipFile), corrupt
+# deflate data (zlib.error), a truncated stream (EOFError), a version or method byte turned
+# into one zipfile does not know (NotImplementedError), an impossible size or offset.
+_ENTRY_ERRORS: Final = (
+    zipfile.BadZipFile,
+    zlib.error,
+    EOFError,
+    NotImplementedError,
+    ValueError,
+    OverflowError,
+    OSError,
+)
+# What opening an archive whose own structure (end record, central directory) is damaged
+# raises, beyond BadZipFile.
+_ARCHIVE_ERRORS: Final = (*_ENTRY_ERRORS, UnicodeDecodeError, struct.error, KeyError)
+
+
+def _entry_sha256(zf: zipfile.ZipFile, name: str) -> str | None:
+    """The entry's SHA-256, or None when it cannot be read back intact."""
     digest = hashlib.sha256()
-    with zf.open(name) as entry:
-        while block := entry.read(_CHUNK):
-            digest.update(block)
+    try:
+        with zf.open(name) as entry:
+            while block := entry.read(_CHUNK):
+                digest.update(block)
+    except _ENTRY_ERRORS:
+        return None
     return digest.hexdigest()
+
+
+def _read(zf: zipfile.ZipFile, name: str) -> bytes | None:
+    try:
+        return zf.read(name)
+    except _ENTRY_ERRORS:
+        return None
 
 
 def _parse(report: bytes) -> dict[str, Any] | None:
@@ -174,29 +204,35 @@ def read_report(path: Path) -> dict[str, Any] | None:
     not verified: call `verify_zip` first."""
     try:
         with zipfile.ZipFile(path) as zf:
-            return _parse(zf.read(REPORT_NAME))
-    except (zipfile.BadZipFile, KeyError, OSError):
+            report = _read(zf, REPORT_NAME)
+    except _ARCHIVE_ERRORS:
         return None
+    return None if report is None else _parse(report)
 
 
 def verify_zip(path: Path, public_key: bytes) -> VerifyOutcome:
     """Check the signature, the signer's key id and every file's hash against the report."""
     try:
-        with zipfile.ZipFile(path) as zf:
-            problems = _verify(zf, public_key)
-    except (zipfile.BadZipFile, OSError):
-        problems = ["zip.invalid"]
+        zf = zipfile.ZipFile(path)
+        names = zf.namelist()
+    except _ARCHIVE_ERRORS:
+        # The archive itself is unreadable; a damaged entry is reported per entry instead.
+        return VerifyOutcome(ok=False, problems=["zip.invalid"])
+    with zf:
+        problems = _verify(zf, names, public_key)
     return VerifyOutcome(ok=not problems, problems=problems)
 
 
-def _verify(zf: zipfile.ZipFile, public: bytes) -> list[str]:
-    names = set(zf.namelist())
+def _verify(zf: zipfile.ZipFile, listed: list[str], public: bytes) -> list[str]:
+    names = set(listed)
     missing = [f"file.missing:{n}" for n in (REPORT_NAME, SIGNATURE_NAME) if n not in names]
     if missing:
         return missing
-    report = zf.read(REPORT_NAME)
+    report, sig_file = _read(zf, REPORT_NAME), _read(zf, SIGNATURE_NAME)
+    if report is None or sig_file is None:
+        return ["signature.invalid"]  # a damaged report or signature proves nothing
     problems: list[str] = []
-    if not _signature_ok(report, zf.read(SIGNATURE_NAME), public):
+    if not _signature_ok(report, sig_file, public):
         problems.append("signature.invalid")
     parsed = _parse(report)
     if parsed is None:
@@ -218,7 +254,7 @@ def _verify(zf: zipfile.ZipFile, public: bytes) -> list[str]:
     problems.extend(f"file.extra:{n}" for n in sorted(names - expected))
     # A second entry of the same name: readers disagree on which one they show.
     seen: set[str] = set()
-    for name in zf.namelist():
+    for name in listed:
         if name in seen:
             problems.append(f"file.extra:{name}")
         seen.add(name)

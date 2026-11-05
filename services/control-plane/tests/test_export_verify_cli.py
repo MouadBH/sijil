@@ -4,6 +4,7 @@ is intact, 1 with one problem code per line otherwise, 2 when it could not verif
 import asyncio
 import base64
 import hashlib
+import struct
 import uuid
 import zipfile
 from collections.abc import Sequence
@@ -157,3 +158,28 @@ def test_against_ledger_without_a_database_exits_2(
     err = capsys.readouterr().err
     assert "database error" in err
     assert "secret-pw" not in err
+
+
+def test_a_byte_flipped_in_place_is_a_problem_code_never_a_traceback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    doc = uuid.uuid4()
+    intact = _export(tmp_path / "e.zip", uuid.uuid4(), [(doc, SHA, None)])
+    with zipfile.ZipFile(intact) as zf:
+        info, start_dir = zf.getinfo(f"originals/{doc}.pdf"), zf.start_dir
+    raw = intact.read_bytes()
+    name_len, extra_len = struct.unpack(
+        "<HH", raw[info.header_offset + 26 : info.header_offset + 30]
+    )
+    for offset, problem in (
+        (info.header_offset + 30 + name_len + extra_len, f"file.hash:originals/{doc}.pdf"),
+        (start_dir, "zip.invalid"),
+    ):
+        flipped = bytearray(raw)
+        flipped[offset] ^= 0xFF
+        path = tmp_path / "flipped.zip"
+        path.write_bytes(bytes(flipped))
+        assert export_verify(path, public_key_b64=TEST_PUBLIC_KEY_B64) == 1
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == [problem]
+        assert captured.err == ""

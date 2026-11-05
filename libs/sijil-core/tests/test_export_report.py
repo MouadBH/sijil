@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import json
+import struct
 import zipfile
 from collections.abc import Callable
 from datetime import UTC, date, datetime
@@ -197,3 +198,103 @@ def test_period_bounds(period: str, bounds: tuple[date, date]) -> None:
 def test_period_bounds_refuses_a_malformed_period(period: str) -> None:
     with pytest.raises(ValueError, match="period"):
         period_bounds(period)
+
+
+# In-place byte flips: the ZIP's own bytes edited, as damage on disk or in transit would be,
+# never rebuilt through `writestr` (which would compute a fresh, matching CRC).
+
+BIG_ORIGINAL = b"%PDF-1.7 SAMPLE " + bytes(range(256)) * 8
+
+
+def _flip_zip(path: Path, compression: int) -> Path:
+    """An intact export whose original is BIG_ORIGINAL, stored or deflated."""
+    report = build_report(
+        workspace_id=WS, region="ma-cas", period="2026-10", generated_at=GENERATED,
+        documents=[
+            ReportDocument(
+                id=DOC, path=f"originals/{DOC}.pdf",
+                sha256=hashlib.sha256(BIG_ORIGINAL).hexdigest(), size_bytes=len(BIG_ORIGINAL),
+                fields_sha256=None,
+            )
+        ],
+        index_csv_sha256=hashlib.sha256(CSV).hexdigest(),
+        audit_head=AuditHead(id=EVENT, hash="a" * 64), public_key=public_key(SEED),
+    )  # fmt: skip
+    with zipfile.ZipFile(path, "w", compression=compression) as zf:
+        zf.writestr(f"originals/{DOC}.pdf", BIG_ORIGINAL)
+        zf.writestr(INDEX_NAME, CSV)
+        zf.writestr(REPORT_NAME, report)
+        zf.writestr(SIGNATURE_NAME, base64.b64encode(sign(report, SEED)))
+    return path
+
+
+def _data_span(path: Path, name: str) -> range:
+    """The byte offsets of `name`'s (compressed) data in the archive."""
+    with zipfile.ZipFile(path) as zf:
+        info = zf.getinfo(name)
+    raw = path.read_bytes()
+    name_len, extra_len = struct.unpack(
+        "<HH", raw[info.header_offset + 26 : info.header_offset + 30]
+    )
+    start = info.header_offset + 30 + name_len + extra_len
+    return range(start, start + info.compress_size)
+
+
+def _flipped(src: Path, dst: Path, offset: int) -> Path:
+    raw = bytearray(src.read_bytes())
+    raw[offset] ^= 0xFF
+    dst.write_bytes(bytes(raw))
+    return dst
+
+
+COMPRESSIONS = pytest.mark.parametrize(
+    "compression", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED], ids=["stored", "deflated"]
+)
+
+
+@COMPRESSIONS
+def test_a_byte_flipped_in_place_in_an_original_is_a_hash_problem(
+    tmp_path: Path, compression: int
+) -> None:
+    intact = _flip_zip(tmp_path / "intact.zip", compression)
+    span = _data_span(intact, f"originals/{DOC}.pdf")
+    # Not the last byte: in a deflate stream it may hold only padding bits, which no reader sees.
+    for offset in (span.start, span.start + len(span) // 3, span.start + len(span) // 2):
+        outcome = verify_zip(_flipped(intact, tmp_path / "f.zip", offset), public_key(SEED))
+        assert outcome.problems == [f"file.hash:originals/{DOC}.pdf"], offset
+
+
+@COMPRESSIONS
+def test_a_byte_flipped_in_place_in_the_index_is_an_index_hash_problem(
+    tmp_path: Path, compression: int
+) -> None:
+    intact = _flip_zip(tmp_path / "intact.zip", compression)
+    span = _data_span(intact, INDEX_NAME)
+    for offset in (span.start, span.start + len(span) // 2):
+        outcome = verify_zip(_flipped(intact, tmp_path / "f.zip", offset), public_key(SEED))
+        assert outcome.problems == ["index_csv.hash"], offset
+
+
+@COMPRESSIONS
+def test_a_byte_flipped_in_the_central_directory_never_raises(
+    tmp_path: Path, compression: int
+) -> None:
+    intact = _flip_zip(tmp_path / "intact.zip", compression)
+    with zipfile.ZipFile(intact) as zf:
+        start_dir = zf.start_dir
+    raw = intact.read_bytes()
+    # Its first record's signature: the archive itself is unreadable.
+    assert verify_zip(
+        _flipped(intact, tmp_path / "f.zip", start_dir), public_key(SEED)
+    ).problems == ["zip.invalid"]
+    # Any byte of the directory (and of the end record): a verdict, never an exception.
+    for offset in range(start_dir, len(raw)):
+        verify_zip(_flipped(intact, tmp_path / "f.zip", offset), public_key(SEED))
+
+
+@COMPRESSIONS
+def test_every_single_byte_flip_is_reported_never_raised(tmp_path: Path, compression: int) -> None:
+    intact = _flip_zip(tmp_path / "intact.zip", compression)
+    assert verify_zip(intact, public_key(SEED)).ok
+    for offset in range(len(intact.read_bytes())):
+        verify_zip(_flipped(intact, tmp_path / "f.zip", offset), public_key(SEED))
