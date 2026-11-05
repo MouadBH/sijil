@@ -120,3 +120,34 @@ async def test_policy_years_falls_back_to_other_and_country(
     assert await policy_years(db, workspace.id, "no-such-type") == 11
     # A type without a row (a partly seeded workspace) falls back to the preset, not to `other`.
     assert await policy_years(db, workspace.id, "contract") == 10
+
+
+@pytest.mark.db
+async def test_lowest_policy_years_across_types(
+    db: AsyncSession, org: Organisation, workspace: Workspace
+) -> None:
+    from sijil_core.retention import lowest_policy_years
+
+    assert await lowest_policy_years(db, workspace.id) == 10  # MA: every type 10
+    org.country = "DE"
+    await db.commit()
+    assert await lowest_policy_years(db, workspace.id) == 8  # invoice, receipt, bank_statement
+    # Raising `other` (or any type) never raises the lowest; rows win over the preset.
+    db.add_all(
+        [
+            RetentionPolicy(
+                workspace_id=workspace.id, document_type=t, years=y, preset_years=p, locked=True
+            )
+            for t, y, p in (("other", 15, 10), ("invoice", 9, 8))
+        ]
+    )
+    await db.commit()
+    assert await lowest_policy_years(db, workspace.id) == 8  # receipt still on its preset
+    for t in ("receipt", "bank_statement"):
+        db.add(
+            RetentionPolicy(
+                workspace_id=workspace.id, document_type=t, years=12, preset_years=8, locked=True
+            )
+        )
+    await db.commit()
+    assert await lowest_policy_years(db, workspace.id) == 9

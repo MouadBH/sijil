@@ -68,6 +68,28 @@ async def policy_years(db: AsyncSession, workspace_id: UUID, document_type: str 
     return PRESETS[country][kind]
 
 
+async def lowest_policy_years(db: AsyncSession, workspace_id: UUID) -> int:
+    """The lowest of the workspace's retention years across every document type (`policy_years`
+    of each: its row, else its country's preset). The provisional retention at arrival, when
+    the type is not known yet: routing and sealing raise it to the type's own policy, and a
+    lock is only ever extended, so it never keeps a type longer than its policy (final review
+    I2), and raising one type's policy never raises another's."""
+    found = await db.execute(
+        select(RetentionPolicy.document_type, RetentionPolicy.years).where(
+            RetentionPolicy.workspace_id == workspace_id
+        )
+    )
+    rows: dict[str, int] = dict(found.tuples().all())
+    country = await db.scalar(
+        select(Organisation.country)
+        .join(Workspace, Workspace.org_id == Organisation.id)
+        .where(Workspace.id == workspace_id)
+    )
+    if country is None:
+        raise LookupError(f"workspace {workspace_id} not found")
+    return min(rows.get(t, PRESETS[country][t]) for t in DOCUMENT_TYPES)
+
+
 def preset_policies(workspace_id: UUID, country: str) -> list[RetentionPolicy]:
     """One locked row per document type from `country`'s preset, for a new workspace."""
     return [
