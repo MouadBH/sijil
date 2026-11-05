@@ -6,15 +6,12 @@ throw-away database behind a real `IndexEngines`; the ledger the real test datab
 
 import asyncio
 import hashlib
-import json
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
-import httpx
 import pytest
-import respx
 from redis.asyncio import Redis
 from sqlalchemy import select, text
 from sqlalchemy.engine import URL
@@ -55,6 +52,7 @@ from sijil_worker.purge import (
     requeue_unpurged,
 )
 from sijil_worker.settings import WorkerSettings
+from tests.support.fake_paperless import FakePaperless, fake_paperless
 from tests.support.index_db import throwaway_index_db
 
 PAPERLESS = "http://paperless-ws:8000"
@@ -242,89 +240,9 @@ async def _purge(row: DocumentLedger, sessions: Any, keys: Any, engines: Any, **
 TASK_ID = "11111111-2222-3333-4444-555555555555"
 
 
-class FakePaperless:
-    """Paperless 3.4.1 as the purge meets it (pinned by tests/integration/
-    test_paperless_contract.py): a delete moves a live document to the trash (404 when it is
-    not live), emptying the trash answers 400 unless every document named is in it, lists are
-    paginated. Every request is recorded with the credential it carried; only the tenant
-    admin's token is accepted after the token request."""
-
-    def __init__(self) -> None:
-        self.live: dict[int, tuple[str, str]] = {}  # id -> (checksum, original file name)
-        self.trash: dict[int, tuple[str, str]] = {}
-        self.tasks: dict[str, dict[str, Any]] = {}
-        self.calls: list[tuple[str, str, str | None, Any]] = []
-        self.keep_in_trash = False  # an `empty` that answers 200 but keeps them
-        self.down = False
-
-    def add(
-        self, doc_id: int, sha256: str, *, name: str | None = None, trashed: bool = False
-    ) -> None:
-        entry = (sha256, name or f"{sha256[:12]}.pdf")
-        (self.trash if trashed else self.live)[doc_id] = entry
-
-    def methods(self) -> list[tuple[str, str]]:
-        return [(method, path) for method, path, _, _ in self.calls]
-
-    @staticmethod
-    def _page(request: httpx.Request, rows: list[dict[str, Any]]) -> httpx.Response:
-        size = int(request.url.params.get("page_size", 25))
-        page = int(request.url.params.get("page", 1))
-        chunk = rows[(page - 1) * size : page * size]
-        more = page * size < len(rows)
-        return httpx.Response(
-            200,
-            json={"count": len(rows), "next": f"page={page + 1}" if more else None,
-                  "results": chunk},
-        )  # fmt: skip
-
-    def handler(self, request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        body = json.loads(request.content) if request.content else None
-        auth = request.headers.get("authorization")
-        self.calls.append((request.method, path, auth, body))
-        if path == "/api/token/":
-            ok = body == {"username": "sijil-admin", "password": ADMIN_PASSWORD}
-            return httpx.Response(200 if ok else 400, json={"token": ADMIN_TOKEN})
-        if self.down:
-            return httpx.Response(503)
-        if auth != f"Token {ADMIN_TOKEN}":
-            return httpx.Response(403)
-        if request.method == "GET" and path == "/api/documents/":
-            wanted = request.url.params["checksum__iexact"].lower()
-            rows = [{"id": i} for i, (sha, _) in sorted(self.live.items()) if sha == wanted]
-            return self._page(request, rows)
-        if request.method == "DELETE" and path.startswith("/api/documents/"):
-            doc_id = int(path.split("/")[3])
-            if doc_id not in self.live:
-                return httpx.Response(404)
-            self.trash[doc_id] = self.live.pop(doc_id)
-            return httpx.Response(204)
-        if request.method == "GET" and path == "/api/trash/":
-            trashed: list[dict[str, Any]] = [
-                {"id": i, "original_file_name": n} for i, (_, n) in sorted(self.trash.items())
-            ]
-            return self._page(request, trashed)
-        if request.method == "POST" and path == "/api/trash/":
-            assert body is not None
-            ids = body["documents"]
-            if body["action"] != "empty" or any(i not in self.trash for i in ids):
-                return httpx.Response(400, json={"documents": ["not yet deleted"]})
-            if not self.keep_in_trash:
-                for i in ids:
-                    del self.trash[i]
-            return httpx.Response(200, json={"result": "OK"})
-        if request.method == "GET" and path == "/api/tasks/":
-            task = self.tasks.get(request.url.params["task_id"])
-            return httpx.Response(200, json=[task] if task else [])
-        return httpx.Response(404)
-
-
 @pytest.fixture
 def fake() -> Iterator[FakePaperless]:
-    found = FakePaperless()
-    with respx.mock(assert_all_called=False) as router:
-        router.route(url__startswith=PAPERLESS).mock(side_effect=found.handler)
+    with fake_paperless(PAPERLESS, ADMIN_PASSWORD, ADMIN_TOKEN) as found:
         yield found
 
 
