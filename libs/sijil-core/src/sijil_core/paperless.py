@@ -30,6 +30,8 @@ _RETRY_STATUS = frozenset({502, 503, 504})
 _READY_ERRORS = frozenset({401, 403, 406})
 _ATTEMPTS = 3
 _BACKOFF_S = 0.5
+# Rows per page when a whole paginated list is read.
+PAGE_SIZE = 100
 
 
 class PaperlessError(Exception):
@@ -367,6 +369,52 @@ class PaperlessClient:
             }
         except (ValueError, KeyError, TypeError, AttributeError):
             raise PaperlessError("GET /api/documents/: unexpected body") from None
+
+    async def _every_page(self, path: str, params: Mapping[str, str]) -> list[dict[str, Any]]:
+        """Every row of a paginated list (`page`, `page_size`, `next`)."""
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = await self._request(
+                "GET", path, params={**params, "page": page, "page_size": PAGE_SIZE}
+            )
+            try:
+                body = response.json()
+                results = [dict(r) for r in body["results"]]
+                more = body.get("next")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise PaperlessBadResponse(f"GET {path}: unexpected body") from None
+            rows.extend(results)
+            if not more or not results:
+                return rows
+            page += 1
+
+    async def documents_with_checksum(self, sha256: str) -> list[int]:
+        """Ids of every live document whose original has this SHA-256 (3.4.1 keeps duplicates).
+        `checksum__iexact`: see `find_document_by_checksum`."""
+        rows = await self._every_page(
+            "/api/documents/", {"checksum__iexact": sha256, "ordering": "id"}
+        )
+        try:
+            return [int(r["id"]) for r in rows]
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("GET /api/documents/: unexpected body") from None
+
+    async def trashed_documents(self) -> list[PaperlessDoc]:
+        """The documents in the trash (`/api/trash/`, which has no filter in 3.4.1)."""
+        rows = await self._every_page("/api/trash/", {})
+        try:
+            return [
+                PaperlessDoc(
+                    id=int(r["id"]),
+                    title=r.get("title"),
+                    created=r.get("created"),
+                    original_file_name=r.get("original_file_name"),
+                )
+                for r in rows
+            ]
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("GET /api/trash/: unexpected body") from None
 
     async def delete_document(self, doc_id: int) -> None:
         """Moves the document to Paperless's trash (`empty_trash` removes it for good)."""

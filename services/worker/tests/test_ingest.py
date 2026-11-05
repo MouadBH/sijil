@@ -1207,6 +1207,11 @@ class _RemovedWhile(PaperlessClient):
         await self._maybe("lookup")
         return await super().find_document_by_checksum(sha256)
 
+    async def upload(self, content: bytes, filename: str, title: str | None = None) -> str:
+        task_id = await super().upload(content, filename, title)
+        await self._maybe("upload")
+        return task_id
+
     async def task(self, task_id: str) -> Any:
         found = await super().task(task_id)
         await self._maybe("poll")
@@ -1232,6 +1237,8 @@ def _removing(
     [
         ("lookup", None, 0),  # before the upload: nothing is sent to Paperless
         ("lookup", PaperlessUnavailable("down"), 0),  # and a transient error then: no retry
+        # Uploaded, removed before the task id is written: the consume is still waited for.
+        ("upload", None, 1),
         ("poll", None, 1),  # after the upload: the result is never written to the row
     ],
 )
@@ -1246,10 +1253,13 @@ async def test_ingest_stops_when_removed_mid_run(
     then: Exception | None,
     uploads: int,
 ) -> None:
+    """A stop after an upload sends the purge again once the consume is over (or its wait timed
+    out): the removal's own purge may have run before the copy existed."""
     ledger = await make_ledger(db, memory_store, ready, tmp_path)
     extractions = _Extractions()
+    purges = _Extractions()
     with respx.mock(assert_all_called=False) as router:
-        upload, _ = mock_flow(router)
+        upload, polls = mock_flow(router)
         # Returns, never raises: a stop is not something to retry.
         await ingest_document(
             ledger.id,
@@ -1262,13 +1272,16 @@ async def test_ingest_stops_when_removed_mid_run(
             settings=SETTINGS,
             will_retry=lambda _exc: True,
             enqueue_extract=extractions,
+            enqueue_purge=purges,
         )
         assert upload.call_count == uploads
+        assert polls.call_count == uploads  # a consume, once uploaded, is waited for
     row = await reload(db, ledger)
     assert row.state is DocumentState.removed
     assert row.paperless_doc_id is None
     assert await _ingest_actions(db, ready) == []
     assert extractions.sent == []
+    assert purges.sent == [ledger.id] * uploads
 
 
 async def test_requeue_skips_removed_rows(

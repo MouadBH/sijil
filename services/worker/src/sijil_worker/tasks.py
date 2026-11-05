@@ -51,7 +51,12 @@ from sijil_worker.lock import lock_sealed, requeue_unlocked
 from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
 from sijil_worker.provisioning import provision_workspace, record_failure
-from sijil_worker.purge import purge_document, requeue_unpurged
+from sijil_worker.purge import (
+    ConsumeInFlight,
+    PurgeIncomplete,
+    purge_document,
+    requeue_unpurged,
+)
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
@@ -229,6 +234,7 @@ async def _ingest(
             will_retry=will_retry,
             retry_after_s=retry_after_s,
             enqueue_extract=_send_extract,
+            enqueue_purge=_send_purge,
         )
     finally:
         await engine.dispose()
@@ -894,9 +900,35 @@ def requeue_unremoved_task() -> int:
 # may send it again. A permanent failure (e.g. Paperless refusing the admin) is logged by its
 # code only and its `purge:pending` key kept for the full TTL (1 h), so the sweep re-sends that
 # row at most hourly.
+# An upload that may still be consuming (ConsumeInFlight) is neither a failure nor a retry: the
+# purge is sent again by name after CONSUME_RECHECK_S, a fresh message whose retries are
+# untouched, its key kept meanwhile. It ends once the consume window is over.
 PURGE_MAX_RETRIES = 8
 PURGE_BACKOFF_FACTOR_S = 30
 PURGE_BACKOFF_MAX_S = 900
+CONSUME_RECHECK_S = 60
+
+
+def is_purge_transient(exc: BaseException) -> bool:
+    """A workspace not active, Paperless or a database down, or a copy left in the trash."""
+    return isinstance(exc, PurgeIncomplete) or is_mirror_transient(exc)
+
+
+def _recheck_purge(lid: UUID, ledger_id: str, workspace_id: str) -> None:
+    async def wait(pending: PendingExtractions) -> None:
+        await pending.refresh(lid, CONSUME_RECHECK_S + PENDING_MARGIN_S)
+
+    _pending_purge_quietly(wait)
+    try:
+        current_app.send_task(
+            "sijil.purge_document",
+            kwargs={"ledger_id": ledger_id, "workspace_id": workspace_id},
+            queue="default",
+            countdown=CONSUME_RECHECK_S,
+        )
+    except Exception as exc:
+        # The key expires and the sweep sends it again.
+        log.warning("purge re-check of document %s not sent: %s", ledger_id, type(exc).__name__)
 
 
 def _purge_code(exc: BaseException) -> str:
@@ -953,9 +985,12 @@ def purge_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: st
 
     try:
         asyncio.run(_purge(ledger_id, workspace_id))
+    except ConsumeInFlight:
+        _recheck_purge(lid, ledger_id, workspace_id)
+        return
     except Exception as exc:
         retries = int(self.request.retries or 0)
-        if is_mirror_transient(exc) and retries < PURGE_MAX_RETRIES:
+        if is_purge_transient(exc) and retries < PURGE_MAX_RETRIES:
             countdown = get_exponential_backoff_interval(
                 factor=PURGE_BACKOFF_FACTOR_S,
                 retries=retries,
@@ -968,7 +1003,7 @@ def purge_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: st
 
             _pending_purge_quietly(refresh)
             raise self.retry(exc=exc, countdown=countdown) from exc
-        if is_mirror_transient(exc):
+        if is_purge_transient(exc):
             _pending_purge_quietly(clear)
             raise  # retries ran out: the next sweep may send it again
         log.error("purge of document %s failed: %s", ledger_id, _purge_code(exc))

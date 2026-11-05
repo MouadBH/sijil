@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 import respx
 from redis.asyncio import Redis
@@ -47,7 +48,12 @@ from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.ingest import WorkspaceNotActive
 from sijil_worker.pending import PendingExtractions
-from sijil_worker.purge import purge_document, requeue_unpurged
+from sijil_worker.purge import (
+    ConsumeInFlight,
+    PurgeIncomplete,
+    purge_document,
+    requeue_unpurged,
+)
 from sijil_worker.settings import WorkerSettings
 from tests.support.index_db import throwaway_index_db
 
@@ -129,16 +135,22 @@ async def _document(
     *,
     original_removed: bool = True,
     paperless_doc_id: int | None = DOC_ID,
+    ingest_state: IngestState = IngestState.consumed,
+    task_id: str | None = None,
+    claimed_at: datetime | None = None,
+    next_attempt_at: datetime | None = None,
 ) -> DocumentLedger:
     """A row brought to `state` through the transitions 0011 allows, with its index row
-    (sealed for a sealed or deleted document)."""
+    (sealed for a sealed or deleted document). The ingest columns say how far ingest got."""
     sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     sealed = state in (DocumentState.sealed, DocumentState.deleted)
     row = DocumentLedger(
         workspace_id=ws.id, sha256=sha, md5="0" * 32, size_bytes=10, content_kind="pdf",
         source=DocumentSource.upload, object_key=f"k/{sha}", object_version_id="v1",
         state=DocumentState.sealed if sealed else DocumentState.filed,
-        ingest_state=IngestState.consumed, paperless_doc_id=paperless_doc_id,
+        ingest_state=ingest_state, paperless_doc_id=paperless_doc_id,
+        paperless_task_id=task_id, ingest_claimed_at=claimed_at,
+        ingest_next_attempt_at=next_attempt_at,
         retention_until=PAST if state is DocumentState.deleted else FAR,
         ingested_at=NOW - timedelta(days=2),
         fields_sha256=fields_digest(VALUES) if sealed else None,
@@ -227,38 +239,117 @@ async def _purge(row: DocumentLedger, sessions: Any, keys: Any, engines: Any, **
     return await purge_document(row.id, **args)
 
 
-def _admin_routes(router: respx.MockRouter, *, delete: int = 204, trash: int = 200) -> None:
-    router.post(f"{PAPERLESS}/api/token/").respond(200, json={"token": ADMIN_TOKEN})
-    router.delete(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(delete)
-    router.post(f"{PAPERLESS}/api/trash/").respond(trash, json={"result": "OK"})
+TASK_ID = "11111111-2222-3333-4444-555555555555"
 
 
-def _calls(router: respx.MockRouter) -> list[tuple[str, str, str | None, Any]]:
-    out = []
-    for call in router.calls:
-        request = call.request
+class FakePaperless:
+    """Paperless 3.4.1 as the purge meets it (pinned by tests/integration/
+    test_paperless_contract.py): a delete moves a live document to the trash (404 when it is
+    not live), emptying the trash answers 400 unless every document named is in it, lists are
+    paginated. Every request is recorded with the credential it carried; only the tenant
+    admin's token is accepted after the token request."""
+
+    def __init__(self) -> None:
+        self.live: dict[int, tuple[str, str]] = {}  # id -> (checksum, original file name)
+        self.trash: dict[int, tuple[str, str]] = {}
+        self.tasks: dict[str, dict[str, Any]] = {}
+        self.calls: list[tuple[str, str, str | None, Any]] = []
+        self.keep_in_trash = False  # an `empty` that answers 200 but keeps them
+        self.down = False
+
+    def add(
+        self, doc_id: int, sha256: str, *, name: str | None = None, trashed: bool = False
+    ) -> None:
+        entry = (sha256, name or f"{sha256[:12]}.pdf")
+        (self.trash if trashed else self.live)[doc_id] = entry
+
+    def methods(self) -> list[tuple[str, str]]:
+        return [(method, path) for method, path, _, _ in self.calls]
+
+    @staticmethod
+    def _page(request: httpx.Request, rows: list[dict[str, Any]]) -> httpx.Response:
+        size = int(request.url.params.get("page_size", 25))
+        page = int(request.url.params.get("page", 1))
+        chunk = rows[(page - 1) * size : page * size]
+        more = page * size < len(rows)
+        return httpx.Response(
+            200,
+            json={"count": len(rows), "next": f"page={page + 1}" if more else None,
+                  "results": chunk},
+        )  # fmt: skip
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
         body = json.loads(request.content) if request.content else None
-        out.append((request.method, request.url.path, request.headers.get("authorization"), body))
-    return out
+        auth = request.headers.get("authorization")
+        self.calls.append((request.method, path, auth, body))
+        if path == "/api/token/":
+            ok = body == {"username": "sijil-admin", "password": ADMIN_PASSWORD}
+            return httpx.Response(200 if ok else 400, json={"token": ADMIN_TOKEN})
+        if self.down:
+            return httpx.Response(503)
+        if auth != f"Token {ADMIN_TOKEN}":
+            return httpx.Response(403)
+        if request.method == "GET" and path == "/api/documents/":
+            wanted = request.url.params["checksum__iexact"].lower()
+            rows = [{"id": i} for i, (sha, _) in sorted(self.live.items()) if sha == wanted]
+            return self._page(request, rows)
+        if request.method == "DELETE" and path.startswith("/api/documents/"):
+            doc_id = int(path.split("/")[3])
+            if doc_id not in self.live:
+                return httpx.Response(404)
+            self.trash[doc_id] = self.live.pop(doc_id)
+            return httpx.Response(204)
+        if request.method == "GET" and path == "/api/trash/":
+            trashed: list[dict[str, Any]] = [
+                {"id": i, "original_file_name": n} for i, (_, n) in sorted(self.trash.items())
+            ]
+            return self._page(request, trashed)
+        if request.method == "POST" and path == "/api/trash/":
+            assert body is not None
+            ids = body["documents"]
+            if body["action"] != "empty" or any(i not in self.trash for i in ids):
+                return httpx.Response(400, json={"documents": ["not yet deleted"]})
+            if not self.keep_in_trash:
+                for i in ids:
+                    del self.trash[i]
+            return httpx.Response(200, json={"result": "OK"})
+        if request.method == "GET" and path == "/api/tasks/":
+            task = self.tasks.get(request.url.params["task_id"])
+            return httpx.Response(200, json=[task] if task else [])
+        return httpx.Response(404)
+
+
+@pytest.fixture
+def fake() -> Iterator[FakePaperless]:
+    found = FakePaperless()
+    with respx.mock(assert_all_called=False) as router:
+        router.route(url__startswith=PAPERLESS).mock(side_effect=found.handler)
+        yield found
 
 
 @pytest.mark.parametrize("state", [DocumentState.removed, DocumentState.deleted])
 async def test_purge_deletes_in_paperless_with_admin_and_empties_trash(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User, state: DocumentState,
+    user: User, state: DocumentState, fake: FakePaperless,
 ) -> None:  # fmt: skip
     row = await _document(db, engines, ready, user, state)
-    with respx.mock(assert_all_called=True) as router:
-        _admin_routes(router)
-        assert await _purge(row, sessions, keys, engines)
-        calls = _calls(router)  # respx forgets them when the mock ends
-    assert calls == [
-        # A token for the tenant admin, then the delete and the trash with it: the service
-        # token has no delete right and is never used here.
-        ("POST", "/api/token/", None, {"username": "sijil-admin", "password": ADMIN_PASSWORD}),
-        ("DELETE", f"/api/documents/{DOC_ID}/", f"Token {ADMIN_TOKEN}", None),
-        ("POST", "/api/trash/", f"Token {ADMIN_TOKEN}", {"documents": [DOC_ID], "action": "empty"}),
-    ]
+    fake.add(DOC_ID, row.sha256)
+    assert await _purge(row, sessions, keys, engines)
+    # A token for the tenant admin, then everything with it: the service token has no delete
+    # right and is never used here.
+    assert fake.calls[0] == (
+        "POST", "/api/token/", None, {"username": "sijil-admin", "password": ADMIN_PASSWORD}
+    )  # fmt: skip
+    assert {auth for _, _, auth, _ in fake.calls[1:]} == {f"Token {ADMIN_TOKEN}"}
+    assert ("DELETE", f"/api/documents/{DOC_ID}/") in fake.methods()
+    assert (
+        "POST",
+        "/api/trash/",
+        f"Token {ADMIN_TOKEN}",
+        {"documents": [DOC_ID], "action": "empty"},
+    ) in fake.calls  # noqa: E501
+    assert (fake.live, fake.trash) == ({}, {})  # Paperless keeps no copy
     # The index rows are gone, a sealed one too for an approved deletion.
     assert await _index_row(engines, ready, row.id) is None
     [event] = [e for e in await _events(db, ready) if e.action == "document.purged"]
@@ -278,28 +369,27 @@ async def test_purge_deletes_in_paperless_with_admin_and_empties_trash(
 )
 async def test_purge_refuses_unless_original_removed(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User, state: DocumentState, original_removed: bool,
+    user: User, state: DocumentState, original_removed: bool, fake: FakePaperless,
 ) -> None:  # fmt: skip
     """Only once the ledger says the original is gone: a forged or early message purges
     nothing, so Paperless is never called and the index row stays."""
     row = await _document(db, engines, ready, user, state, original_removed=original_removed)
-    with respx.mock(assert_all_called=False) as router:
-        assert not await _purge(row, sessions, keys, engines)
-        assert router.calls.call_count == 0
+    fake.add(DOC_ID, row.sha256)
+    assert not await _purge(row, sessions, keys, engines)
+    assert fake.calls == []
     assert await _index_row(engines, ready, row.id) is not None
     assert [e.action for e in await _events(db, ready)] == []
 
 
 async def test_an_absent_paperless_document_counts_as_deleted(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User,
+    user: User, fake: FakePaperless,
 ) -> None:  # fmt: skip
-    """A second run (or a document deleted in Paperless already): 404 on the delete, and the
-    trash answers 400 for a document that is not in it (Paperless 3.4.1 TrashSerializer)."""
+    """A second run (or a document deleted and emptied in Paperless already): 404 on the
+    delete, nothing of it in the trash."""
     row = await _document(db, engines, ready, user, DocumentState.removed)
-    with respx.mock(assert_all_called=True) as router:
-        _admin_routes(router, delete=404, trash=400)
-        assert await _purge(row, sessions, keys, engines)
+    assert await _purge(row, sessions, keys, engines)
+    assert ("DELETE", f"/api/documents/{DOC_ID}/") in fake.methods()
     assert await _index_row(engines, ready, row.id) is None
     [event] = [e for e in await _events(db, ready) if e.action == "document.purged"]
     assert event.data == {"paperless": False}
@@ -307,80 +397,173 @@ async def test_an_absent_paperless_document_counts_as_deleted(
 
 async def test_a_document_never_recorded_in_paperless_is_found_by_its_checksum(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User,
+    user: User, fake: FakePaperless,
 ) -> None:  # fmt: skip
     """Ingest stopped on the removal after Paperless had consumed the file, before the ledger
     recorded its id: the copy is found by its SHA-256."""
     row = await _document(db, engines, ready, user, DocumentState.removed, paperless_doc_id=None)
-    with respx.mock(assert_all_called=True) as router:
-        _admin_routes(router)
-        lookup = router.get(f"{PAPERLESS}/api/documents/").respond(
-            200, json={"results": [{"id": DOC_ID}]}
-        )
-        assert await _purge(row, sessions, keys, engines)
-        assert lookup.calls.last.request.url.params["checksum__iexact"] == row.sha256
-        calls = _calls(router)
-    assert [c[:2] for c in calls][-2:] == [
-        ("DELETE", f"/api/documents/{DOC_ID}/"),
-        ("POST", "/api/trash/"),
-    ]
+    fake.add(DOC_ID, row.sha256)
+    assert await _purge(row, sessions, keys, engines)
+    assert (fake.live, fake.trash) == ({}, {})
+
+
+async def test_every_checksum_match_is_deleted_across_pages(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Paperless 3.4.1 does not refuse duplicates: every copy with the SHA-256 goes, however many
+    pages the lookup takes."""
+    monkeypatch.setattr("sijil_core.paperless.PAGE_SIZE", 2)
+    row = await _document(db, engines, ready, user, DocumentState.removed)
+    for doc_id in range(DOC_ID, DOC_ID + 5):
+        fake.add(doc_id, row.sha256, name=f"copy-{doc_id}.pdf")  # some uploaded by hand
+    fake.add(99, hashlib.sha256(b"another").hexdigest())  # another document stays
+    assert await _purge(row, sessions, keys, engines)
+    assert list(fake.live) == [99]
+    assert fake.trash == {}
+
+
+async def test_a_trashed_copy_is_found_by_its_file_name_and_emptied(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """A copy deleted already (a run whose `empty` failed, or a person in Paperless) is in the
+    trash, where the checksum lookup does not see it: ingest's file name `{sha256[:12]}.{ext}`
+    finds it. Someone else's trashed document stays."""
+    row = await _document(db, engines, ready, user, DocumentState.removed, paperless_doc_id=None)
+    fake.add(DOC_ID, row.sha256, trashed=True)
+    fake.add(99, hashlib.sha256(b"another").hexdigest(), trashed=True)
+    assert await _purge(row, sessions, keys, engines)
+    assert list(fake.trash) == [99]
+    [event] = [e for e in await _events(db, ready) if e.action == "document.purged"]
+    assert event.data == {"paperless": True}
+
+
+async def test_a_copy_left_in_the_trash_is_not_recorded_purged(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """`document.purged` only once the trash holds none of it: otherwise a transient error, so
+    the task retries and the sweep keeps the row."""
+    row = await _document(db, engines, ready, user, DocumentState.removed)
+    fake.add(DOC_ID, row.sha256)
+    fake.keep_in_trash = True
+    with pytest.raises(PurgeIncomplete):
+        await _purge(row, sessions, keys, engines)
+    assert await _index_row(engines, ready, row.id) is not None
+    assert [e.action for e in await _events(db, ready)] == []
+    assert tasks.is_purge_transient(PurgeIncomplete())
 
 
 async def test_nothing_in_paperless_still_purges_the_index(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User,
+    user: User, fake: FakePaperless,
 ) -> None:  # fmt: skip
     row = await _document(db, engines, ready, user, DocumentState.removed, paperless_doc_id=None)
-    with respx.mock(assert_all_called=True) as router:
-        router.post(f"{PAPERLESS}/api/token/").respond(200, json={"token": ADMIN_TOKEN})
-        router.get(f"{PAPERLESS}/api/documents/").respond(200, json={"results": []})
-        assert await _purge(row, sessions, keys, engines)
+    assert await _purge(row, sessions, keys, engines)
     assert await _index_row(engines, ready, row.id) is None
     [event] = [e for e in await _events(db, ready) if e.action == "document.purged"]
     assert event.data == {"paperless": False}
 
 
+@pytest.mark.parametrize(
+    ("ingest", "task"),
+    [
+        # A consume task Paperless still runs, however old the claim.
+        (
+            {"ingest_state": IngestState.sending, "task_id": TASK_ID,
+             "claimed_at": NOW - timedelta(hours=1)},
+            {"task_id": TASK_ID, "status": "started"},
+        ),
+        # Uploaded, then stopped before its task id was recorded: a claim within the window.
+        ({"ingest_state": IngestState.sending, "claimed_at": NOW - timedelta(minutes=2)}, None),
+        # A failure after the upload, a Celery retry pending: within the window too.
+        ({"ingest_state": IngestState.queued, "next_attempt_at": NOW + timedelta(minutes=1)}, None),
+    ],
+)  # fmt: skip
+async def test_an_upload_still_consuming_is_checked_again_later(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless, ingest: dict[str, Any], task: dict[str, Any] | None,
+) -> None:  # fmt: skip
+    """No Paperless id recorded and an upload that may still be consuming: the copy may appear
+    after a purge that found nothing, so nothing is deleted or recorded yet."""
+    row = await _document(
+        db, engines, ready, user, DocumentState.removed, paperless_doc_id=None, **ingest
+    )
+    if task is not None:
+        fake.tasks[TASK_ID] = task
+    with pytest.raises(ConsumeInFlight):
+        await _purge(row, sessions, keys, engines)
+    assert not any(method == "DELETE" for method, _ in fake.methods())
+    assert await _index_row(engines, ready, row.id) is not None
+    assert [e.action for e in await _events(db, ready)] == []
+
+
+async def test_after_the_consume_window_the_checksum_decides(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    row = await _document(
+        db, engines, ready, user, DocumentState.removed, paperless_doc_id=None,
+        ingest_state=IngestState.sending, claimed_at=NOW - timedelta(minutes=11),
+    )  # fmt: skip
+    fake.add(DOC_ID, row.sha256)
+    assert await _purge(row, sessions, keys, engines)
+    assert (fake.live, fake.trash) == ({}, {})
+
+
+async def test_a_finished_task_names_the_copy_the_ledger_never_recorded(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    row = await _document(
+        db, engines, ready, user, DocumentState.removed, paperless_doc_id=None,
+        ingest_state=IngestState.sending, task_id=TASK_ID, claimed_at=NOW - timedelta(minutes=1),
+    )  # fmt: skip
+    fake.tasks[TASK_ID] = {"task_id": TASK_ID, "status": "success",
+                           "related_document_ids": [DOC_ID]}  # fmt: skip
+    fake.add(DOC_ID, "0" * 64, name="adopted.pdf")  # not findable by checksum or name
+    assert await _purge(row, sessions, keys, engines)
+    assert (fake.live, fake.trash) == ({}, {})
+
+
 @pytest.mark.parametrize("state", [WorkspaceState.hibernated, WorkspaceState.closing])
 async def test_a_workspace_not_active_is_retried_later(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User, state: WorkspaceState,
+    user: User, state: WorkspaceState, fake: FakePaperless,
 ) -> None:  # fmt: skip
     row = await _document(db, engines, ready, user, DocumentState.removed)
     ready.state = state
     await db.commit()
-    with respx.mock(assert_all_called=False) as router:
-        with pytest.raises(WorkspaceNotActive):
-            await _purge(row, sessions, keys, engines)
-        assert router.calls.call_count == 0
+    with pytest.raises(WorkspaceNotActive):
+        await _purge(row, sessions, keys, engines)
+    assert fake.calls == []
     assert await _index_row(engines, ready, row.id) is not None
 
 
 async def test_paperless_down_raises_and_keeps_the_index_row(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User,
+    user: User, fake: FakePaperless,
 ) -> None:  # fmt: skip
     """The index row is purged only after Paperless: a retry finds everything to do again."""
     row = await _document(db, engines, ready, user, DocumentState.removed)
-    with respx.mock(assert_all_called=False) as router:
-        router.post(f"{PAPERLESS}/api/token/").respond(200, json={"token": ADMIN_TOKEN})
-        router.delete(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(503)
-        with pytest.raises(PaperlessUnavailable):
-            await _purge(row, sessions, keys, engines)
+    fake.down = True
+    with pytest.raises(PaperlessUnavailable):
+        await _purge(row, sessions, keys, engines)
     assert await _index_row(engines, ready, row.id) is not None
     assert [e.action for e in await _events(db, ready)] == []
 
 
 async def test_purge_skips_another_workspace_and_another_region(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
-    user: User,
+    user: User, fake: FakePaperless,
 ) -> None:  # fmt: skip
     row = await _document(db, engines, ready, user, DocumentState.removed)
     with pytest.raises(LookupError):
         await _purge(row, sessions, keys, engines, workspace_id=uuid.uuid4())
     elsewhere = WorkerSettings.model_construct(region="fr-par", environment="test")
-    with respx.mock(assert_all_called=False) as router:
-        assert not await _purge(row, sessions, keys, engines, settings=elsewhere)
-        assert router.calls.call_count == 0
+    assert not await _purge(row, sessions, keys, engines, settings=elsewhere)
+    assert fake.calls == []
 
 
 # The sweep --------------------------------------------------------------------------------
@@ -559,3 +742,32 @@ def test_a_done_purge_clears_its_key(
     monkeypatch.setattr(tasks, "_purge", purge)
     tasks.purge_document_task.apply(kwargs=ARGS)
     assert key.ops == ["clear"]
+
+
+@pytest.mark.parametrize("retries_before", [0, tasks.PURGE_MAX_RETRIES])
+def test_a_consume_in_flight_is_checked_again_without_spending_a_retry(
+    eager_app: Any, key: RecordingPending, monkeypatch: pytest.MonkeyPatch, retries_before: int
+) -> None:
+    """Sent again by name with a countdown (a fresh message, its retries untouched), its key kept
+    past the countdown; nothing audited, nothing logged as a failure."""
+    calls: list[str] = []
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    async def purge(ledger_id: str, workspace_id: str) -> None:
+        calls.append(ledger_id)
+        raise ConsumeInFlight
+
+    def send_task(name: str, **options: Any) -> None:
+        sent.append((name, options))
+
+    monkeypatch.setattr(tasks, "_purge", purge)
+    monkeypatch.setattr(eager_app, "send_task", send_task)
+    tasks.purge_document_task.apply(kwargs=ARGS, retries=retries_before)
+    assert len(calls) == 1
+    assert sent == [
+        (
+            "sijil.purge_document",
+            {"kwargs": ARGS, "queue": "default", "countdown": tasks.CONSUME_RECHECK_S},
+        )
+    ]
+    assert key.ops == [f"refresh {tasks.CONSUME_RECHECK_S + tasks.PENDING_MARGIN_S}"]
