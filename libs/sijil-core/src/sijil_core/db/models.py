@@ -1,7 +1,7 @@
 import uuid
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import (
     BigInteger,
@@ -98,6 +98,12 @@ class DocumentState(StrEnum):
     removed = "removed"
     deleting = "deleting"
     deleted = "deleted"
+
+
+# Rows on their way out or gone: nothing ingests, extracts, seals or removes them again.
+TERMINAL_STATES: Final = frozenset(
+    {DocumentState.removed, DocumentState.deleting, DocumentState.deleted}
+)
 
 
 class IngestState(StrEnum):

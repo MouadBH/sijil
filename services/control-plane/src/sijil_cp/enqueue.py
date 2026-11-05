@@ -14,6 +14,8 @@ INGEST_TASK = ("sijil.ingest_document", "ingest")
 MIRROR_TASK = ("sijil.mirror_fields", "default")
 # The seal worker: the only holder of the key that switches an original to COMPLIANCE.
 LOCK_TASK = ("sijil.lock_sealed", "seal")
+# The removal worker: the only holder of the key that can delete an original.
+REMOVE_TASK = ("sijil.remove_original", "removal")
 
 
 class Enqueuer(Protocol):
@@ -29,6 +31,10 @@ class Enqueuer(Protocol):
 
     def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
         """Switch a sealed original to COMPLIANCE (seal worker, queue `seal`)."""
+        ...
+
+    def send_remove(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        """Delete a removed original from the store (removal worker, queue `removal`)."""
         ...
 
 
@@ -54,6 +60,9 @@ class CeleryEnqueuer:
 
     def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self._send_document(LOCK_TASK, ledger_id, workspace_id)
+
+    def send_remove(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self._send_document(REMOVE_TASK, ledger_id, workspace_id)
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task

@@ -28,6 +28,8 @@ class Action(StrEnum):
     documents_upload = "documents_upload"
     documents_review = "documents_review"
     documents_seal = "documents_seal"
+    # The pre-seal removal of a document uploaded by mistake (design §5.4): the Owner's only.
+    documents_remove = "documents_remove"
     documents_export = "documents_export"
     retention_manage = "retention_manage"
     audit_read = "audit_read"
@@ -35,7 +37,7 @@ class Action(StrEnum):
 
 MATRIX: dict[Role, frozenset[Action]] = {
     Role.owner: frozenset(Action),
-    Role.admin: frozenset(Action) - {Action.org_update},
+    Role.admin: frozenset(Action) - {Action.org_update, Action.documents_remove},
     Role.member: frozenset(
         {
             Action.workspace_read,

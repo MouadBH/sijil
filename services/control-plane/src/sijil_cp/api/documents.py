@@ -18,7 +18,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from python_multipart.exceptions import MultipartParseError
 from python_multipart.multipart import MultipartParser, parse_options_header
 from sqlalchemy import select, tuple_
@@ -34,6 +34,7 @@ from sijil_core.db.models import (
     DocumentState,
     IngestState,
     Organisation,
+    Role,
     TenantCredential,
     User,
     Workspace,
@@ -221,6 +222,8 @@ PAPERLESS_TIMEOUT_S = 3.0
 PAPERLESS_DEADLINE_S = 6.0
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
+# Gone from every list; the document itself answers with its tombstone.
+TOMBSTONES = (DocumentState.removed, DocumentState.deleted)
 
 
 class DocumentOut(BaseModel):
@@ -235,6 +238,21 @@ class DocumentOut(BaseModel):
     retention_until: date
     title: str | None
     original_file_name: str | None
+
+
+class TombstoneOut(BaseModel):
+    """What stays of a removed or deleted document. `removal_reason` is set for Owners only
+    (and left out of the body otherwise)."""
+
+    # Never mistaken for a DocumentOut when the response is validated.
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    state: DocumentState
+    sha256: str
+    removed_at: datetime | None
+    deleted_at: datetime | None
+    removal_reason: str | None = None
 
 
 class DocumentPage(BaseModel):
@@ -333,7 +351,9 @@ async def list_documents(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> DocumentPage:
     workspace = ctx.workspace
-    query = select(DocumentLedger).where(DocumentLedger.workspace_id == workspace.id)
+    query = select(DocumentLedger).where(
+        DocumentLedger.workspace_id == workspace.id, DocumentLedger.state.not_in(TOMBSTONES)
+    )
     if cursor is not None:
         at, last_id = _decode_cursor(cursor)
         query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) < (at, last_id))
@@ -363,10 +383,27 @@ async def list_documents(
     )
 
 
-@router.get("/workspaces/{workspace_id}/documents/{doc_id}", response_model=DocumentOut)
+def _tombstone(row: DocumentLedger, role: Role) -> TombstoneOut:
+    out = TombstoneOut(
+        id=row.id,
+        state=row.state,
+        sha256=row.sha256,
+        removed_at=row.removed_at,
+        deleted_at=row.deleted_at,
+    )
+    if role is Role.owner:
+        out.removal_reason = row.removal_reason
+    return out
+
+
+@router.get(
+    "/workspaces/{workspace_id}/documents/{doc_id}",
+    response_model=DocumentOut | TombstoneOut,
+    response_model_exclude_unset=True,
+)
 async def get_document(
     doc_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
-) -> DocumentOut:
+) -> DocumentOut | TombstoneOut:
     workspace = ctx.workspace
     row = await db.scalar(
         select(DocumentLedger).where(
@@ -375,7 +412,9 @@ async def get_document(
     )
     if row is None:
         raise ApiError("document.not_found", 404)
-    ids = [row.paperless_doc_id] if row.paperless_doc_id is not None else []
+    tombstone = row.state in TOMBSTONES
+    # A tombstone has nothing left in Paperless to ask about.
+    ids = [row.paperless_doc_id] if row.paperless_doc_id is not None and not tombstone else []
     docs = await _titles(request, db, workspace, ids)
     await audit.append(
         db,
@@ -389,4 +428,4 @@ async def get_document(
         now=now,
     )
     await db.commit()
-    return _out(row, docs)
+    return _tombstone(row, ctx.role) if tombstone else _out(row, docs)
