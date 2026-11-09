@@ -78,7 +78,7 @@ async def test_ensure_schema_idempotent(conn: AsyncConnection) -> None:
 
 
 def test_schema_version_is_the_latest_ddl() -> None:
-    assert max(index._DDL) == index.SCHEMA_VERSION == 2
+    assert max(index._DDL) == index.SCHEMA_VERSION == 3
 
 
 async def test_concurrent_first_runs_apply_once(fresh_db_url: str) -> None:

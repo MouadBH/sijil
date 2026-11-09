@@ -6,8 +6,9 @@ by a role of the same name. The control plane and the ledger never hold values, 
 A row of `document_fields` is frozen once sealed, at the database level (trigger
 `document_fields_frozen`): the error message carries the machine code `retention.locked`, which
 this module raises as `RetentionLocked` so callers can answer 409. `extraction_run` is evidence
-of what each model run said and is append-only, like `correction_note` (v2). The one DELETE
-the triggers allow is `purge_document`'s.
+of what each model run said and is append-only, like `correction_note` (v2). The search index
+(v3, `sijil_core.search_index`: `search_doc`, `document_tag`) may change but never be deleted
+from. The one DELETE the triggers allow is `purge_document`'s.
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -39,7 +40,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
 MAX_ENGINES: Final = 32
 LOCKED_CODE: Final = "retention.locked"
 # SQLSTATE the triggers raise it with (custom class "SJ": Sijil).
@@ -162,6 +163,107 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         IF sealed THEN
             PERFORM set_config('sijil.purge_sealed', target::text, true);
         END IF;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
+    ),
+    # v3: the search index (sijil_core.search_index). pg_trgm and unaccent are trusted, so the
+    # index role (the database's owner) creates them here; vector is not, and is already in
+    # every index database (infra/compose/postgres/init.sh, `template_index`), so IF NOT EXISTS
+    # skips it without asking for privileges.
+    3: (
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        "CREATE EXTENSION IF NOT EXISTS unaccent",
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        # Mirrors sijil_core.text.search_normalise (the tests check they agree): NFKC, bidi
+        # controls dropped, horizontal space collapsed, lower case, NFKD with the Latin and
+        # Arabic combining marks dropped, tatweel dropped, alef/yeh/teh marbuta and digits
+        # folded. `ß` is the one casefold that `lower` does not do.
+        r"""CREATE FUNCTION search_normalise(s text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+        SELECT translate(
+            regexp_replace(
+                normalize(
+                    replace(lower(regexp_replace(regexp_replace(normalize(s, NFKC),
+                        '[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]', '', 'g'),
+                        '[ \t\u00a0\u202f\u2009]+', ' ', 'g')), U&'\00DF', 'ss'),
+                    NFKD),
+                '[\u0300-\u036f\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e4'
+                '\u06e7\u06e8\u06ea-\u06ed]', '', 'g'),
+            'أإآٱىة٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹ـ',
+            'اااايه01234567890123456789')
+    $$""",
+        """CREATE TABLE search_doc (
+        ledger_id uuid PRIMARY KEY,
+        state text NOT NULL,
+        ingested_at timestamptz NOT NULL,
+        basis_date date NOT NULL,
+        document_type text,
+        supplier_name text,
+        supplier_ice text,
+        number text,
+        total_ht numeric(14, 2),
+        vat numeric(14, 2),
+        total_ttc numeric(14, 2),
+        currency text,
+        corrected text[] NOT NULL DEFAULT '{}',
+        tags text[] NOT NULL DEFAULT '{}',
+        content text NOT NULL DEFAULT '',
+        tsv tsvector GENERATED ALWAYS AS (
+            setweight(to_tsvector('simple', search_normalise(coalesce(supplier_name, ''))), 'A')
+            || setweight(to_tsvector('simple', search_normalise(coalesce(number, ''))), 'A')
+            || setweight(to_tsvector('simple', search_normalise(content)), 'C')
+        ) STORED,
+        updated_at timestamptz NOT NULL
+    )""",
+        "CREATE INDEX search_doc_tsv ON search_doc USING gin (tsv)",
+        "CREATE INDEX search_doc_supplier_trgm ON search_doc "
+        "USING gin (supplier_name gin_trgm_ops)",
+        "CREATE INDEX search_doc_content_trgm ON search_doc USING gin (content gin_trgm_ops)",
+        "CREATE INDEX search_doc_basis ON search_doc (basis_date, ledger_id)",
+        "CREATE INDEX search_doc_ttc ON search_doc (total_ttc, ledger_id)",
+        "CREATE INDEX search_doc_state ON search_doc (state)",
+        "CREATE INDEX search_doc_type ON search_doc (document_type)",
+        "CREATE INDEX search_doc_ice ON search_doc (supplier_ice)",
+        "CREATE INDEX search_doc_tags ON search_doc USING gin (tags)",
+        """CREATE TABLE document_tag (
+        ledger_id uuid NOT NULL,
+        tag text NOT NULL CHECK (char_length(tag) BETWEEN 1 AND 50),
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL,
+        PRIMARY KEY (ledger_id, tag)
+    )""",
+        # Rows may change, but leave only through `purge_document`'s gate.
+        """CREATE FUNCTION index_purge_only() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'DELETE'
+           AND current_setting('sijil.purge', true) IS NOT DISTINCT FROM OLD.ledger_id::text THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+    END $$""",
+        *(
+            sql
+            for table in ("search_doc", "document_tag")
+            for sql in (
+                f"""CREATE TRIGGER {table}_purge_only BEFORE DELETE ON {table}
+        FOR EACH ROW EXECUTE FUNCTION index_purge_only()""",
+                f"""CREATE TRIGGER {table}_no_truncate BEFORE TRUNCATE ON {table}
+        FOR EACH STATEMENT EXECUTE FUNCTION index_purge_only()""",
+            )
+        ),
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
         DELETE FROM correction_note WHERE ledger_id = target;
         DELETE FROM extraction_run WHERE ledger_id = target;
         DELETE FROM document_fields WHERE ledger_id = target;
@@ -524,8 +626,9 @@ def effective_fields(
 
 
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
-    """Deletes the document's `document_fields`, `extraction_run` and `correction_note` rows,
-    all or nothing, through the schema's `purge_document()` function. Idempotent.
+    """Deletes the document's `document_fields`, `extraction_run`, `correction_note`,
+    `search_doc` and `document_tag` rows, all or nothing, through the schema's
+    `purge_document()` function. Idempotent.
 
     The index triggers refuse every DELETE but one whose ledger id the GUC `sijil.purge` names,
     which the function sets with `set_config(..., true)` (`SET LOCAL`) and clears again before
