@@ -12,5 +12,14 @@
       "title": "The archive that stands up to a tax audit.",
       "subtitle": "Every document captured, checked, sealed and kept for ten years in Morocco."
     }
+  },
+  "errors": {
+    "search": {
+      "query_invalid": "This search can't be run. Check the filters and try again.",
+      "view_not_found": "This saved view no longer exists."
+    },
+    "tag": {
+      "invalid": "A tag is 1 to 50 characters long, and a document has at most 20."
+    }
   }
 }

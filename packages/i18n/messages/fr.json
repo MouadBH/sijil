@@ -12,5 +12,14 @@
       "title": "L'archive qui tient le contrôle fiscal.",
       "subtitle": "Chaque pièce captée, vérifiée, scellée et conservée dix ans au Maroc."
     }
+  },
+  "errors": {
+    "search": {
+      "query_invalid": "Cette recherche ne peut pas être lancée. Vérifiez les filtres et réessayez.",
+      "view_not_found": "Cette vue enregistrée n'existe plus."
+    },
+    "tag": {
+      "invalid": "Une étiquette compte de 1 à 50 caractères, et un document en porte 20 au plus."
+    }
   }
 }

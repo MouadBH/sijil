@@ -20,6 +20,7 @@ from sijil_cp.api import (
     removal,
     retention,
     review,
+    search,
     workspaces,
 )
 from sijil_cp.auth import csrf
@@ -28,6 +29,7 @@ from sijil_cp.db import make_engine, make_sessionmaker
 from sijil_cp.enqueue import CeleryEnqueuer
 from sijil_cp.errors import register_error_handlers
 from sijil_cp.settings import CpSettings
+from sijil_cp.timing import ServerTimingMiddleware
 
 
 def create_app(settings: CpSettings) -> FastAPI:
@@ -71,6 +73,8 @@ def create_app(settings: CpSettings) -> FastAPI:
     app.state.exports = S3ExportStore(settings)
     register_error_handlers(app)
     app.add_middleware(CsrfMiddleware)
+    # Outermost: the timing covers the CSRF check too.
+    app.add_middleware(ServerTimingMiddleware)
 
     v1 = APIRouter(prefix="/v1")
     v1.include_router(health.router)
@@ -85,6 +89,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(corrections.router)
     v1.include_router(retention.router)
     v1.include_router(removal.router)
+    v1.include_router(search.router)
     v1.include_router(exports.router)
     v1.include_router(exports.regions)
     app.include_router(v1)
