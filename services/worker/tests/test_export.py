@@ -47,6 +47,7 @@ from sijil_core.export_report import (
 )
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.pending import EXPORT_PREFIX
+from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_core.storage import ObjectRef
 from sijil_worker import tasks
 from sijil_worker.export import build_export, expire_exports, sweep_exports
@@ -586,3 +587,65 @@ async def test_a_resent_job_never_builds_twice(
     assert await _build(job, sessions, idx, memory_store, exports)  # the first message
     assert not await _build(job, sessions, idx, memory_store, exports)  # the re-send
     assert len(await _events(db, workspace)) == 2  # requested, ready
+
+
+# One period basis for search, sums and exports (fix round 1) ---------------------------------
+
+
+async def _search_period(conn: AsyncConnection, first: date, last: date) -> set[uuid.UUID]:
+    found = await conn.scalars(
+        text("SELECT ledger_id FROM search_doc WHERE basis_date BETWEEN :a AND :b"),
+        {"a": first, "b": last},
+    )
+    return set(found)
+
+
+async def test_export_and_search_agree_on_a_corrected_date(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex,
+    index_conn: AsyncConnection, tmp_path: Path,
+) -> None:  # fmt: skip
+    """Sealed with a September date, corrected to October: both the search row and the export
+    put it in October (its `basis_date`), not in September."""
+    row = await add_exportable(
+        db, memory_store, index_conn, workspace, user, state=DocumentState.sealed,
+        arrived=datetime(2026, 10, 3, 8, 0, tzinfo=UTC), values=_values(date="2026-09-30"),
+    )  # fmt: skip
+    await index.add_correction(
+        index_conn, row.id, "date", "2026-10-02", REASON, created_by=user.id, now=NOW
+    )
+    facts = SearchLedgerFacts(
+        ledger_id=row.id, state=DocumentState.sealed, ingested_at=row.ingested_at,
+        region="ma-cas", now=NOW,
+    )  # fmt: skip
+    await refresh_search_doc(index_conn, facts, "Facture SAMPLE")
+    october = await _job(db, workspace, user, "2026-10")
+    september = await _job(db, workspace, user, "2026-09")
+    assert await _build(october, sessions, idx, memory_store, exports)
+    assert await _build(september, sessions, idx, memory_store, exports)
+    exported = {r["document_id"] for r in _rows(_zip(exports, october, tmp_path))}
+    assert str(row.id) in exported
+    assert (await _fresh(db, september)).document_count == 0
+    assert row.id in await _search_period(index_conn, date(2026, 10, 1), date(2026, 10, 31))
+    assert row.id not in await _search_period(index_conn, date(2026, 9, 1), date(2026, 9, 30))
+
+
+async def test_a_document_without_a_search_row_is_exported_and_logged(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex,
+    index_conn: AsyncConnection, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    """An unindexed workspace still exports: the basis is computed the same way (the effective
+    date), and the gap is logged with a count."""
+    row = await add_exportable(
+        db, memory_store, index_conn, workspace, user, state=DocumentState.sealed,
+        arrived=datetime(2026, 10, 3, 8, 0, tzinfo=UTC), values=_values(date="2026-09-30"),
+    )  # fmt: skip
+    await index.add_correction(
+        index_conn, row.id, "date", "2026-10-02", REASON, created_by=user.id, now=NOW
+    )
+    job = await _job(db, workspace, user, "2026-10")
+    with caplog.at_level("WARNING"):
+        assert await _build(job, sessions, idx, memory_store, exports)
+    assert [r["document_id"] for r in _rows(_zip(exports, job, tmp_path))] == [str(row.id)]
+    assert "1 document(s) not in the search index" in caplog.text

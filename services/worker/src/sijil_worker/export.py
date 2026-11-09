@@ -12,8 +12,14 @@ region's Ed25519 signing seed, reaches no tenant network and has no Docker socke
    the audit chain head (the workspace's last event), in a single REPEATABLE READ transaction;
    then the fields and correction notes in one index transaction opened right after (sealed
    rows are frozen, so the index has no seal-time race left);
-3. keeps the documents whose `retention_basis` (the plausible document date, else the
-   region-local arrival date: the basis retention uses) falls in the period;
+3. keeps the documents whose period basis falls in the period: their `search_doc.basis_date`
+   (sijil_core.search_index), read in the same index transaction, so an export, a search and a
+   sum over one period count the same documents. That basis is the `retention_basis` of the
+   effective date (a correction note's date wins; else the region-local arrival date), its
+   plausibility judged when the search row was written. An export therefore expects the
+   workspace's documents indexed (`sijil-cp search backfill` after an upgrade): a live document
+   without a search row still gets its basis computed here, the same way, and the build logs
+   how many there were;
 4. streams each original from the object store into the ZIP at `originals/<id>.<ext>`, hashing
    as it goes: a hash or size that is not the ledger's fails the job (`export.hash_mismatch`)
    and audits `integrity.export_mismatch` on the document;
@@ -150,6 +156,7 @@ class _Doc:
     ledger: DocumentLedger
     fields: FieldsRow | None
     corrections: list[Correction]
+    basis: date | None = None  # `search_doc.basis_date`; None without a search row
 
     @property
     def path(self) -> str:
@@ -260,27 +267,48 @@ async def _snapshot(
     return rows, AuditHead(id=head[0], hash=head[1]) if head else AuditHead(id=None, hash=None)
 
 
-async def _fields(
+async def _docs(
     index: IndexSource, workspace: Workspace, rows: Sequence[DocumentLedger]
-) -> dict[UUID, tuple[FieldsRow | None, list[Correction]]]:
-    found: dict[UUID, tuple[FieldsRow | None, list[Correction]]] = {}
+) -> list[_Doc]:
+    """Each row's fields, correction notes and search basis, in one index transaction."""
     if not rows:
-        return found  # an empty archive needs no index connection
+        return []  # an empty archive needs no index connection
+    found: list[_Doc] = []
     engine = await index.engine(workspace)
     async with engine.connect() as conn:
         await conn.execution_options(isolation_level="REPEATABLE READ")
         async with conn.begin():
+            bases: dict[UUID, date] = dict(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT ledger_id, basis_date FROM search_doc "
+                            "WHERE ledger_id = ANY(:ids)"
+                        ),
+                        {"ids": [row.id for row in rows]},
+                    )
+                ).all()
+            )
             for row in rows:
                 fields = await index_db.read_fields(conn, row.id)
                 notes = await index_db.read_corrections(conn, row.id) if fields else []
-                found[row.id] = (fields, notes)
+                found.append(_Doc(row, fields, notes, bases.get(row.id)))
     return found
 
 
+def _basis(doc: _Doc, region: str, now: datetime) -> date:
+    """The search row's basis, else the same computation `upsert_search_doc` makes."""
+    if doc.basis is not None:
+        return doc.basis
+    effective = (
+        index_db.effective_fields(doc.fields, doc.corrections) if doc.fields is not None else {}
+    )
+    dated = effective.get("date", (None, False))[0]
+    return retention_basis(dated, doc.ledger.ingested_at, region, now)
+
+
 def _in_period(doc: _Doc, region: str, now: datetime, bounds: tuple[date, date]) -> bool:
-    dated = doc.fields.values.get("date") if doc.fields is not None else None
-    basis = retention_basis(dated, doc.ledger.ingested_at, region, now)
-    return bounds[0] <= basis <= bounds[1]
+    return bounds[0] <= _basis(doc, region, now) <= bounds[1]
 
 
 async def _write_original(zf: zipfile.ZipFile, doc: _Doc, originals: OriginalReader) -> None:
@@ -352,8 +380,15 @@ async def _build(
     job, workspace, region = claimed
     bounds = period_bounds(job.period)
     rows, head = await _snapshot(sessions, workspace.id)
-    fields = await _fields(index, workspace, rows)
-    docs = [d for row in rows if _in_period(d := _Doc(row, *fields[row.id]), region, now, bounds)]
+    every = await _docs(index, workspace, rows)
+    unindexed = sum(1 for d in every if d.basis is None)
+    if unindexed:
+        log.warning(
+            "export %s: %d document(s) not in the search index, their period basis computed now",
+            job_id,
+            unindexed,
+        )
+    docs = [d for d in every if _in_period(d, region, now, bounds)]
     key = f"{workspace.id}/{job.id}.zip"
     with tempfile.TemporaryDirectory(prefix="sijil-export-") as tmp:
         path = Path(tmp) / "export.zip"
