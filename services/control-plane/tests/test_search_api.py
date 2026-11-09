@@ -149,6 +149,9 @@ async def test_search_refuses_bad_bodies(member: Actor, ws: Workspace) -> None:
         {"sort": "name"},
         {"limit": 101},
         {"cursor": "garbage"},
+        {"cursor": "W" * 100_000},
+        # base64 of ["date_desc","2026-01-01",1]: a non-string id (review, Important 1).
+        {"cursor": "WyJkYXRlX2Rlc2MiLCIyMDI2LTAxLTAxIiwxXQ"},
     ):
         r = await member.client.post(_search_url(ws), json=body)
         assert (r.status_code, _code(r)) == (422, "search.query_invalid"), body

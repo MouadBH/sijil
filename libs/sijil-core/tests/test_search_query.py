@@ -4,6 +4,8 @@ Each test gets its own empty index database: `search_doc` rows cannot be deleted
 one would let another test's rows into the results.
 """
 
+import base64
+import json
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, date, datetime
@@ -17,7 +19,12 @@ from sijil_core import index
 from sijil_core.db.models import DocumentState
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import FieldsRow
-from sijil_core.search_index import SearchLedgerFacts, mark_search_state, upsert_search_doc
+from sijil_core.search_index import (
+    SearchLedgerFacts,
+    mark_search_state,
+    set_tags,
+    upsert_search_doc,
+)
 from sijil_core.search_query import QueryInvalid, SearchFilters, filter_names, run_search
 from tests.support.index_db import throwaway_index_db
 
@@ -211,3 +218,44 @@ def test_filters_reject_unknown_and_long_queries() -> None:
         "q,amount_min,tags"
     )
     assert filter_names(SearchFilters(q=" ", tags=[])) == ""
+
+
+def _crafted(value: object) -> str:
+    return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+
+async def test_crafted_cursors_are_query_invalid(conn: AsyncConnection) -> None:
+    """Whatever a client sends as a cursor answers `search.query_invalid`, never a 500."""
+    ledger = str(uuid.uuid4())
+    crafted = {
+        "a non-string id": _crafted({"s": "date_desc", "k": "2026-01-01", "id": 1}),
+        "an id list": _crafted({"s": "date_desc", "k": "2026-01-01", "id": [ledger]}),
+        "the old list shape": _crafted(["date_desc", "2026-01-01", 1]),
+        "nested JSON": _crafted({"s": {"s": "date_desc"}, "k": "2026-01-01", "id": ledger}),
+        "deeply nested JSON": base64.urlsafe_b64encode(b"[" * 300 + b"]" * 300).decode(),
+        "an oversized cursor": "W" * 100_000,
+        "a wrong sort": _crafted({"s": "amount_asc", "k": "10.00", "id": ledger}),
+        "an extra key": _crafted({"s": "date_desc", "k": "2026-01-01", "id": ledger, "x": 1}),
+        "a non-numeric amount": _crafted({"s": "amount_desc", "k": "abc", "id": ledger}),
+        "a numeric amount": _crafted({"s": "amount_desc", "k": 10, "id": ledger}),
+        "an infinite amount": _crafted({"s": "amount_desc", "k": "Infinity", "id": ledger}),
+        "a NaN rank": _crafted({"s": "relevance", "k": "NaN", "id": ledger}),
+        "a date that is not one": _crafted({"s": "date_desc", "k": "2026-13-01", "id": ledger}),
+        "not base64": "%%%",
+    }
+    for name, cursor in crafted.items():
+        sort = "relevance" if "rank" in name else "amount_desc" if "amount" in name else "date_desc"
+        filters = SearchFilters(q="facture" if sort == "relevance" else None)
+        try:
+            await run_search(conn, filters, sort, cursor, 3)
+        except QueryInvalid:
+            continue
+        pytest.fail(f"{name}: accepted")
+
+
+async def test_tag_filter_is_normalised_like_stored_tags(conn: AsyncConnection) -> None:
+    doc = await _doc(conn)
+    await _doc(conn)
+    await set_tags(conn, doc, ["urgent"], by=uuid.uuid4(), now=NOW)
+    assert await _ids(conn, tags=["Urgent"]) == {doc}
+    assert await _ids(conn, tags=["  URGENT "]) == {doc}

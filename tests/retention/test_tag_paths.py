@@ -6,6 +6,7 @@ sealed `document_fields` row or its `fields_sha256`, it changes `search_doc.tags
 index transaction (both or neither), and `index.purge_document` still deletes the tags left.
 """
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
@@ -137,3 +138,26 @@ async def test_tags_of_a_terminal_row_stay_out_of_search_doc(engine: AsyncEngine
             text("SELECT state FROM search_doc WHERE ledger_id = :id"), {"id": ledger_id}
         )
     assert state == "deleting"
+
+
+async def test_concurrent_tag_writes_leave_the_last_writers_set(engine: AsyncEngine) -> None:
+    """Two writers with disjoint sets: the second, blocked until the first commits, sees its
+    rows and replaces them, so `document_tag` and `search_doc.tags` both end as its set (the
+    ledger's FOR SHARE lets both through; the per-document advisory lock serialises them)."""
+    ledger_id = await _sealed(engine)
+    async with engine.connect() as first, engine.connect() as second:
+        await first.begin()
+        await set_tags(first, ledger_id, ["alpha", "beta"], by=uuid.uuid4(), now=NOW)
+
+        async def later() -> None:
+            await second.begin()
+            await set_tags(second, ledger_id, ["gamma"], by=uuid.uuid4(), now=NOW)
+            await second.commit()
+
+        writer = asyncio.create_task(later())
+        await asyncio.sleep(0.3)
+        assert not writer.done(), "the second writer must wait for the first"
+        await first.commit()
+        await asyncio.wait_for(writer, 10)
+    async with engine.connect() as conn:
+        assert await _tags(conn, ledger_id) == (["gamma"], ["gamma"])

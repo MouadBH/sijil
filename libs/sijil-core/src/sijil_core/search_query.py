@@ -62,12 +62,15 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.sql.elements import ColumnElement
 
+from sijil_core.search_index import normalise_tag
 from sijil_core.text import search_normalise
 
 QUERY_INVALID: Final = "search.query_invalid"
 MAX_QUERY: Final = 200
 MAX_LIMIT: Final = 100
 SNIPPET_MAX: Final = 200
+# A cursor is ~120 characters; anything longer is not one this module made.
+MAX_CURSOR: Final = 512
 # Tags and document types a filter may list (a document has at most 20 tags).
 MAX_LIST: Final = 20
 
@@ -103,7 +106,7 @@ class SearchFilters(BaseModel):
     # Inclusive, on `total_ttc`.
     amount_min: Decimal | None = None
     amount_max: Decimal | None = None
-    # Every one of them.
+    # Every one of them, normalised as stored (`search_index.normalise_tag`).
     tags: Annotated[list[str], Field(max_length=MAX_LIST)] = []
     status: list[LiveState] = []
 
@@ -200,28 +203,42 @@ def _effective(sort: str, words: _Text) -> str:
 
 
 def _encode(sort: str, key: Any, ledger_id: UUID) -> str:
-    raw = json.dumps([sort, None if key is None else str(key), str(ledger_id)])
+    raw = json.dumps({"s": sort, "k": None if key is None else str(key), "id": str(ledger_id)})
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
+def _key(sort: str, key: str) -> Any:
+    """The sort key a cursor carries as text, typed for its sort (finite numbers only)."""
+    if sort.startswith("date"):
+        return date.fromisoformat(key)
+    number = Decimal(key)
+    if not number.is_finite():
+        raise ValueError("not finite")
+    return number if sort.startswith("amount") else float(number)
+
+
 def _decode(cursor: str, sort: str) -> tuple[Any, UUID]:
+    """A cursor `_encode` made for `sort`, strictly: at most MAX_CURSOR characters, a flat JSON
+    object with exactly `s`, `k` and `id`, each a string (`k` null only for an amount sort).
+    Anything else raises QueryInvalid, never another error."""
+    if len(cursor) > MAX_CURSOR:
+        raise QueryInvalid(QUERY_INVALID)
     try:
-        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        kind, key, ledger_id = json.loads(raw)
-        if kind != sort or (key is None and not sort.startswith("amount")):
+        decoded = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        if not isinstance(decoded, dict) or decoded.keys() != {"s", "k", "id"}:
+            raise ValueError("shape")
+        kind, key, ledger_id = decoded["s"], decoded["k"], decoded["id"]
+        if not (isinstance(kind, str) and isinstance(ledger_id, str)) or kind != sort:
             raise ValueError("another sort")
-        parsed: Any = None
-        if key is not None:
-            if sort.startswith("date"):
-                parsed = date.fromisoformat(key)
-            elif sort.startswith("amount"):
-                parsed = Decimal(key)
-                if not parsed.is_finite():
-                    raise ValueError("amount")
-            else:
-                parsed = float(key)
-        return parsed, UUID(ledger_id)
-    except (binascii.Error, ValueError, TypeError, InvalidOperation, UnicodeDecodeError):
+        if key is None:
+            if not sort.startswith("amount"):
+                raise ValueError("no key")
+            return None, UUID(ledger_id)
+        if not isinstance(key, str):
+            raise ValueError("key")
+        return _key(sort, key), UUID(ledger_id)
+    except (binascii.Error, ValueError, InvalidOperation, RecursionError):
+        # UnicodeDecodeError and JSONDecodeError are ValueErrors.
         raise QueryInvalid(QUERY_INVALID) from None
 
 
@@ -278,7 +295,8 @@ def build_search(filters: SearchFilters, sort: str, cursor: str | None, limit: i
     if filters.amount_max is not None:
         where.append(_d.total_ttc <= filters.amount_max)
     if filters.tags:
-        where.append(_d.tags.contains(cast(literal(list(filters.tags), ARRAY(Text)), ARRAY(Text))))
+        tags = sorted({normalise_tag(tag) for tag in filters.tags})
+        where.append(_d.tags.contains(cast(literal(tags, ARRAY(Text)), ARRAY(Text))))
 
     key: ColumnElement[Any] = {
         "relevance": rank,

@@ -168,13 +168,18 @@ async def mark_search_state(conn: AsyncConnection, ledger_id: UUID, state: str) 
     )
 
 
+def normalise_tag(tag: str) -> str:
+    """A tag as stored and as matched: NFKC, trimmed, casefolded."""
+    return unicodedata.normalize("NFKC", tag).strip().casefold()
+
+
 def clean_tags(raw: Sequence[str]) -> list[str]:
     """The tags as stored: NFKC, trimmed, casefolded, deduplicated and sorted. Raises ValueError
     (`tag.invalid`) for one outside 1-50 characters or with a control character, or for more
     than 20."""
     tags = set()
     for tag in raw:
-        clean = unicodedata.normalize("NFKC", tag).strip().casefold()
+        clean = normalise_tag(tag)
         if not 1 <= len(clean) <= MAX_TAG_CHARS:
             raise ValueError(TAG_INVALID)
         if any(unicodedata.category(c).startswith("C") for c in clean):
@@ -191,8 +196,13 @@ async def set_tags(
     """Replaces the document's tags (`clean_tags` output) in `document_tag` and in its search
     row, in the caller's transaction. A tag is an annotation: removing one is a plain DELETE
     (index schema v4), and nothing else of the document changes. A row in a terminal state is
-    left as it is (its tags go with the purge)."""
+    left as it is (its tags go with the purge).
+
+    Writers of one document are serialised by a transaction-level advisory lock taken first:
+    the ledger's FOR SHARE lets two of them through, and the second's DELETE would otherwise not
+    see the first's rows, leaving `document_tag` the union of both sets."""
     params = {"id": ledger_id, "tags": sorted(tags), "by": by, "now": now}
+    await conn.execute(text("SELECT pg_advisory_xact_lock(hashtext(:id))"), {"id": str(ledger_id)})
     await conn.execute(
         text(
             "DELETE FROM document_tag WHERE ledger_id = :id AND tag <> ALL (CAST(:tags AS text[]))"

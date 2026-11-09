@@ -32,6 +32,7 @@ from sijil_core import audit
 from sijil_core.db.models import TERMINAL_STATES, ActorType, DocumentLedger, Role, Workspace
 from sijil_core.search_index import TAG_INVALID, clean_tags, set_tags
 from sijil_core.search_query import (
+    MAX_CURSOR,
     MAX_LIMIT,
     QUERY_INVALID,
     QueryInvalid,
@@ -74,7 +75,7 @@ class SearchIn(BaseModel):
 
     filters: SearchFilters = Field(default_factory=SearchFilters)
     sort: Sort = "relevance"
-    cursor: str | None = None
+    cursor: Annotated[str, Field(max_length=MAX_CURSOR)] | None = None
     limit: int = Field(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT)
 
 
