@@ -178,10 +178,12 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         "CREATE EXTENSION IF NOT EXISTS pg_trgm",
         "CREATE EXTENSION IF NOT EXISTS unaccent",
         "CREATE EXTENSION IF NOT EXISTS vector",
-        # Mirrors sijil_core.text.search_normalise (the tests check they agree): NFKC, bidi
-        # controls dropped, horizontal space collapsed, lower case, NFKD with the Latin and
-        # Arabic combining marks dropped, tatweel dropped, alef/yeh/teh marbuta and digits
-        # folded. `ß` is the one casefold that `lower` does not do.
+        # Mirrors sijil_core.text.search_normalise (the tests check they agree), for the invoice
+        # number in `tsv`; the supplier name and the text are normalised in Python into
+        # `supplier_norm` and `content_norm`. NFKC, bidi controls dropped, horizontal space
+        # collapsed, lower case, NFKD with the Latin and Arabic combining marks dropped, tatweel
+        # dropped, alef/yeh/teh marbuta and digits folded. `ß` is the one casefold that `lower`
+        # does not do. `unaccent` is not used: this folding replaces it.
         r"""CREATE FUNCTION search_normalise(s text) RETURNS text
     LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
         SELECT translate(
@@ -193,7 +195,7 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
                     NFKD),
                 '[\u0300-\u036f\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e4'
                 '\u06e7\u06e8\u06ea-\u06ed]', '', 'g'),
-            'أإآٱىة٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹ـ',
+            'أإآٱىة٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹' || U&'\0640',
             'اااايه01234567890123456789')
     $$""",
         """CREATE TABLE search_doc (
@@ -212,17 +214,19 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         corrected text[] NOT NULL DEFAULT '{}',
         tags text[] NOT NULL DEFAULT '{}',
         content text NOT NULL DEFAULT '',
+        supplier_norm text NOT NULL DEFAULT '',
+        content_norm text NOT NULL DEFAULT '',
         tsv tsvector GENERATED ALWAYS AS (
-            setweight(to_tsvector('simple', search_normalise(coalesce(supplier_name, ''))), 'A')
+            setweight(to_tsvector('simple', supplier_norm), 'A')
             || setweight(to_tsvector('simple', search_normalise(coalesce(number, ''))), 'A')
-            || setweight(to_tsvector('simple', search_normalise(content)), 'C')
+            || setweight(to_tsvector('simple', content_norm), 'C')
         ) STORED,
         updated_at timestamptz NOT NULL
     )""",
         "CREATE INDEX search_doc_tsv ON search_doc USING gin (tsv)",
         "CREATE INDEX search_doc_supplier_trgm ON search_doc "
-        "USING gin (supplier_name gin_trgm_ops)",
-        "CREATE INDEX search_doc_content_trgm ON search_doc USING gin (content gin_trgm_ops)",
+        "USING gin (supplier_norm gin_trgm_ops)",
+        "CREATE INDEX search_doc_content_trgm ON search_doc USING gin (content_norm gin_trgm_ops)",
         "CREATE INDEX search_doc_basis ON search_doc (basis_date, ledger_id)",
         "CREATE INDEX search_doc_ttc ON search_doc (total_ttc, ledger_id)",
         "CREATE INDEX search_doc_state ON search_doc (state)",

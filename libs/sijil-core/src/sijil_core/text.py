@@ -3,10 +3,10 @@
 import re
 import unicodedata
 
-_BIDI_CONTROLS = re.compile("[‎‏؜‪-‮⁦-⁩]")
-_HSPACE = re.compile("[ \t   ]+")
+_BIDI_CONTROLS = re.compile("[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]")
+_HSPACE = re.compile("[ \t\u00a0\u202f\u2009]+")
 # Arabic tatweel and harakat (fathatan .. sukun); the harakat are combining marks too.
-_ARABIC_MARKS = re.compile("[ـً-ْ]")
+_ARABIC_MARKS = re.compile("[\u0640\u064b-\u0652]")
 _SEARCH_MAP = str.maketrans(
     "أإآٱىة٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹",
     "اااايه01234567890123456789",

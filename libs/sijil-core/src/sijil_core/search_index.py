@@ -3,9 +3,14 @@
 Full-text search runs in the workspace's index database, never in Paperless. A row holds the
 document's ledger state, its retention basis date, its effective field values (a correction
 note's value wins over the sealed one, `index.effective_fields`), its tags (denormalised from
-`document_tag`) and its OCR text; `tsv` is generated from the `search_normalise`d supplier
-name and number (weight A) and text (weight C), so queries normalised by
-`sijil_core.text.search_normalise` match whatever the hamza, tatweel, harakat, accents or digits.
+`document_tag`) and its OCR text. The supplier name and the text are also stored normalised
+by `sijil_core.text.search_normalise` (`supplier_norm`, `content_norm`), and the trigram
+indexes and `tsv` (supplier and number weight A, text weight C) are built on them, so queries
+normalised by the same function match whatever the hamza, tatweel, harakat, accents or digits.
+
+`basis_date` is the period basis search, sums and exports share: the retention basis of the
+effective date (a correction note's date wins), its plausibility judged when the row is
+written.
 
 Every change a row reflects writes it in the same index transaction as the change (field edit,
 seal, correction), or right after its commit when the change lives in the control-plane
@@ -28,6 +33,7 @@ from sijil_core import index
 from sijil_core.db.models import TERMINAL_STATES
 from sijil_core.index import Correction, FieldsRow
 from sijil_core.retention import retention_basis
+from sijil_core.text import search_normalise
 
 # Beyond this the OCR text is cut: a page of text is a few thousand characters, and a tsvector
 # has a 1 MB ceiling that must never fail a routing or a seal.
@@ -63,13 +69,14 @@ _UPSERT: Final = text(
     """
     INSERT INTO search_doc (ledger_id, state, ingested_at, basis_date, document_type,
         supplier_name, supplier_ice, number, total_ht, vat, total_ttc, currency, corrected,
-        tags, content, updated_at)
+        tags, content, supplier_norm, content_norm, updated_at)
     VALUES (:ledger_id, :state, :ingested_at, :basis_date, :document_type, :supplier_name,
         :supplier_ice, :number, :total_ht, :vat, :total_ttc, :currency,
         CAST(:corrected AS text[]),
         COALESCE((SELECT array_agg(tag ORDER BY tag) FROM document_tag
                   WHERE ledger_id = :ledger_id), '{}'),
-        COALESCE(CAST(:content AS text), ''), :now)
+        COALESCE(CAST(:content AS text), ''), :supplier_norm,
+        COALESCE(CAST(:content_norm AS text), ''), :now)
     ON CONFLICT (ledger_id) DO UPDATE SET
         state = EXCLUDED.state, ingested_at = EXCLUDED.ingested_at,
         basis_date = EXCLUDED.basis_date, document_type = EXCLUDED.document_type,
@@ -78,6 +85,8 @@ _UPSERT: Final = text(
         total_ttc = EXCLUDED.total_ttc, currency = EXCLUDED.currency,
         corrected = EXCLUDED.corrected, tags = EXCLUDED.tags,
         content = COALESCE(CAST(:content AS text), search_doc.content),
+        supplier_norm = EXCLUDED.supplier_norm,
+        content_norm = COALESCE(CAST(:content_norm AS text), search_doc.content_norm),
         updated_at = EXCLUDED.updated_at
     WHERE search_doc.state <> ALL (CAST(:terminal AS text[]))
     """
@@ -100,6 +109,8 @@ async def upsert_search_doc(
     row = fields or FieldsRow(ledger_id=ledger.ledger_id, updated_at=ledger.now)
     effective = index.effective_fields(row, corrections)
 
+    kept = None if content is None else content[:MAX_CONTENT_CHARS]
+
     def value(name: str) -> str | None:
         return effective.get(name, (None, False))[0]
 
@@ -121,7 +132,9 @@ async def upsert_search_doc(
             "total_ttc": _amount(value("total_ttc")),
             "currency": value("currency"),
             "corrected": sorted(name for name, (_, fixed) in effective.items() if fixed),
-            "content": None if content is None else content[:MAX_CONTENT_CHARS],
+            "content": kept,
+            "supplier_norm": search_normalise(value("supplier_name") or ""),
+            "content_norm": None if kept is None else search_normalise(kept),
             "now": ledger.now,
             "terminal": list(_TERMINAL),
         },
@@ -149,7 +162,15 @@ async def mark_search_state(conn: AsyncConnection, ledger_id: UUID, state: str) 
     )
 
 
-async def search_states(conn: AsyncConnection) -> dict[UUID, str]:
-    """Every row's state, by ledger id (the resync compares them with the ledger)."""
-    result = await conn.execute(text("SELECT ledger_id, state FROM search_doc"))
-    return {ledger_id: state for ledger_id, state in result}
+@dataclass(frozen=True)
+class IndexedState:
+    """What the resync compares with the ledger: the row's state, and whether it has no text."""
+
+    state: str
+    empty: bool
+
+
+async def search_states(conn: AsyncConnection) -> dict[UUID, IndexedState]:
+    """Every row's state and whether its text is empty, by ledger id."""
+    result = await conn.execute(text("SELECT ledger_id, state, content = '' FROM search_doc"))
+    return {ledger_id: IndexedState(state, empty) for ledger_id, state, empty in result}

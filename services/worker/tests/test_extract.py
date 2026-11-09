@@ -1816,7 +1816,7 @@ async def test_extraction_writes_content_and_state(
     """After routing, the search row holds the routed state, the fields and the whole
     normalised Paperless text (not only what the model was given)."""
     ledger = await make_ledger(db, ready)
-    content = "‫ﻓﺎﺗﻮﺭﺓ‬ " + CONTENT_01 + "y" * 13_000
+    content = "\u202bﻓﺎﺗﻮﺭﺓ\u202c " + CONTENT_01 + "y" * 13_000
     with respx.mock(assert_all_called=False) as router:
         mock_paperless(router, content=content)
         await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))

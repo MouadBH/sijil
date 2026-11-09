@@ -43,7 +43,7 @@ VALUES: dict[str, str | None] = dict.fromkeys(FIELD_NAMES) | {
     "total_ttc": "1500.00",
     "currency": "MAD",
 }
-CONTENT = "SAMPLE فـاتورة رقم ٢٠٢٦ — شركة أطلس للاتصالات\nFacture Télécom"
+CONTENT = "SAMPLE ف\u0640اتورة رقم ٢٠٢٦ — شركة أطلس للاتصالات\nFacture Télécom"
 
 
 @pytest.fixture(scope="module")
@@ -132,9 +132,9 @@ async def test_v2_database_upgrades_to_v3(
     [
         "Atlas Télécom SAMPLE SARL",
         "ÉCHANTILLON — Façade, Œuvre & Garçon, Straße",
-        "فـــاتورة رقم ٢٠٢٦ / ۲۰۲۶",
-        "فَاتُورَةٌ أحمد إسماعيل آمنة ٱلدار مصطفى",
-        "ﻓﺎﺗﻮﺭﺓ  ‏F-2026-01001\tTotal TTC 1 500,00 MAD",
+        "ف\u0640\u0640\u0640اتورة رقم ٢٠٢٦ / ۲۰۲۶",
+        "ف\u064eات\u064fور\u064eة\u064c أحمد إسماعيل آمنة ٱلدار مصطفى",
+        "ﻓﺎﺗﻮﺭﺓ\u00a0\u00a0\u200fF-2026-01001\tTotal TTC 1 500,00 MAD",
         "شركة أطلس للاتصالات ش.م.م — ICE 001905837000041",
     ],
 )
@@ -276,3 +276,55 @@ async def test_tsv_matches_queries_normalised_the_same_way(
         {"q": search_normalise(query), "id": ledger_id},
     )
     assert hit is True
+
+
+async def test_normalised_columns_are_written_by_python(conn: AsyncConnection) -> None:
+    ledger_id = uuid.uuid4()
+    await upsert_search_doc(conn, _facts(ledger_id), _fields(ledger_id), [], CONTENT)
+    row = await _row(conn, ledger_id)
+    assert row["supplier_norm"] == search_normalise(str(VALUES["supplier_name"]))
+    assert row["content_norm"] == search_normalise(CONTENT)
+    # `content` None keeps both the text and its normalised form.
+    await upsert_search_doc(conn, _facts(ledger_id), _fields(ledger_id), [], None)
+    row = await _row(conn, ledger_id)
+    assert (row["content"], row["content_norm"]) == (CONTENT, search_normalise(CONTENT))
+
+
+@pytest.mark.parametrize(
+    ("column", "operator", "query"),
+    [
+        ("supplier_norm", "%", "atlas telecom sample sarl"),  # no accents, lower case
+        ("supplier_norm", "%", "ATLAS TÉLÉCOM SAMPLE"),
+        ("content_norm", "<%", "فاتوره"),  # teh marbuta written as heh
+        ("content_norm", "<%", "اطلس"),  # alef without hamza
+        ("content_norm", "<%", "telecom"),
+    ],
+)
+async def test_trigram_path_matches_normalised_queries(
+    conn: AsyncConnection, column: str, operator: str, query: str
+) -> None:
+    """The trigram indexes are on the normalised columns, so a query normalised the same way
+    finds accented and Arabic-variant text through them (an index scan, not a table scan)."""
+    ledger_id = uuid.uuid4()
+    await upsert_search_doc(conn, _facts(ledger_id), _fields(ledger_id), [], CONTENT)
+    q = search_normalise(query)
+    if operator == "%":
+        condition = f"{column} % :q"
+    else:
+        condition = f":q <% {column}"
+    hit = await conn.scalar(
+        text(f"SELECT count(*) FROM search_doc WHERE ledger_id = :id AND {condition}"),  # noqa: S608
+        {"q": q, "id": ledger_id},
+    )
+    assert hit == 1
+    await conn.execute(text("SET enable_seqscan = off"))
+    try:
+        plan = "\n".join(
+            await conn.scalars(
+                text(f"EXPLAIN SELECT ledger_id FROM search_doc WHERE {condition}"),  # noqa: S608
+                {"q": q},
+            )
+        )
+    finally:
+        await conn.execute(text("RESET enable_seqscan"))
+    assert f"search_doc_{column.removesuffix('_norm')}_trgm" in plan
