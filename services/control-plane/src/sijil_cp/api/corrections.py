@@ -7,7 +7,8 @@ stay as they were; exports use `index.effective_fields` and flag the corrected v
 
 Like a field edit, it holds the ledger lock, commits its audit event first and writes the index
 after: an applied note always has its event, and an index failure answers 503
-`field.update_failed`.
+`field.update_failed`. The note and the search row's effective values (`search_doc`) are written
+in one index transaction, so search shows the corrected value as soon as the request answers.
 """
 
 import logging
@@ -20,6 +21,7 @@ from pydantic import BaseModel, ConfigDict
 from sijil_core import audit
 from sijil_core import index as index_db
 from sijil_core.db.models import TERMINAL_STATES, ActorType
+from sijil_core.search_index import refresh_search_doc
 from sijil_cp.api.review import (
     NOT_REVIEWABLE,
     UPDATE_FAILED,
@@ -32,6 +34,7 @@ from sijil_cp.api.review import (
     _ip,
     _locked_ledger,
     _parsed,
+    _search_facts,
 )
 from sijil_cp.deps import require_totp_compliance
 from sijil_cp.errors import ApiError
@@ -97,6 +100,7 @@ async def add_correction(
             note = await index_db.add_correction(
                 conn, ledger.id, body.field, value, reason, created_by=user.id, now=now
             )
+            await refresh_search_doc(conn, _search_facts(request, ledger, ledger.state, now))
     except Exception as exc:
         # A logged correction that did not apply: acceptable, and said so.
         log.warning("correction of document %s not applied: %s", doc_id, type(exc).__name__)

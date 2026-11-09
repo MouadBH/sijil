@@ -13,7 +13,8 @@ sijil_cp.api.review):
 3. the row becomes the tombstone (`state = removed`, `removed_at`, `removed_by`,
    `removal_reason`; the hash and the object reference never change) and `document.removed`
    `{reason_length}` is audited (never the reason's text).
-After the commit `remove:pending:<id>` is claimed and `sijil.remove_original` sent to the
+After the commit the document's search row is marked `removed` (sijil_cp.removals), then
+`remove:pending:<id>` is claimed and `sijil.remove_original` sent to the
 removal worker, which deletes the original and then has the main worker purge the Paperless
 copy and the index rows. A lost message is re-sent by the `requeue_unremoved` sweep.
 
@@ -63,6 +64,7 @@ from sijil_cp.removals import (
     STEP_UP_MINUTES,
     audit_refusal,
     client_ip,
+    mark_search,
     parse_body,
     send_removal,
 )
@@ -199,5 +201,6 @@ async def remove_document(
         now=now,
     )
     await db.commit()
+    await mark_search(request, workspace, [doc_id], DocumentState.removed)
     await send_removal(request, doc_id, ws_id)
     return RemovalOut(id=doc_id, state=DocumentState.removed)

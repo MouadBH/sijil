@@ -18,6 +18,8 @@ LOCK_TASK = ("sijil.lock_sealed", "seal")
 REMOVE_TASK = ("sijil.remove_original", "removal")
 # The export worker: the only holder of the export key and the region's signing seed.
 EXPORT_TASK = ("sijil.build_export", "export")
+# The main worker: it holds the index database settings and the tenants' service tokens.
+SEARCH_BACKFILL_TASK = ("sijil.search_backfill", "default")
 
 
 class Enqueuer(Protocol):
@@ -41,6 +43,10 @@ class Enqueuer(Protocol):
 
     def send_export(self, job_id: UUID) -> None:
         """Build a period export (export worker, queue `export`)."""
+        ...
+
+    def send_search_backfill(self, workspace_id: UUID) -> None:
+        """Rebuild a workspace's search rows (worker, queue `default`)."""
         ...
 
 
@@ -73,6 +79,10 @@ class CeleryEnqueuer:
     def send_export(self, job_id: UUID) -> None:
         name, queue = EXPORT_TASK
         self._app.send_task(name, kwargs={"job_id": str(job_id)}, queue=queue)
+
+    def send_search_backfill(self, workspace_id: UUID) -> None:
+        name, queue = SEARCH_BACKFILL_TASK
+        self._app.send_task(name, kwargs={"workspace_id": str(workspace_id)}, queue=queue)
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task

@@ -132,6 +132,7 @@ class RecordingEnqueuer:
         self.locks: list[tuple[UUID, UUID]] = []
         self.removals: list[tuple[UUID, UUID]] = []
         self.exports: list[UUID] = []
+        self.backfills: list[UUID] = []
 
     def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None:
         self.calls.append((kind, job_id, workspace_id))
@@ -150,6 +151,9 @@ class RecordingEnqueuer:
 
     def send_export(self, job_id: UUID) -> None:
         self.exports.append(job_id)
+
+    def send_search_backfill(self, workspace_id: UUID) -> None:
+        self.backfills.append(workspace_id)
 
 
 @pytest.fixture

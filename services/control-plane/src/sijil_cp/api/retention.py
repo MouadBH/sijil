@@ -13,8 +13,9 @@ locked FOR UPDATE in id order and, if any is not eligible (retention not over, t
 already, another workspace's or unknown), 409 `retention.not_eligible` names the offending
 `ids` and nothing changes. Otherwise, in one transaction, each row goes to `deleting` with
 `deletion_approved_at` and `deletion_approved_by` and is audited `document.deletion_approved`,
-then `retention.deletion_batch` `{count}`; after the commit `sijil.remove_original` is sent for
-each (sijil_cp.removals). The removal worker deletes an original only once its lock is over.
+then `retention.deletion_batch` `{count}`; after the commit their search rows are marked
+`deleting` and `sijil.remove_original` is sent for each (sijil_cp.removals). The removal worker
+deletes an original only once its lock is over.
 
 Every refusal of an approval to a signed-in member is audited `document.removal_refused`
 `{code}` (sijil_cp.removals): one per offending id for `retention.not_eligible`, else one with
@@ -67,6 +68,7 @@ from sijil_cp.removals import (
     STEP_UP_MINUTES,
     audit_refusal,
     client_ip,
+    mark_search,
     parse_body,
     send_removal,
 )
@@ -385,6 +387,7 @@ async def approve_deletion(
         now=now,
     )
     await db.commit()
+    await mark_search(request, workspace, ids, DocumentState.deleting)
     for ledger_id in ids:
         await send_removal(request, ledger_id, ws_id)
     return ApproveOut(approved=len(ids))

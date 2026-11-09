@@ -1,5 +1,6 @@
 """`sijil-cp` console entry: `serve` runs the API, `bootstrap-storage` prepares the object store,
-`audit verify` recomputes a workspace's audit chain and `export verify` checks an export ZIP."""
+`audit verify` recomputes a workspace's audit chain, `export verify` checks an export ZIP and
+`search backfill` has the worker rebuild a workspace's search index."""
 
 import argparse
 import asyncio
@@ -27,6 +28,7 @@ from sijil_cp.storage_admin import (
 )
 
 if TYPE_CHECKING:
+    from sijil_cp.enqueue import Enqueuer
     from sijil_cp.settings import CpSettings
 
 _BOOTSTRAP_ATTEMPTS = 30
@@ -110,6 +112,60 @@ def audit_verify(workspace_id: UUID, settings: "CpSettings | None" = None) -> in
         return 2
     print(f"ok {result.count}" if result.ok else f"broken at seq {result.first_bad_seq}")  # noqa: T201
     return 0 if result.ok else 1
+
+
+def search_backfill(
+    workspace_id: UUID,
+    settings: "CpSettings | None" = None,
+    enqueuer: "Enqueuer | None" = None,
+) -> int:
+    """Send `sijil.search_backfill` for a workspace of this region, which rebuilds its every
+    live search row (sijil_worker.search). Exit code 0 when sent, 2 for an unknown workspace,
+    one of another region, or a database or broker that cannot be reached."""
+    from sqlalchemy import select
+
+    from sijil_core.db.models import Organisation, Workspace
+    from sijil_core.region import RegionMismatch, assert_region
+    from sijil_cp.db import make_engine, make_sessionmaker
+    from sijil_cp.enqueue import CeleryEnqueuer
+    from sijil_cp.settings import CpSettings
+
+    cp = settings or CpSettings()
+
+    async def _region() -> str | None:
+        engine = make_engine(cp)
+        try:
+            async with make_sessionmaker(engine)() as db:
+                found: str | None = await db.scalar(
+                    select(Organisation.region)
+                    .join(Workspace, Workspace.org_id == Organisation.id)
+                    .where(Workspace.id == workspace_id)
+                )
+                return found
+        finally:
+            await engine.dispose()
+
+    try:
+        region = asyncio.run(_region())
+    except Exception as exc:
+        # The type only: messages can carry the connection string.
+        print(f"database error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    if region is None:
+        print("unknown workspace", file=sys.stderr)  # noqa: T201
+        return 2
+    try:
+        assert_region(region, cp)
+    except RegionMismatch:
+        print(f"workspace is in region {region}, not this one", file=sys.stderr)  # noqa: T201
+        return 2
+    try:
+        (enqueuer or CeleryEnqueuer(str(cp.redis_url))).send_search_backfill(workspace_id)
+    except Exception as exc:
+        print(f"broker error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    print(f"queued {workspace_id}")  # noqa: T201
+    return 0
 
 
 async def _ledger_problems(report: dict[str, Any], database_url: str) -> list[str]:
@@ -212,9 +268,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     check.add_argument(
         "--against-ledger", action="store_true", help="compare each document with the ledger"
     )
+    search_parser = sub.add_parser("search", help="search index tools")
+    search_sub = search_parser.add_subparsers(dest="search_command", required=True)
+    backfill = search_sub.add_parser("backfill", help="rebuild a workspace's search index")
+    backfill.add_argument("workspace", type=UUID)
     args = parser.parse_args(argv)
     if args.command == "serve":
         serve()
+    elif args.command == "search":
+        sys.exit(search_backfill(args.workspace))
     elif args.command == "audit":
         sys.exit(audit_verify(args.workspace))
     elif args.command == "export":

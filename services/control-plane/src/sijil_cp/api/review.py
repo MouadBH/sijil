@@ -16,6 +16,7 @@ completes exactly once when it is called again:
    ruling P1) and `document.sealed` audited, in one transaction;
 4. after the commit, `sijil.lock_sealed` to the seal worker (queue `seal`), which switches the
    original to COMPLIANCE at the committed `retention_until`, and `sijil.mirror_fields`.
+The search row (`sijil_core.search_index`) becomes `sealed` in step 2's transaction.
 
 Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
 provisional date: the app key this service holds can neither delete nor shorten it (only the
@@ -25,7 +26,8 @@ bound that window.
 
 A field edit holds the same ledger lock; it commits its `document.fields_edited` event first and
 its index write after (an applied edit is always audited; an index failure then answers 503
-`field.update_failed`). A seal racing it either seals the values it locked, with their digest,
+`field.update_failed`). The index write includes the search row, so search shows the edit as
+soon as the request answers. A seal racing it either seals the values it locked, with their digest,
 or gets `seal.fields_changed`.
 """
 
@@ -61,6 +63,7 @@ from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, pars
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
 from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
+from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
@@ -382,6 +385,12 @@ async def edit_fields(
             raise ApiError(SEAL_UNFINISHED, 409) from None
         except LookupError:
             raise ApiError(NOT_REVIEWABLE, 409) from None
+        try:
+            await refresh_search_doc(conn, _search_facts(request, ledger, ledger.state, now))
+        except Exception as exc:
+            # Nothing applied: the index transaction rolls back with the edit.
+            log.warning("field edit of document %s not applied: %s", doc_id, type(exc).__name__)
+            raise ApiError(UPDATE_FAILED, 503) from None
         await audit.append(
             db,
             workspace_id=workspace.id,
@@ -406,6 +415,20 @@ async def edit_fields(
             log.warning("field edit of document %s not applied: %s", doc_id, type(exc).__name__)
             raise ApiError(UPDATE_FAILED, 503) from None
     return _full(ledger, row)
+
+
+def _search_facts(
+    request: Request, ledger: DocumentLedger, state: DocumentState, now: datetime
+) -> SearchLedgerFacts:
+    """The ledger facts of the document's search row (the region is this service's, which
+    `require_workspace` checked against the workspace's)."""
+    return SearchLedgerFacts(
+        ledger_id=ledger.id,
+        state=state,
+        ingested_at=ledger.ingested_at,
+        region=request.app.state.settings.region,
+        now=now,
+    )
 
 
 async def _commit_index(trans: AsyncTransaction) -> None:
@@ -468,15 +491,23 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
     if row.sealed_at is not None and row.fields_sha256 != digest:
         raise ApiError(LOCKED, 409)
     final = await _final_retention(db, ledger, row, sealer)
-    # The index row frozen, in its own committed transaction. The digest is recomputed from the
-    # row it locks, so values that changed since the read above are refused, never sealed
-    # under a stale hash. On a retry it is already sealed with this hash: its stored
-    # `sealed_at` is the one the ledger gets.
+    # The index row frozen and the search row `sealed`, in their own committed transaction. The
+    # digest is recomputed from the row it locks, so values that changed since the read above
+    # are refused, never sealed under a stale hash. On a retry it is already sealed with this
+    # hash: its stored `sealed_at` is the one the ledger gets.
     try:
         async with sealer.engine.begin() as conn:
             frozen = await index_db.seal_fields(
                 conn, ledger.id, fields_sha256=digest, sealed_at=sealer.now
             )
+            facts = SearchLedgerFacts(
+                ledger_id=ledger.id,
+                state=DocumentState.sealed,
+                ingested_at=ledger.ingested_at,
+                region=sealer.region,
+                now=sealer.now,
+            )
+            await refresh_search_doc(conn, facts)
     except FieldsChanged:
         raise ApiError(CHANGED, 409) from None
     except RetentionLocked:
