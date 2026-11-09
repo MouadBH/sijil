@@ -68,6 +68,8 @@ QUERY_INVALID: Final = "search.query_invalid"
 MAX_QUERY: Final = 200
 MAX_LIMIT: Final = 100
 SNIPPET_MAX: Final = 200
+# Tags and document types a filter may list (a document has at most 20 tags).
+MAX_LIST: Final = 20
 
 Sort = Literal["relevance", "date_desc", "date_asc", "amount_desc", "amount_asc"]
 LiveState = Literal["needs_review", "filed", "sealed", "received"]
@@ -92,7 +94,7 @@ class SearchFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     q: Annotated[str, Field(max_length=MAX_QUERY)] | None = None
-    document_type: list[str] = []
+    document_type: Annotated[list[str], Field(max_length=MAX_LIST)] = []
     # An ICE when 15 digits, else part of the supplier's name.
     supplier: Annotated[str, Field(max_length=MAX_QUERY)] | None = None
     # Inclusive, on the retention basis date (`basis_date`), as exports and sums.
@@ -102,7 +104,7 @@ class SearchFilters(BaseModel):
     amount_min: Decimal | None = None
     amount_max: Decimal | None = None
     # Every one of them.
-    tags: list[str] = []
+    tags: Annotated[list[str], Field(max_length=MAX_LIST)] = []
     status: list[LiveState] = []
 
 

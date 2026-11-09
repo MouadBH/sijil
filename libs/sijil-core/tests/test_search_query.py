@@ -203,6 +203,10 @@ def test_filters_reject_unknown_and_long_queries() -> None:
         SearchFilters.model_validate({"text": "x"})
     with pytest.raises(ValidationError):
         SearchFilters(q="x" * 201)
+    with pytest.raises(ValidationError):
+        SearchFilters(tags=[f"t{i}" for i in range(21)])
+    with pytest.raises(ValidationError):
+        SearchFilters(document_type=[f"type{i}" for i in range(21)])
     assert filter_names(SearchFilters(q="x", tags=["a"], amount_min=Decimal(1))) == (
         "q,amount_min,tags"
     )
