@@ -29,7 +29,7 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
-from tests.support.memory_store import MemoryObjectStore
+from tests.support.memory_store import MemoryExportStore, MemoryObjectStore
 
 ROOT = Path(__file__).parent
 CP_DIR = ROOT / "services" / "control-plane"
@@ -223,3 +223,9 @@ async def fixtures(user: User, org: Organisation, workspace: Workspace) -> Fixtu
 def memory_store() -> MemoryObjectStore:
     """An in-memory object-locked store (see tests/support/memory_store.py)."""
     return MemoryObjectStore()
+
+
+@pytest.fixture
+def export_store() -> MemoryExportStore:
+    """The exports bucket in memory (see tests/support/memory_store.py)."""
+    return MemoryExportStore()

@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 import respx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import audit
@@ -619,3 +619,65 @@ async def test_locked_row_whose_object_is_not_compliance_is_a_mismatch(
             (str(short.id), drift.OBJECT_LOCK_MISMATCH),
         ]
     )
+
+
+_TERMINAL_SQL = {
+    "removed": (
+        "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+        " removed_by = :u, removal_reason = 'Déposé par erreur (SAMPLE)' WHERE id = :id",
+    ),
+    "deleting": (
+        "UPDATE document_ledger SET state = 'deleting', deletion_approved_at = now(),"
+        " deletion_approved_by = :u WHERE id = :id",
+    ),
+    "deleted": (
+        "UPDATE document_ledger SET state = 'deleting', deletion_approved_at = now(),"
+        " deletion_approved_by = :u WHERE id = :id",
+        "UPDATE document_ledger SET state = 'deleted', deleted_at = now(),"
+        " original_removed_at = now() WHERE id = :id",
+    ),
+}
+
+
+async def _gone(
+    db: AsyncSession, ws: Workspace, user: User, state: DocumentState, doc_id: int
+) -> DocumentLedger:
+    """A row in a terminal state whose original and Paperless copy are gone, as they should be
+    (its retention is over, so it may be approved for deletion)."""
+    sha = hashlib.sha256(f"gone-{doc_id}".encode()).hexdigest()
+    row = DocumentLedger(
+        workspace_id=ws.id, sha256=sha, md5="0" * 32, size_bytes=4, content_kind="pdf",
+        source=DocumentSource.upload, object_key=f"{tenant_ref(ws.id)}/{sha}",
+        object_version_id="v1", retention_until=datetime(2020, 12, 31).date(),
+        ingest_state=IngestState.consumed, paperless_doc_id=doc_id,
+    )  # fmt: skip
+    db.add(row)
+    await db.commit()
+    for statement in _TERMINAL_SQL[state.value]:
+        await db.execute(text(statement), {"id": row.id, "u": user.id})
+    await db.commit()
+    return row
+
+
+async def test_terminal_rows_are_not_checked(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    user: User,
+    tmp_path: Path,
+) -> None:
+    """A removed, deleting or deleted row's original and Paperless copy go away by design: the
+    drift check skips them instead of reporting them missing."""
+    live = await make_doc(db, memory_store, ready, tmp_path, 1)
+    for n, state in enumerate(
+        (DocumentState.removed, DocumentState.deleting, DocumentState.deleted), start=2
+    ):
+        await _gone(db, ready, user, state, n)
+    with respx.mock(assert_all_called=True) as router:
+        metadata(router, 1, live.sha256)
+        report = await run(ready, sessions, keys, memory_store)
+        assert router.calls.call_count == 1
+    assert report == DriftReport(checked=1, problems=0)
+    assert await alerts(db) == []

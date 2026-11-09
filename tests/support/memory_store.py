@@ -1,17 +1,17 @@
 """An in-memory `ObjectStore` with the semantics of the real object-locked bucket.
 
 Every put creates a new version (the bucket is versioned), retention can only move later,
-`seal` switches to COMPLIANCE and `governance_remove` refuses sealed versions. Tests read
+`seal` switches to COMPLIANCE and `remove_original` refuses an unexpired lock. Tests read
 `puts` and `objects` to assert what reached the store.
 """
 
 import itertools
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
-from sijil_core.storage import ObjectRef, ObjectStore
+from sijil_core.storage import ExportStore, ObjectRef, ObjectStore, RetentionActive
 
 CHUNK_BYTES = 1024 * 1024
 
@@ -31,8 +31,8 @@ class Put:
     size: int
 
 
-class SealedObjectError(PermissionError):
-    """The store refuses to remove a COMPLIANCE-locked version."""
+class LockedObjectError(PermissionError):
+    """The store refuses to delete a GOVERNANCE-locked version without the bypass."""
 
 
 class MemoryObjectStore(ObjectStore):
@@ -78,10 +78,15 @@ class MemoryObjectStore(ObjectStore):
         stored.mode = "COMPLIANCE"
         stored.retain_until = max(stored.retain_until, retain_until)
 
-    async def governance_remove(self, ref: ObjectRef) -> None:
-        stored = self._get(ref)
-        if stored.mode == "COMPLIANCE":
-            raise SealedObjectError(f"{ref.key}@{ref.version_id} is sealed")
+    async def remove_original(self, ref: ObjectRef, *, governance: bool) -> None:
+        stored = self.objects.get(ref)
+        if stored is None:
+            return  # absent: already removed
+        unexpired = stored.retain_until >= datetime.now(UTC).date()
+        if stored.mode == "COMPLIANCE" and unexpired:
+            raise RetentionActive(f"{ref.key}@{ref.version_id}")
+        if stored.mode == "GOVERNANCE" and unexpired and not governance:
+            raise LockedObjectError(f"{ref.key}@{ref.version_id} is locked")
         del self.objects[ref]
         self.removed.append(ref)
 
@@ -91,3 +96,29 @@ class MemoryObjectStore(ObjectStore):
 
     def versions(self, key: str) -> list[ObjectRef]:
         return [ref for ref in self.objects if ref.key == key]
+
+
+class MemoryExportStore(ExportStore):
+    """The exports bucket in memory: plain objects by key, no versions, no lock."""
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.deleted: list[str] = []
+
+    async def ensure_bucket(self) -> None:
+        return None
+
+    async def put_export(self, key: str, path: Path) -> None:
+        self.objects[key] = path.read_bytes()  # noqa: ASYNC240 - test double, small files
+
+    async def open_export(self, key: str) -> AsyncIterator[bytes]:
+        try:
+            data = self.objects[key]
+        except KeyError:
+            raise FileNotFoundError(key) from None
+        for start in range(0, len(data), CHUNK_BYTES):
+            yield data[start : start + CHUNK_BYTES]
+
+    async def delete_export(self, key: str) -> None:
+        if self.objects.pop(key, None) is not None:
+            self.deleted.append(key)

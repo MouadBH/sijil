@@ -30,6 +30,8 @@ _RETRY_STATUS = frozenset({502, 503, 504})
 _READY_ERRORS = frozenset({401, 403, 406})
 _ATTEMPTS = 3
 _BACKOFF_S = 0.5
+# Rows per page when a whole paginated list is read.
+PAGE_SIZE = 100
 
 
 class PaperlessError(Exception):
@@ -106,6 +108,23 @@ class PaperlessDoc:
     title: str | None
     created: str | None
     original_file_name: str | None
+    checksum: str | None = None
+
+    def is_copy_of(self, sha256: str, filename: str) -> bool:
+        """See `is_copy_of`."""
+        return is_copy_of(self.checksum, self.original_file_name, sha256, filename)
+
+
+def is_copy_of(checksum: object, original_file_name: object, sha256: str, filename: str) -> bool:
+    """Whether a Paperless list row is a copy of the original with this SHA-256, uploaded by
+    ingest as `filename`: its `checksum` when the payload carries one, else its file name.
+
+    Never only Paperless's filter: one it ignores answers every document (see
+    `find_document_by_checksum`), and the purge deletes what this keeps.
+    """
+    if checksum is not None:
+        return isinstance(checksum, str) and checksum.lower() == sha256.lower()
+    return original_file_name == filename
 
 
 class PaperlessClient:
@@ -368,8 +387,73 @@ class PaperlessClient:
         except (ValueError, KeyError, TypeError, AttributeError):
             raise PaperlessError("GET /api/documents/: unexpected body") from None
 
+    async def _every_page(self, path: str, params: Mapping[str, str]) -> list[dict[str, Any]]:
+        """Every row of a paginated list (`page`, `page_size`, `next`)."""
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = await self._request(
+                "GET", path, params={**params, "page": page, "page_size": PAGE_SIZE}
+            )
+            try:
+                body = response.json()
+                results = [dict(r) for r in body["results"]]
+                more = body.get("next")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                raise PaperlessBadResponse(f"GET {path}: unexpected body") from None
+            rows.extend(results)
+            if not more or not results:
+                return rows
+            page += 1
+
+    async def documents_with_checksum(self, sha256: str, *, filename: str) -> list[int]:
+        """Ids of every live document whose original has this SHA-256 (3.4.1 keeps duplicates).
+        `checksum__iexact`: see `find_document_by_checksum`. Only the rows that are copies
+        (`is_copy_of`, with ingest's `filename`) are kept, whatever the filter let through."""
+        rows = await self._every_page(
+            "/api/documents/",
+            {
+                "checksum__iexact": sha256,
+                "ordering": "id",
+                "fields": "id,checksum,original_file_name",
+            },
+        )
+        try:
+            return [
+                int(r["id"])
+                for r in rows
+                if is_copy_of(r.get("checksum"), r.get("original_file_name"), sha256, filename)
+            ]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise PaperlessBadResponse("GET /api/documents/: unexpected body") from None
+
+    async def trashed_documents(self) -> list[PaperlessDoc]:
+        """The documents in the trash (`/api/trash/`, which has no filter in 3.4.1)."""
+        rows = await self._every_page("/api/trash/", {})
+        try:
+            return [
+                PaperlessDoc(
+                    id=int(r["id"]),
+                    title=r.get("title"),
+                    created=r.get("created"),
+                    original_file_name=r.get("original_file_name"),
+                    checksum=r.get("checksum"),
+                )
+                for r in rows
+            ]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise PaperlessBadResponse("GET /api/trash/: unexpected body") from None
+
     async def delete_document(self, doc_id: int) -> None:
+        """Moves the document to Paperless's trash (`empty_trash` removes it for good)."""
         await self._request("DELETE", f"/api/documents/{doc_id}/")
+
+    async def empty_trash(self, doc_ids: Sequence[int]) -> None:
+        """Deletes these trashed documents for good, so Paperless keeps no copy. 3.4.1 answers
+        400 when any of them is not in the trash (`TrashSerializer.validate_documents`)."""
+        await self._request(
+            "POST", "/api/trash/", json={"documents": list(doc_ids), "action": "empty"}
+        )
 
     async def document_content(self, doc_id: int) -> str:
         """The document's text as Paperless extracted it (OCR or text layer), or ""."""

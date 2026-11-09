@@ -27,10 +27,15 @@ READONLY = frozenset({Action.workspace_read, Action.documents_read})
 
 def test_matrix_shape() -> None:
     assert MATRIX[Role.owner] == ALL
-    assert MATRIX[Role.admin] == ALL - {Action.org_update}
+    # The pre-seal removal and the approved deletion are the Owner's alone (design §5.4).
+    assert MATRIX[Role.admin] == ALL - {
+        Action.org_update,
+        Action.documents_remove,
+        Action.retention_approve_deletion,
+    }
     assert MATRIX[Role.member] == MEMBER
     assert MATRIX[Role.readonly] == READONLY
-    assert len(Action) == 13
+    assert len(Action) == 15
 
 
 @pytest.mark.parametrize("role", list(Role))

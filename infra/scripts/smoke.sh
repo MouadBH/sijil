@@ -171,6 +171,52 @@ case "$sock" in
   socket) fail "seal worker has the Docker socket" ;;
   *) fail "seal worker socket check could not run (exec failed)" ;;
 esac
+# The removal worker: the only holder of the removal key, consuming `removal`, on `core` only,
+# with no Docker socket and no app or seal key.
+ping_out=$(compose exec -T worker-removal celery -A sijil_worker.main_removal inspect ping \
+  --timeout 10 2>/dev/null)
+grep -A1 'removal@' <<<"$ping_out" | grep -q pong \
+  && pass "removal worker answers celery ping" || fail "removal worker ping"
+sock=$(compose exec -T worker-removal sh -c \
+  'if [ -S /var/run/docker.sock ]; then echo socket; else echo none; fi' 2>/dev/null | tr -d '\r')
+case "$sock" in
+  none) pass "removal worker has no Docker socket" ;;
+  socket) fail "removal worker has the Docker socket" ;;
+  *) fail "removal worker socket check could not run (exec failed)" ;;
+esac
+removal_id=$(compose ps -q worker-removal 2>/dev/null)
+nets=$(docker inspect "$removal_id" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' 2>/dev/null)
+[ "$nets" = "${project:-sijil}_core " ] \
+  && pass "removal worker is on the core network only" \
+  || fail "removal worker networks: '$nets' (only ${project:-sijil}_core expected)"
+# Prints the env names (never values), or "exec-failed".
+env_names() {
+  compose exec -T "$1" sh -c 'env | cut -d= -f1' 2>/dev/null | tr -d '\r' || echo exec-failed
+}
+names=$(env_names worker-removal)
+if grep -qx exec-failed <<<"$names" || ! grep -qx SIJIL_OBJECTSTORE_ACCESS_KEY <<<"$names"; then
+  fail "removal worker env check could not run (exec failed)"
+elif grep -Eq '^SIJIL_OBJECTSTORE_APP_|SEAL_' <<<"$names"; then
+  fail "removal worker holds an app or seal variable"
+else
+  pass "removal worker holds no app or seal variable"
+fi
+removal_key=$(sed -n 's/^SIJIL_OBJECTSTORE_REMOVAL_ACCESS_KEY=//p' .env)
+held=$(compose exec -T worker-removal printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')
+[ -n "$removal_key" ] && [ "$held" = "$removal_key" ] \
+  && pass "removal worker uses the removal key" || fail "removal worker object-store key"
+for svc in worker worker-seal; do
+  names=$(env_names "$svc")
+  if grep -qx exec-failed <<<"$names" || [ -z "$names" ]; then
+    fail "$svc env check could not run (exec failed)"
+  elif grep -q '^SIJIL_OBJECTSTORE_REMOVAL_' <<<"$names" \
+    || [ "$(compose exec -T "$svc" printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')" = "$removal_key" ]; then
+    fail "$svc holds the removal key"
+  else
+    pass "$svc does not hold the removal key"
+  fi
+done
 
 # Inbound email: the SMTP receiver greets on its localhost-published port.
 banner=$(python3 - <<'PY' 2>/dev/null
@@ -190,5 +236,49 @@ case "$(compose port smtp 2525 2>/dev/null)" in
   127.0.0.1:*) pass "smtp published on localhost only" ;;
   *) fail "smtp published beyond localhost" ;;
 esac
+
+# The export worker: the only holder of the signing seed and the export key, consuming
+# `export`, on `core` only, with no Docker socket.
+ping_out=$(compose exec -T worker-export celery -A sijil_worker.main_export inspect ping \
+  --timeout 10 2>/dev/null)
+grep -A1 'export@' <<<"$ping_out" | grep -q pong \
+  && pass "export worker answers celery ping" || fail "export worker ping"
+sock=$(compose exec -T worker-export sh -c \
+  'if [ -S /var/run/docker.sock ]; then echo socket; else echo none; fi' 2>/dev/null | tr -d '\r')
+case "$sock" in
+  none) pass "export worker has no Docker socket" ;;
+  socket) fail "export worker has the Docker socket" ;;
+  *) fail "export worker socket check could not run (exec failed)" ;;
+esac
+export_id=$(compose ps -q worker-export 2>/dev/null)
+nets=$(docker inspect "$export_id" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' 2>/dev/null)
+[ "$nets" = "${project:-sijil}_core " ] \
+  && pass "export worker is on the core network only" \
+  || fail "export worker networks: '$nets' (only ${project:-sijil}_core expected)"
+export_key=$(sed -n 's/^SIJIL_OBJECTSTORE_EXPORT_ACCESS_KEY=//p' .env)
+held=$(compose exec -T worker-export printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')
+[ -n "$export_key" ] && [ "$held" = "$export_key" ] \
+  && pass "export worker uses the export key" || fail "export worker object-store key"
+seed=$(sed -n 's/^SIJIL_EXPORT_SIGNING_KEY=//p' .env)
+held=$(compose exec -T worker-export printenv SIJIL_EXPORT_SIGNING_KEY 2>/dev/null | tr -d '\r')
+[ -n "$seed" ] && [ "$held" = "$seed" ] \
+  && pass "export worker holds the signing seed" || fail "export worker signing seed"
+for svc in control-plane worker worker-extraction worker-seal worker-removal smtp beat; do
+  names=$(env_names "$svc")
+  values=$(compose exec -T "$svc" sh -c 'env | cut -d= -f2-' 2>/dev/null | tr -d '\r')
+  if grep -qx exec-failed <<<"$names" || [ -z "$names" ]; then
+    fail "$svc env check could not run (exec failed)"
+  elif grep -q '^SIJIL_EXPORT_SIGNING_KEY$\|^SIJIL_OBJECTSTORE_EXPORT_' <<<"$names" \
+    || { [ -n "$seed" ] && grep -qxF -- "$seed" <<<"$values"; } \
+    || [ "$(compose exec -T "$svc" printenv SIJIL_OBJECTSTORE_ACCESS_KEY 2>/dev/null | tr -d '\r')" = "$export_key" ]; then
+    fail "$svc holds the signing seed or the export key"
+  else
+    pass "$svc holds neither the signing seed nor the export key"
+  fi
+done
+public=$(sed -n 's/^SIJIL_EXPORT_PUBLIC_KEY=//p' .env)
+curl -s localhost:8000/v1/regions/ma-cas/export-key | grep -qF "\"public_key\":\"$public\"" \
+  && pass "control plane publishes the region's export key" || fail "published export key"
 
 if [ "$failures" -eq 0 ]; then echo "smoke: all checks passed"; else echo "smoke: $failures check(s) failed"; exit 1; fi

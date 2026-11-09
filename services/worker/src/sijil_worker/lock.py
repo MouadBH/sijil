@@ -12,9 +12,11 @@ AI network. `lock_sealed`:
    transaction holding the ledger row FOR UPDATE (before the audit chain's lock).
 
 A crash between 2 and 3 only repeats step 2 on the next run. Until 3, the original stays under
-its GOVERNANCE lock at the provisional date (no running service's key can delete or shorten
-it); `requeue_unlocked` re-sends the lock for sealed rows still unlocked after two minutes, and
-the drift check flags them after an hour (`object_lock_pending`).
+its GOVERNANCE lock at the provisional date: the app key can neither delete nor shorten it; only
+the seal key (this worker's) could shorten it, and only the removal key (`worker-removal`, and
+only for a row in `removed`) could delete it. `requeue_unlocked` re-sends the lock for sealed
+rows still unlocked after two minutes, and the drift check flags them after an hour
+(`object_lock_pending`).
 """
 
 import logging

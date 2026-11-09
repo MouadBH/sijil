@@ -1,21 +1,32 @@
-"""Retention periods by country. Provisional until a document is dated (see design §5.2)."""
+"""Retention periods by country and document type. Provisional until a document is dated
+(see design §5.2)."""
 
+from collections.abc import Mapping
 from datetime import date, datetime
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sijil_core.confidence import plausible_date
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# Statutory retention in whole years, by ISO country code.
-_RETENTION_YEARS = {"MA": 10}
+from sijil_core.confidence import plausible_date
+from sijil_core.db.models import Organisation, RetentionPolicy, Workspace
+from sijil_core.fields import DOCUMENT_TYPES
+
+# Working values, in whole years, by ISO country code and document type: none is confirmed by an
+# accountant yet. A workspace starts from its country's row and may only raise it
+# (`retention_policy`).
+PRESETS: Mapping[str, Mapping[str, int]] = {
+    "MA": dict.fromkeys(DOCUMENT_TYPES, 10),
+    "FR": dict.fromkeys(DOCUMENT_TYPES, 10),
+    "DE": {t: 8 if t in ("invoice", "receipt", "bank_statement") else 10 for t in DOCUMENT_TYPES},
+    "AE": dict.fromkeys(DOCUMENT_TYPES, 5),
+    "SA": dict.fromkeys(DOCUMENT_TYPES, 6),
+}
 
 # The civil time zone of each Sijil region: arrival dates are local, not UTC. Zone data comes
 # from the `tzdata` package when the OS has none, so it never depends on the image.
 REGION_TZ = {"ma-cas": "Africa/Casablanca"}
-
-
-def retention_years(country: str) -> int:
-    """Years a document must be kept in `country`. Unknown country raises KeyError."""
-    return _RETENTION_YEARS[country]
 
 
 def region_local_date(now: datetime, region: str) -> date:
@@ -25,15 +36,68 @@ def region_local_date(now: datetime, region: str) -> date:
     return now.astimezone(ZoneInfo(REGION_TZ[region])).date()
 
 
-def provisional_retain_until(arrival: date, country: str) -> date:
-    """Retain until 31 December, `retention_years` after the year of arrival."""
-    return date(arrival.year + retention_years(country), 12, 31)
+def provisional_retain_until(arrival: date, years: int) -> date:
+    """Retain until 31 December, `years` after the year of arrival."""
+    return date(arrival.year + years, 12, 31)
 
 
-def fiscal_retain_until(doc_date: date, country: str) -> date:
-    """Retain until 31 December, `retention_years` after the fiscal (= calendar) year of the
-    document's date (design §5.4)."""
-    return date(doc_date.year + retention_years(country), 12, 31)
+def fiscal_retain_until(doc_date: date, years: int) -> date:
+    """Retain until 31 December, `years` after the fiscal (= calendar) year of the document's
+    date (design §5.4)."""
+    return date(doc_date.year + years, 12, 31)
+
+
+async def policy_years(db: AsyncSession, workspace_id: UUID, document_type: str | None) -> int:
+    """The workspace's retention in years for `document_type`; None and unknown types read
+    `other`. A type with no row falls back to the preset of the workspace's org country."""
+    kind = document_type if document_type in DOCUMENT_TYPES else "other"
+    years = await db.scalar(
+        select(RetentionPolicy.years).where(
+            RetentionPolicy.workspace_id == workspace_id, RetentionPolicy.document_type == kind
+        )
+    )
+    if years is not None:
+        return years
+    country = await db.scalar(
+        select(Organisation.country)
+        .join(Workspace, Workspace.org_id == Organisation.id)
+        .where(Workspace.id == workspace_id)
+    )
+    if country is None:
+        raise LookupError(f"workspace {workspace_id} not found")
+    return PRESETS[country][kind]
+
+
+async def lowest_policy_years(db: AsyncSession, workspace_id: UUID) -> int:
+    """The lowest of the workspace's retention years across every document type (`policy_years`
+    of each: its row, else its country's preset). The provisional retention at arrival, when
+    the type is not known yet: routing and sealing raise it to the type's own policy, and a
+    lock is only ever extended, so it never keeps a type longer than its policy (final review
+    I2), and raising one type's policy never raises another's."""
+    found = await db.execute(
+        select(RetentionPolicy.document_type, RetentionPolicy.years).where(
+            RetentionPolicy.workspace_id == workspace_id
+        )
+    )
+    rows: dict[str, int] = {name: years for name, years in found}
+    country = await db.scalar(
+        select(Organisation.country)
+        .join(Workspace, Workspace.org_id == Organisation.id)
+        .where(Workspace.id == workspace_id)
+    )
+    if country is None:
+        raise LookupError(f"workspace {workspace_id} not found")
+    return min(rows.get(t, PRESETS[country][t]) for t in DOCUMENT_TYPES)
+
+
+def preset_policies(workspace_id: UUID, country: str) -> list[RetentionPolicy]:
+    """One locked row per document type from `country`'s preset, for a new workspace."""
+    return [
+        RetentionPolicy(
+            workspace_id=workspace_id, document_type=t, years=y, preset_years=y, locked=True
+        )
+        for t, y in PRESETS[country].items()
+    ]
 
 
 def retention_basis(doc_date: str | None, arrival: datetime, region: str, now: datetime) -> date:

@@ -18,7 +18,8 @@ from sijil_core.db.models import JobKind
 from sijil_cp import deps
 from sijil_cp.main import create_app
 from sijil_cp.settings import CpSettings
-from tests.support.memory_store import MemoryObjectStore
+from tests.support.export_keys import TEST_PUBLIC_KEY_B64
+from tests.support.memory_store import MemoryExportStore, MemoryObjectStore
 
 # Ports nothing listens on: readiness must report these as down.
 CLOSED_DB = "postgresql+asyncpg://sijil:sijil@127.0.0.1:1/sijil_cp"
@@ -42,6 +43,7 @@ def make_settings(**overrides: str) -> CpSettings:
         "objectstore_access_key": "test-access",
         "objectstore_secret_key": "test-secret",
         "objectstore_bucket": "sijil-originals-test",
+        "export_public_key": TEST_PUBLIC_KEY_B64,
     } | overrides
     return CpSettings.model_validate(values)
 
@@ -128,6 +130,8 @@ class RecordingEnqueuer:
         self.ingests: list[tuple[UUID, UUID]] = []
         self.mirrors: list[tuple[UUID, UUID]] = []
         self.locks: list[tuple[UUID, UUID]] = []
+        self.removals: list[tuple[UUID, UUID]] = []
+        self.exports: list[UUID] = []
 
     def send(self, kind: JobKind, job_id: UUID, workspace_id: UUID) -> None:
         self.calls.append((kind, job_id, workspace_id))
@@ -140,6 +144,12 @@ class RecordingEnqueuer:
 
     def send_lock(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self.locks.append((ledger_id, workspace_id))
+
+    def send_remove(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self.removals.append((ledger_id, workspace_id))
+
+    def send_export(self, job_id: UUID) -> None:
+        self.exports.append(job_id)
 
 
 @pytest.fixture
@@ -204,10 +214,12 @@ def cp_app(
     enqueuer: RecordingEnqueuer,
     clock: Clock,
     memory_store: MemoryObjectStore,
+    export_store: MemoryExportStore,
 ) -> FastAPI:
     app = make_db_app()
     app.state.enqueuer = enqueuer
     app.state.store = memory_store
+    app.state.exports = export_store
     app.dependency_overrides[deps.get_now] = lambda: clock.now
     return app
 

@@ -11,6 +11,14 @@ code and re-raises, so the caller can retry. When the caller's retries run out:
 - any other cause makes the row `failed`, audited as `document.ingest_failed`.
 `consumed`, `unsupported` and `failed` are final: a redelivery of the task is a no-op.
 
+A document its Owner removed while it was being ingested (ledger `removed`, frozen by 0011) is
+not claimed, and a run that holds it stops before each step that would write to Paperless or to
+the row (the upload, the task id, the outcome). A stop is not a failure: nothing is retried,
+audited or sent to extraction. When Paperless may hold a copy by then (found, resumed or
+uploaded by this run), the stop sends `sijil.purge_document` again (`enqueue_purge`), after
+waiting for a consume this run started: the removal's own purge may have run before the copy
+existed.
+
 Paperless 3.4.1 does not refuse duplicates (it only flags them), so before uploading, ingest
 looks the file's SHA-256 up in Paperless and adopts the existing document. That makes a retry
 after a lost response, or the same bytes arriving by two routes, harmless.
@@ -39,6 +47,7 @@ from sijil_core import audit
 from sijil_core.crypto import Envelope, KeyService, open_envelope
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     CredentialKind,
     DocumentLedger,
@@ -100,6 +109,12 @@ _ABSENT_CODES = {"404", "NoSuchKey", "NoSuchVersion", "NotFound"}
 _TASK_DONE = {"SUCCESS", "FAILURE", "REVOKED"}
 
 
+def upload_filename(sha256: str, kind: FileKind) -> str:
+    """The name an original is uploaded to Paperless under (its `original_file_name` there):
+    from the hash, never the user's own filename. The purge finds trashed copies by it."""
+    return f"{sha256[:12]}.{_EXTENSION[kind]}"
+
+
 class WorkspaceNotActive(Exception):  # noqa: N818
     """The workspace is not `active` (yet, or any more): try again later."""
 
@@ -114,6 +129,10 @@ class OriginalCorrupt(Exception):  # noqa: N818
     def __init__(self, observed_sha256: str) -> None:
         super().__init__("original does not match its SHA-256")
         self.observed_sha256 = observed_sha256
+
+
+class DocumentRemoved(Exception):  # noqa: N818 - a state, not an error
+    """The row went terminal (its Owner removed it) during the run: stop, touch nothing."""
 
 
 class ConsumeFailed(Exception):  # noqa: N818
@@ -192,6 +211,13 @@ class _Claim:
     task_id: str | None
 
 
+@dataclass
+class _Progress:
+    """How far a run got in Paperless: whether it may hold a copy of the original now."""
+
+    in_paperless: bool = False
+
+
 @dataclass(frozen=True)
 class _Job:
     claim: _Claim
@@ -221,6 +247,8 @@ async def _claim(
                 update(DocumentLedger)
                 .where(
                     *scope,
+                    # A removed row is frozen: never claimed (see the module docstring).
+                    DocumentLedger.state.not_in(TERMINAL_STATES),
                     or_(
                         DocumentLedger.ingest_state == IngestState.queued,
                         and_(
@@ -327,11 +355,22 @@ async def _await_task(
         await asyncio.sleep(interval_s)
 
 
+async def _removed(sessions: async_sessionmaker[AsyncSession], ledger_id: UUID) -> bool:
+    """Whether the row went terminal (its Owner removed it)."""
+    async with sessions() as session:
+        state = await session.scalar(
+            select(DocumentLedger.state).where(DocumentLedger.id == ledger_id)
+        )
+    return state in TERMINAL_STATES
+
+
 async def _set_task_id(
     sessions: async_sessionmaker[AsyncSession], ledger_id: UUID, claim: _Claim, task_id: str | None
 ) -> None:
     async with sessions() as session:
         ledger = await session.get(DocumentLedger, ledger_id, with_for_update=True)
+        if ledger is not None and ledger.state in TERMINAL_STATES:
+            raise DocumentRemoved
         if ledger is not None and ledger.ingest_claimed_at == claim.claimed_at:
             ledger.paperless_task_id = task_id
             await session.commit()
@@ -378,6 +417,7 @@ async def _push(
     store: ObjectStore,
     poll_timeout_s: float,
     poll_interval_s: float,
+    progress: _Progress,
 ) -> int:
     """The Paperless document id of the original; uploads at most once per run.
 
@@ -387,25 +427,42 @@ async def _push(
     claim = job.claim
     existing = await client.find_document_by_checksum(claim.sha256)
     if existing is not None:
+        progress.in_paperless = True
         return existing
     if claim.task_id:
+        progress.in_paperless = True  # an earlier run uploaded
         resumed = await _resolve(
             client, claim.sha256, claim.task_id, poll_timeout_s, poll_interval_s, resume=True
         )
         if resumed is not None:
             return resumed
         await _set_task_id(sessions, ledger_id, claim, None)  # unknown or failed: start over
+    # The one step that writes to Paperless: never for a document removed meanwhile.
+    if await _removed(sessions, ledger_id):
+        raise DocumentRemoved
     content = await _read_original(store, claim.ref)
     # Never hand Paperless (or lock in as "the document") bytes that are not the original.
     observed = hashlib.sha256(content).hexdigest()
     if observed != claim.sha256:
         raise OriginalCorrupt(observed)
-    filename = f"{claim.sha256[:12]}.{_EXTENSION[claim.kind]}"
+    filename = upload_filename(claim.sha256, claim.kind)
     try:
         task_id = await client.upload(content, filename, title=job.title)
     except PaperlessUnsupportedType:
         raise _Unsupported from None
-    await _set_task_id(sessions, ledger_id, claim, task_id)
+    progress.in_paperless = True
+    try:
+        await _set_task_id(sessions, ledger_id, claim, task_id)
+    except DocumentRemoved:
+        # Removed just after the upload: the copy is still consuming, and its id can never be
+        # recorded. Wait for it (best effort), so the purge sent on the stop finds it.
+        try:
+            await _await_task(client, task_id, poll_timeout_s, poll_interval_s, resume=False)
+        except Exception as exc:
+            log.info(
+                "consume of removed document %s not awaited: %s", ledger_id, type(exc).__name__
+            )
+        raise
     doc_id = await _resolve(
         client, claim.sha256, task_id, poll_timeout_s, poll_interval_s, resume=False
     )
@@ -438,6 +495,7 @@ async def _settle(
         ledger = await session.get(DocumentLedger, ledger_id, with_for_update=True)
         if (
             ledger is None
+            or ledger.state in TERMINAL_STATES  # removed meanwhile: frozen, a stop
             or ledger.ingest_state is not IngestState.sending
             or ledger.ingest_claimed_at != claim.claimed_at
         ):
@@ -558,6 +616,7 @@ async def ingest_document(
     will_retry: Callable[[Exception], bool] = _never_retried,
     retry_after_s: float = 0.0,
     enqueue_extract: Enqueue | None = None,
+    enqueue_purge: Enqueue | None = None,
 ) -> None:
     """`will_retry(exc)` says whether the caller will run this again after `exc`, `retry_after_s`
     seconds from now (the Celery countdown, recorded so the requeue sweep agrees with it).
@@ -565,6 +624,9 @@ async def ingest_document(
     Once the row is `consumed` (or `unsupported`, to be routed to review) and committed,
     `enqueue_extract(ledger_id, workspace_id)` sends the extraction. A failed send is logged
     only: the extraction sweep picks the row up.
+
+    A row its Owner removed during the run is a stop (see the module docstring), which sends
+    `enqueue_purge(ledger_id, workspace_id)` when Paperless may hold a copy.
 
     A row of another region is left exactly as it is (not claimed, not settled): it belongs to
     that region's worker.
@@ -580,17 +642,39 @@ async def ingest_document(
     )
     if claim is None:
         return  # settled, or another run holds it: a redelivery changes nothing
+    progress = _Progress()
+
+    async def stop() -> None:
+        log.info("ingest of document %s stopped: removed", ledger_id)
+        if progress.in_paperless and enqueue_purge is not None:
+            try:
+                await enqueue_purge(ledger_id, claim.workspace_id)
+            except Exception:
+                # The removal's own purge, or the unpurged sweep, still runs.
+                log.exception("enqueue of purge failed for document %s", ledger_id)
+
     try:
         job = await _prepare(sessions, keys, settings, claim)
         async with paperless(job.paperless_url, token=job.token) as client:
             doc_id = await _push(
-                job, ledger_id, client, sessions, store, poll_timeout_s, poll_interval_s
+                job, ledger_id, client, sessions, store, poll_timeout_s, poll_interval_s, progress
             )
         settled = await _settle(sessions, ledger_id, claim, doc_id=doc_id)
+        if not settled and await _removed(sessions, ledger_id):
+            await stop()  # consumed, then found removed: the result is never written
+            return
     except _Unsupported:
         # Never extracted, but the extraction task routes it to review.
         settled = await _settle(sessions, ledger_id, claim, unsupported=True)
+    except DocumentRemoved:
+        await stop()
+        return
     except Exception as exc:
+        # Whatever failed (a `ledger.immutable` included), a removed row is a stop: no retry,
+        # no `ingest_failed`.
+        if await _removed(sessions, ledger_id):
+            await stop()
+            return
         # Only a machine code is recorded; the exception carries no secrets by contract.
         code = error_code(exc)
         log.error("ingest of document %s failed: %s", ledger_id, code)
@@ -642,6 +726,8 @@ async def requeue_stuck_ingest(
                 .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(
                     Organisation.region == region,
+                    # A removed row stays queued or sending for ever: nothing to send.
+                    DocumentLedger.state.not_in(TERMINAL_STATES),
                     or_(
                         and_(
                             DocumentLedger.ingest_state == IngestState.queued,

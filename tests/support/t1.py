@@ -158,7 +158,7 @@ class Harness:
     async def close(self) -> None:
         try:
             for ref in self.refs:
-                await self.store.governance_remove(ref)
+                await self.store.remove_original(ref, governance=True)
         finally:
             try:
                 await mark_closing(self.workspace_ids, database_url=self.settings.database_url)

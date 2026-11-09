@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from sijil_cp.main import create_app
 from sijil_cp.settings import CpSettings, MigrationSettings
+from tests.support.export_keys import TEST_PUBLIC_KEY_B64
 
 
 def test_migrations_use_their_own_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -34,6 +35,7 @@ _CP_ENV = {
     "objectstore_access_key": "app-access",
     "objectstore_secret_key": "app-secret",
     "objectstore_bucket": "sijil-originals-ma-cas",
+    "export_public_key": TEST_PUBLIC_KEY_B64,
 }
 
 
@@ -47,3 +49,17 @@ def test_the_control_plane_holds_no_sealing_key(monkeypatch: pytest.MonkeyPatch)
     app = create_app(settings)
     assert not hasattr(app.state, "seal_store")
     assert app.state.store.client is not None
+
+
+@pytest.mark.parametrize("key", ["", "not base64!", "c2hvcnQ="])
+def test_the_control_plane_refuses_an_unusable_export_public_key(key: str) -> None:
+    with pytest.raises(ValidationError):
+        CpSettings.model_validate(_CP_ENV | {"export_public_key": key})
+
+
+def test_the_control_plane_never_holds_the_signing_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only `worker-export` signs: the control plane has the public key alone."""
+    monkeypatch.setenv("SIJIL_EXPORT_SIGNING_KEY", "seed")
+    settings = CpSettings.model_validate(_CP_ENV)
+    assert not [name for name in CpSettings.model_fields if "signing" in name]
+    assert not hasattr(settings, "export_signing_key")

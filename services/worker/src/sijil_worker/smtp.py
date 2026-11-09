@@ -75,7 +75,6 @@ class SmtpSettings(StorageSettings):
 @dataclass(frozen=True)
 class _Target:
     workspace: Workspace
-    country: str
     region: str
 
 
@@ -146,7 +145,7 @@ class SijilSmtpHandler:
         async with self._sessions() as db:
             row = (
                 await db.execute(
-                    select(Workspace, Organisation.country, Organisation.region)
+                    select(Workspace, Organisation.region)
                     .join(Organisation, Organisation.id == Workspace.org_id)
                     .where(
                         Workspace.inbound_token == token,
@@ -156,12 +155,12 @@ class SijilSmtpHandler:
             ).first()
         if row is None:
             return None
-        workspace, country, region = row
+        workspace, region = row
         try:
             assert_region(region, self._settings)
         except RegionMismatch:
             return None
-        return _Target(workspace, country, region)
+        return _Target(workspace, region)
 
     async def handle_RCPT(
         self, server: Any, session: Any, envelope: Any, address: str, rcpt_options: Any
@@ -216,7 +215,6 @@ class SijilSmtpHandler:
             store=self._store,
             enqueue=self._enqueue,
             workspace=target.workspace,
-            country=target.country,
             region=target.region,
             chunks=_chunks(data),
             source=DocumentSource.email,
