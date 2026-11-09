@@ -2,7 +2,8 @@
 
 The resync compares each `search_doc` row's state with the ledger, fixes the ones that differ
 (a terminal ledger state is marked, never upserted), creates the missing ones (content fetched
-from Paperless once, fields from `document_fields`) and audits `search.resynced` `{fixed}`. The
+from Paperless once, fields from `document_fields`), fills an empty text, purges the row of
+a purged document and audits `search.resynced` `{fixed, failed}`. The
 backfill rebuilds every live row. Ingest and extraction upkeep are in test_ingest.py and
 test_extract.py, next to their harnesses.
 
@@ -15,6 +16,7 @@ from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 import respx
 from celery.schedules import crontab
@@ -28,9 +30,10 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from sijil_core import index
+from sijil_core import audit, index
 from sijil_core.crypto import LocalKeyService, seal
 from sijil_core.db.models import (
+    ActorType,
     AuditEvent,
     CredentialKind,
     DocumentLedger,
@@ -47,7 +50,7 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.paperless import PaperlessClient
-from sijil_core.search_index import SearchLedgerFacts, upsert_search_doc
+from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc, upsert_search_doc
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.search import resync_search
@@ -246,12 +249,12 @@ async def test_resync_fixes_state_and_creates_missing_rows(
     }  # fmt: skip
     assert (await _search(conn, removed.id) or {})["state"] == "removed"
     assert (await _search(conn, in_step.id) or {})["content"] == "Facture SAMPLE scellée"
-    assert await _resynced(db, ready) == [{"fixed": 3}]
+    assert await _resynced(db, ready) == [{"fixed": 3, "failed": 0}]
     # In step now: nothing to fix, nothing audited.
     with respx.mock(assert_all_called=False) as router:
         _paperless(router, {})
         assert await _run(sessions, keys, engines) == 0
-    assert await _resynced(db, ready) == [{"fixed": 3}]
+    assert await _resynced(db, ready) == [{"fixed": 3, "failed": 0}]
 
 
 async def test_resync_never_creates_a_row_for_a_terminal_document(
@@ -308,7 +311,7 @@ async def test_backfill_rebuilds_every_live_row(
     assert (await _search(conn, filed.id) or {})["content"] == "SAMPLE 131"
     assert (await _search(conn, sealed.id) or {})["content"] == "SAMPLE 132"
     assert await _search(conn, removed.id) is None
-    assert await _resynced(db, ready) == [{"fixed": 2}]
+    assert await _resynced(db, ready) == [{"fixed": 2, "failed": 0}]
 
 
 def test_resync_runs_daily_and_backfill_is_a_task() -> None:
@@ -317,3 +320,166 @@ def test_resync_runs_daily_and_backfill_is_a_task() -> None:
     assert entry == {"task": "sijil.search_resync", "schedule": crontab(hour=3, minute=30)}
     assert tasks.search_resync_task.name == "sijil.search_resync"
     assert tasks.search_backfill_task.name == "sijil.search_backfill"
+
+
+# Fix round 1: the ledger locked across each write, purged documents, empty text, isolation --
+
+
+async def _seal_now(
+    sessions: async_sessionmaker[AsyncSession], row: DocumentLedger, user: User
+) -> None:
+    async with sessions() as session:
+        await session.execute(
+            text(
+                "UPDATE document_ledger SET state = 'sealed', fields_sha256 = :sha,"
+                " sealed_at = now(), sealed_by = :u WHERE id = :id"
+            ),
+            {"id": row.id, "u": user.id, "sha": "f" * 64},
+        )
+        await session.commit()
+
+
+async def _remove_and_purge(
+    sessions: async_sessionmaker[AsyncSession], engines: IndexEngines, ws: Workspace,
+    row: DocumentLedger, user: User,
+) -> None:  # fmt: skip
+    """The Owner's removal, the removal worker and the purge, as they commit in production."""
+    async with sessions() as session:
+        await session.execute(
+            text(
+                "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+                " removed_by = :u, removal_reason = :reason WHERE id = :id"
+            ),
+            {"id": row.id, "u": user.id, "reason": REASON},
+        )
+        await session.commit()
+        await session.execute(
+            text("UPDATE document_ledger SET original_removed_at = now() WHERE id = :id"),
+            {"id": row.id},
+        )
+        await session.commit()
+    async with (await engines.engine(ws)).begin() as conn:
+        await index.purge_document(conn, row.id)
+    async with sessions() as session:
+        await audit.append(
+            session, workspace_id=ws.id, action="document.purged", actor_type=ActorType.system,
+            actor_id=None, target_type="document", target_id=str(row.id),
+            data={"paperless": True}, now=NOW,
+        )  # fmt: skip
+        await session.commit()
+
+
+async def test_a_seal_during_the_resync_is_not_reverted(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """The document is sealed while the resync fetches its text: the row takes the state the
+    ledger holds under its lock, not the one read at the start of the run."""
+    row = await _ledger(db, ready, user, DocumentState.filed, 141)
+    await _fields(conn, row.id)
+
+    async def seal_then_answer(request: Any) -> httpx.Response:
+        await _seal_now(sessions, row, user)
+        return httpx.Response(200, json={"id": 141, "content": "SAMPLE 141"})
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{PAPERLESS}/api/documents/141/").mock(side_effect=seal_then_answer)
+        assert await _run(sessions, keys, engines) == 1
+    assert await _search(conn, row.id) == {
+        "state": "sealed", "content": "SAMPLE 141", "supplier_name": VALUES["supplier_name"],
+    }  # fmt: skip
+
+
+async def test_a_removal_and_purge_during_a_backfill_leave_no_row(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await _ledger(db, ready, user, DocumentState.filed, 151)
+    await _fields(conn, row.id)
+
+    async def purge_then_answer(request: Any) -> httpx.Response:
+        await _remove_and_purge(sessions, engines, ready, row, user)
+        return httpx.Response(200, json={"id": 151, "content": "SAMPLE texte retiré"})
+
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{PAPERLESS}/api/documents/151/").mock(side_effect=purge_then_answer)
+        await _run(sessions, keys, engines, workspace_id=ready.id, full=True)
+    assert await _search(conn, row.id) is None
+
+
+async def test_resync_purges_a_stray_row_of_a_purged_document(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    purged = await _ledger(db, ready, user, DocumentState.filed, 161)
+    waiting = await _ledger(db, ready, user, DocumentState.filed, 162)
+    await _remove_and_purge(sessions, engines, ready, purged, user)
+    await _search_row(conn, purged, DocumentState.filed, "SAMPLE texte d'un document purgé")
+    await _search_row(conn, waiting, DocumentState.filed, "SAMPLE en attente de purge")
+    async with sessions() as session:  # removed, its purge not run yet
+        await session.execute(
+            text(
+                "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+                " removed_by = :u, removal_reason = :reason WHERE id = :id"
+            ),
+            {"id": waiting.id, "u": user.id, "reason": REASON},
+        )
+        await session.commit()
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        assert await _run(sessions, keys, engines) == 2
+    assert await _search(conn, purged.id) is None
+    assert (await _search(conn, waiting.id) or {})["state"] == "removed"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        # Each path that writes a row without reading the text leaves `content` empty:
+        DocumentState.received,  # ingest at consumed
+        DocumentState.filed,  # a redelivered extraction routing its stored row
+        DocumentState.needs_review,  # record_extraction_failed
+        DocumentState.sealed,  # a seal or a correction creating the row
+    ],
+)
+async def test_resync_fills_empty_text_of_a_consumed_document(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection, origin: DocumentState,
+) -> None:  # fmt: skip
+    row = await _ledger(db, ready, user, origin, 171)
+    await _fields(conn, row.id)
+    facts = SearchLedgerFacts(
+        ledger_id=row.id, state=origin, ingested_at=row.ingested_at, region="ma-cas", now=NOW
+    )
+    async with (await engines.engine(ready)).begin() as c:
+        await refresh_search_doc(c, facts)  # as that path calls it: no text
+    assert (await _search(conn, row.id) or {})["content"] == ""
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {171: "SAMPLE فاتورة 171"})
+        assert await _run(sessions, keys, engines) == 1
+    found = await _search(conn, row.id)
+    assert found is not None and (found["state"], found["content"]) == (
+        origin.value,
+        "SAMPLE فاتورة 171",
+    )
+    assert await _resynced(db, ready) == [{"fixed": 1, "failed": 0}]
+
+
+async def test_one_unreadable_document_does_not_stop_the_resync(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:  # fmt: skip
+    rows = [await _ledger(db, ready, user, DocumentState.filed, d) for d in (181, 182, 183)]
+    removed = await _ledger(db, ready, user, DocumentState.removed, 184)
+    await _search_row(conn, removed, DocumentState.filed, "SAMPLE retiré")
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {181: "SAMPLE 181", 183: "SAMPLE 183"})
+        router.get(f"{PAPERLESS}/api/documents/182/").respond(404, json={"detail": "Not found."})
+        assert await _run(sessions, keys, engines) == 3
+    assert (await _search(conn, rows[0].id) or {})["content"] == "SAMPLE 181"
+    assert await _search(conn, rows[1].id) is None
+    assert (await _search(conn, rows[2].id) or {})["content"] == "SAMPLE 183"
+    assert (await _search(conn, removed.id) or {})["state"] == "removed"
+    assert await _resynced(db, ready) == [{"fixed": 3, "failed": 1}]
+    assert "SAMPLE" not in caplog.text  # logged by class only
