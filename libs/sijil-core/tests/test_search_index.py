@@ -84,8 +84,8 @@ async def _row(conn: AsyncConnection, ledger_id: uuid.UUID) -> dict[str, object]
 
 
 async def test_schema_v3_has_the_extensions_and_tables(conn: AsyncConnection) -> None:
-    assert index.SCHEMA_VERSION == 3
-    assert await conn.scalar(text("SELECT max(version) FROM index_schema")) == 3
+    assert index.SCHEMA_VERSION >= 3
+    assert await conn.scalar(text("SELECT max(version) FROM index_schema")) == index.SCHEMA_VERSION
     extensions = set(await conn.scalars(text("SELECT extname FROM pg_extension")))
     assert {"pg_trgm", "unaccent", "vector"} <= extensions
     tables = set(
@@ -114,7 +114,7 @@ async def test_v2_database_upgrades_to_v3(
             await index.write_extraction(c, _fields(ledger_id))
             await index.ensure_schema(c)
             versions = (await c.execute(text("SELECT version FROM index_schema"))).scalars()
-            assert sorted(versions) == [1, 2, 3]
+            assert sorted(versions) == list(range(1, index.SCHEMA_VERSION + 1))
             await refresh_search_doc(c, _facts(ledger_id), CONTENT)
             await index.purge_document(c, ledger_id)
             for table in ("search_doc", "document_fields"):

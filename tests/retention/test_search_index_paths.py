@@ -1,10 +1,12 @@
 """The search index is a path that writes and deletes document data (CLAUDE.md rule 4).
 
-`search_doc` and `document_tag` rows leave only through `index.purge_document` (the
-`sijil.purge` gate, opened for one ledger id): a plain DELETE or TRUNCATE is refused like on
-every other index table. Writing search rows (upsert, state marks, tags) never touches the
-sealed `document_fields` row, its values or its `fields_sha256`. The daily resync purges the
-search rows of a document whose purge is done, and nothing else.
+`search_doc` rows leave only through `index.purge_document` (the `sijil.purge` gate, opened for
+one ledger id): a plain DELETE or TRUNCATE is refused like on every other index table.
+`document_tag` rows also leave by a plain DELETE since index schema v4 (removing a tag, an
+annotation: test_tag_paths.py); TRUNCATE is still refused. Writing search rows (upsert,
+state marks, tags) never touches the sealed `document_fields` row, its values or its
+`fields_sha256`. The daily resync purges the search rows of a document whose purge is done, and
+nothing else.
 """
 
 import uuid
@@ -140,9 +142,13 @@ async def test_purge_deletes_search_doc_and_tags(conn: AsyncConnection, sealed: 
     await index.purge_document(conn, ledger_id, sealed=sealed)  # idempotent
 
 
-@pytest.mark.parametrize("table", SEARCH_TABLES)
-async def test_plain_delete_of_search_doc_refused(conn: AsyncConnection, table: str) -> None:
+async def test_plain_delete_of_search_doc_refused(conn: AsyncConnection) -> None:
+    """`search_doc` keeps its gate; `document_tag` only refuses TRUNCATE (index schema v4: a tag
+    is removed by a plain DELETE, tests/retention/test_tag_paths.py)."""
+    table = "search_doc"
     ledger_id = await _document(conn, sealed=False)
+    with pytest.raises(DBAPIError, match="retention.locked"):
+        await conn.execute(text("TRUNCATE document_tag"))
     with pytest.raises(DBAPIError, match="retention.locked"):
         await conn.execute(
             text(f"DELETE FROM {table} WHERE ledger_id = :id"),  # noqa: S608

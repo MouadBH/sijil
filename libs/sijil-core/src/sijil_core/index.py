@@ -8,7 +8,8 @@ A row of `document_fields` is frozen once sealed, at the database level (trigger
 this module raises as `RetentionLocked` so callers can answer 409. `extraction_run` is evidence
 of what each model run said and is append-only, like `correction_note` (v2). The search index
 (v3, `sijil_core.search_index`: `search_doc`, `document_tag`) may change but never be deleted
-from. The one DELETE the triggers allow is `purge_document`'s.
+from. The one DELETE the triggers allow is `purge_document`'s, but for removing a tag (v4: a tag
+is an annotation). Saved views (v4, `saved_view`) are the workspace's, not a document's.
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -40,7 +41,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 3
+SCHEMA_VERSION: Final = 4
 MAX_ENGINES: Final = 32
 LOCKED_CODE: Final = "retention.locked"
 # SQLSTATE the triggers raise it with (custom class "SJ": Sijil).
@@ -274,6 +275,30 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         PERFORM set_config('sijil.purge', '', true);
         PERFORM set_config('sijil.purge_sealed', '', true);
     END $$""",
+    ),
+    # v4: saved views (`sijil_core.search_query`) and tag removal. A tag is an annotation, not
+    # document data: removing one is a plain DELETE (`search_index.set_tags`), so the purge-only
+    # trigger on `document_tag` goes; TRUNCATE is still refused, and `search_doc` keeps its
+    # gate. The invoice number gets an index for the exact match of a query token. The
+    # snippet's highlight (`ts_headline`, over the text as written) parses with
+    # `sijil_headline`, which drops Latin accents and case, so a query typed without them
+    # still marks its hits; matching itself uses the normalised columns.
+    4: (
+        "DROP TRIGGER document_tag_purge_only ON document_tag",
+        "CREATE TEXT SEARCH CONFIGURATION sijil_headline (COPY = simple)",
+        """ALTER TEXT SEARCH CONFIGURATION sijil_headline ALTER MAPPING FOR asciiword, asciihword,
+        hword_asciipart, word, hword, hword_part, numword, numhword, hword_numpart
+        WITH unaccent, simple""",
+        "CREATE INDEX search_doc_number ON search_doc (number)",
+        """CREATE TABLE saved_view (
+        id uuid PRIMARY KEY,
+        name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 80),
+        filters jsonb NOT NULL,
+        sort text NOT NULL,
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL
+    )""",
     ),
 }
 
