@@ -68,6 +68,7 @@ from sijil_worker.purge import (
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
+from sijil_worker.search import resync_search
 from sijil_worker.settings import (
     ExportSettings,
     ExtractionSettings,
@@ -231,11 +232,14 @@ async def _ingest(
 ) -> None:
     settings = WorkerSettings()
     engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    keys = LocalKeyService(settings.master_key_bytes())
+    engines = IndexEngines(settings, keys, sessions)
     try:
         await ingest_document(
             UUID(ledger_id),
-            sessions=make_sessionmaker(engine),
-            keys=LocalKeyService(settings.master_key_bytes()),
+            sessions=sessions,
+            keys=keys,
             store=S3ObjectStore(StorageSettings()),
             paperless=PaperlessClient,
             settings=settings,
@@ -244,8 +248,10 @@ async def _ingest(
             retry_after_s=retry_after_s,
             enqueue_extract=_send_extract,
             enqueue_purge=_send_purge,
+            index=engines,
         )
     finally:
+        await engines.aclose()
         await engine.dispose()
 
 
@@ -588,6 +594,42 @@ def mark_eligible_task() -> int:
     """Nightly: mark this region's documents past retention eligible for deletion. It deletes
     nothing (sijil_worker.eligibility)."""
     return asyncio.run(_mark_eligible())
+
+
+async def _search_resync(workspace_id: str | None) -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    keys = LocalKeyService(settings.master_key_bytes())
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        return await resync_search(
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id) if workspace_id else None,
+            full=workspace_id is not None,
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.search_resync")
+def search_resync_task() -> int:
+    """Daily: bring every active workspace's search rows of this region in step with the
+    ledger (sijil_worker.search)."""
+    return asyncio.run(_search_resync(None))
+
+
+@shared_task(name="sijil.search_backfill")
+def search_backfill_task(workspace_id: str) -> int:
+    """Rebuild every live search row of one workspace, its text fetched from its Paperless
+    again (`sijil-cp search backfill`, `make seed`)."""
+    return asyncio.run(_search_resync(workspace_id))
 
 
 # Mirror of a sealed document's fields into its Paperless: 30 s, 1 min ... capped at 15 min,

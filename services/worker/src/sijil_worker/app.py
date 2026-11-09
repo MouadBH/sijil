@@ -68,6 +68,11 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "task": "sijil.drift_check_all",
                 "schedule": crontab(hour=2, minute=30),
             },
+            # Mends search rows a best-effort step missed (sijil_worker.search).
+            "search-resync-daily": {
+                "task": "sijil.search_resync",
+                "schedule": crontab(hour=3, minute=30),
+            },
             # Exports older than 7 days go; only the export worker can delete one.
             "expire-exports-daily": {
                 "task": "sijil.expire_exports",

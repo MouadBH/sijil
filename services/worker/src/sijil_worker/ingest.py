@@ -59,6 +59,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.filetypes import FileKind
+from sijil_core.index import IndexEngines
 from sijil_core.ingest import Enqueue
 from sijil_core.paperless import (
     PaperlessClient,
@@ -72,6 +73,7 @@ from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.retention import region_local_date
 from sijil_core.settings import CoreSettings
 from sijil_core.storage import ObjectRef, ObjectStore
+from sijil_worker.search import index_document
 
 log = logging.getLogger(__name__)
 
@@ -617,13 +619,15 @@ async def ingest_document(
     retry_after_s: float = 0.0,
     enqueue_extract: Enqueue | None = None,
     enqueue_purge: Enqueue | None = None,
+    index: IndexEngines | None = None,
 ) -> None:
     """`will_retry(exc)` says whether the caller will run this again after `exc`, `retry_after_s`
     seconds from now (the Celery countdown, recorded so the requeue sweep agrees with it).
 
     Once the row is `consumed` (or `unsupported`, to be routed to review) and committed,
     `enqueue_extract(ledger_id, workspace_id)` sends the extraction. A failed send is logged
-    only: the extraction sweep picks the row up.
+    only: the extraction sweep picks the row up. Before that, with `index`, the document gets
+    its search row (state and arrival, no text yet: `sijil_worker.search.index_document`).
 
     A row its Owner removed during the run is a stop (see the module docstring), which sends
     `enqueue_purge(ledger_id, workspace_id)` when Paperless may hold a copy.
@@ -691,6 +695,8 @@ async def ingest_document(
         )
         raise
     # After the commit, never inside it: the extraction must find the row settled.
+    if settled and index is not None:
+        await index_document(sessions, index, ledger_id, settings=settings, now=utcnow())
     if settled and enqueue_extract is not None:
         try:
             await enqueue_extract(ledger_id, claim.workspace_id)

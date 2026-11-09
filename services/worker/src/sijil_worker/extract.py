@@ -22,7 +22,9 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
    `retention_until` to the fiscal date (the object lock first, then the ledger; never lower,
    ruling P1); audit `document.filed` / `document.needs_review`. Only a row still `received`
    moves, so it is routed once;
-7. after the commit, best effort, names the document in its own Paperless (title and type).
+7. after the commit, best effort, writes its search row (`sijil_worker.search.index_document`:
+   the routed state, the fields and the whole normalised text, when this run read it) and
+   names the document in its own Paperless (title and type).
 
 An `unsupported` row has no Paperless document: it gets an empty fields row flagged
 `ingest.unsupported_format` and goes straight to review, with no extraction.
@@ -91,6 +93,7 @@ from sijil_core.storage import ObjectRef
 from sijil_core.text import normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
 from sijil_worker.pending import PendingExtractions
+from sijil_worker.search import index_document
 from sijil_worker.settings import ExtractionSettings
 from sijil_worker.taxonomy import ensure_taxonomy
 
@@ -453,13 +456,15 @@ async def _compute(
     ollama: OllamaClient,
     model: str,
     now: datetime,
-) -> tuple[FieldsRow, list[tuple[RunName, _Run]]]:
-    """Reads the content and runs the model twice; returns the row and the runs to record.
+) -> tuple[FieldsRow, list[tuple[RunName, _Run]], str]:
+    """Reads the content and runs the model twice; returns the row, the runs to record and the
+    whole normalised text (for search; the model gets its first MAX_CONTENT_CHARS).
     Writes nothing (the index is only read, for the known supplier): see `_write_once`."""
     if job.doc_id is None or job.paperless_url is None:
         raise ValueError("no Paperless document to extract")
     async with paperless(job.paperless_url, token=job.token) as client:
-        content = normalise(await client.document_content(job.doc_id))[:MAX_CONTENT_CHARS]
+        text_all = normalise(await client.document_content(job.doc_id))
+        content = text_all[:MAX_CONTENT_CHARS]
         runs: list[tuple[RunName, _Run]] = []
         paperless_type: str | None = None
         if content.strip():
@@ -499,7 +504,7 @@ async def _compute(
         extracted_at=now,
         updated_at=now,
     )
-    return row, runs
+    return row, runs, text_all
 
 
 async def _extract(
@@ -510,13 +515,13 @@ async def _extract(
     ollama: OllamaClient,
     model: str,
     now: datetime,
-) -> FieldsRow:
-    """Computes the row (`_compute`) and writes it; returns the stored row."""
-    row, runs = await _compute(
+) -> tuple[FieldsRow, str]:
+    """Computes the row (`_compute`) and writes it; returns the stored row and the text."""
+    row, runs, content = await _compute(
         job, index=index, paperless=paperless, ollama=ollama, model=model, now=now
     )
     async with (await index.engine(job.workspace)).begin() as conn:
-        return await _write_once(conn, row, runs)
+        return await _write_once(conn, row, runs), content
 
 
 async def _unsupported_row(index: IndexEngines, job: _Job, now: datetime) -> FieldsRow:
@@ -556,6 +561,8 @@ async def _route(
     now: datetime,
     *,
     final: bool = False,
+    settings: ExtractionSettings,
+    content: str | None = None,
 ) -> Decision | None:
     """Files the document or sends it to review, once: under the ledger row's lock (taken
     before the audit chain's), only a row still `received` moves. None when nothing moved.
@@ -565,6 +572,9 @@ async def _route(
     fails, the error propagates for a retry; on the `final` path (nothing will retry) the
     document goes to review instead, flagged `retention.extend_failed`, its retention as the
     ledger holds it.
+
+    Once routed, the search row follows, after the commit (`index_document`, with `content`
+    when this run read it; None keeps what the row holds).
     """
     async with sessions() as session:
         found = (
@@ -629,6 +639,9 @@ async def _route(
             now=now,
         )
         await session.commit()
+    await index_document(
+        sessions, index, row.ledger_id, settings=settings, now=now, content=content
+    )
     return decision
 
 
@@ -694,6 +707,7 @@ async def extract_document(
     job = await _load(sessions, keys, settings, ledger_id, workspace_id)
     if job is None:
         return
+    content: str | None = None
     if job.unsupported:
         row = await _unsupported_row(index, job, now)
     else:
@@ -702,18 +716,24 @@ async def extract_document(
         stored = await _stored_row(index, job.workspace, ledger_id)
         if stored is None and await _ingest_in_progress(sessions, job.workspace.id, ledger_id, now):
             raise IngestInProgress
-        row = stored or await _extract(
-            job,
-            index=index,
-            paperless=paperless,
-            ollama=ollama,
-            model=settings.extraction_model,
-            now=now,
-        )
+        if stored is not None:
+            row = stored
+        else:
+            row, content = await _extract(
+                job,
+                index=index,
+                paperless=paperless,
+                ollama=ollama,
+                model=settings.extraction_model,
+                now=now,
+            )
         # 2. Make sure it is audited, exactly once.
         await _ensure_audited(sessions, job.workspace.id, ledger_id, row, now)
     # 3. Score and route it, once.
-    if await _route(sessions, index, store, job.workspace, row, now) is not None:
+    routed = await _route(
+        sessions, index, store, job.workspace, row, now, settings=settings, content=content
+    )
+    if routed is not None:
         await _name_in_paperless(job, paperless, row)
 
 
@@ -771,7 +791,7 @@ async def record_extraction_failed(
     async with (await index.engine(workspace)).begin() as conn:
         row = await _write_once(conn, failed, [])
     await _ensure_audited(sessions, workspace.id, ledger_id, row, now)
-    await _route(sessions, index, store, workspace, row, now, final=True)
+    await _route(sessions, index, store, workspace, row, now, final=True, settings=settings)
 
 
 async def requeue_unextracted(
