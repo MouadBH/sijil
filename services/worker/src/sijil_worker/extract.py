@@ -561,8 +561,6 @@ async def _route(
     now: datetime,
     *,
     final: bool = False,
-    settings: ExtractionSettings,
-    content: str | None = None,
 ) -> Decision | None:
     """Files the document or sends it to review, once: under the ledger row's lock (taken
     before the audit chain's), only a row still `received` moves. None when nothing moved.
@@ -572,9 +570,6 @@ async def _route(
     fails, the error propagates for a retry; on the `final` path (nothing will retry) the
     document goes to review instead, flagged `retention.extend_failed`, its retention as the
     ledger holds it.
-
-    Once routed, the search row follows, after the commit (`index_document`, with `content`
-    when this run read it; None keeps what the row holds).
     """
     async with sessions() as session:
         found = (
@@ -639,9 +634,6 @@ async def _route(
             now=now,
         )
         await session.commit()
-    await index_document(
-        sessions, index, row.ledger_id, settings=settings, now=now, content=content
-    )
     return decision
 
 
@@ -730,10 +722,12 @@ async def extract_document(
         # 2. Make sure it is audited, exactly once.
         await _ensure_audited(sessions, job.workspace.id, ledger_id, row, now)
     # 3. Score and route it, once.
-    routed = await _route(
-        sessions, index, store, job.workspace, row, now, settings=settings, content=content
-    )
-    if routed is not None:
+    if await _route(sessions, index, store, job.workspace, row, now) is not None:
+        # The search row follows the routing, after its commit (`content` None, when this run
+        # did not read the text, keeps what the row holds).
+        await index_document(
+            sessions, index, ledger_id, settings=settings, now=now, content=content
+        )
         await _name_in_paperless(job, paperless, row)
 
 
@@ -791,7 +785,8 @@ async def record_extraction_failed(
     async with (await index.engine(workspace)).begin() as conn:
         row = await _write_once(conn, failed, [])
     await _ensure_audited(sessions, workspace.id, ledger_id, row, now)
-    await _route(sessions, index, store, workspace, row, now, final=True, settings=settings)
+    if await _route(sessions, index, store, workspace, row, now, final=True) is not None:
+        await index_document(sessions, index, ledger_id, settings=settings, now=now)
 
 
 async def requeue_unextracted(
