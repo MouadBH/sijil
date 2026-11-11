@@ -25,8 +25,10 @@ a question still `queued` or `answering` (`ask_store.claim_ask`); anything else 
    (`[#n]`) and at most 3 excerpts of at most 300 characters from the cited documents,
    delimited and labelled as document text, not instructions;
 6. checks it (`check_answer`): every figure written as given (digits folded, `1 234,50`,
-   `1,234.50`, `1234.50`, `1234,50`), every `[#n]` one of the given citations, no other number
-   but those of the question and of the given lines, and the locale's script. Otherwise the
+   `1,234.50`, `1234.50`, `1234,50`), every `[#n]` one of the given citations, and every other
+   number, compared whole, a structured one (a document count, the left-out count, a year of
+   the period): free text (the question, a supplier name, an excerpt) lends it none. Last,
+   the locale's script. Otherwise the
    answer is templated: `answer_text` null and `answer_code` the `ask.answer.*` key the client
    renders with the figures. The citations are always the ones computed in 3 or 4;
 7. stores it (`ask_store.store_answer`, only while every document it quotes is live: else it
@@ -42,7 +44,7 @@ carries the question or the answer.
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -323,10 +325,13 @@ async def _answer(
     except OllamaBadOutput:
         out = {}
     written = out.get("answer")
-    allowed = "\n".join([record.question, *lines, str(facts.excluded)])
+    # Structured numbers only: free text (the question, a supplier name, an excerpt) is the
+    # user's or a document's, and lends the answer no number.
+    years = {d.year for d in (intent.period_from, intent.period_to) if d is not None}
     checked = isinstance(written, str) and check_answer(
-        written.strip(), facts.figures, len(facts.citations), record.locale, allowed
-    )
+        written.strip(), facts.figures, len(facts.citations), record.locale,
+        {*years, facts.excluded},
+    )  # fmt: skip
     return ask_store.Answer(
         intent=intent.as_json(),
         answer_text=written.strip() if checked and isinstance(written, str) else None,
@@ -587,7 +592,8 @@ async def _retrieve(
 # The validator ------------------------------------------------------------------------------
 
 _MARKER = re.compile(r"\[\s*#\s*(\d+)\s*\]")
-_DIGITS = re.compile(r"\d+")
+# A number as written once the digits are folded: digit runs joined by `.` or `,`.
+_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
 _ARABIC = re.compile(r"[ء-يٱ-ۓ]")
 _LATIN = re.compile(r"[a-z]")
 # Arabic decimal and thousands separators, and the minus sign, as ASCII.
@@ -622,18 +628,15 @@ def _value_pattern(value: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![\d.,]){sign}(?:{'|'.join(forms)})(?!\d|[.,]\d)")
 
 
-def _numbers(s: str) -> set[str]:
-    return {run.lstrip("0") or "0" for run in _DIGITS.findall(s)}
-
-
 def check_answer(
     answer: str, figures: Sequence[dict[str, Any]], citation_count: int, locale: str,
-    allowed: str,
+    numbers: Collection[int] = (),
 ) -> bool:  # fmt: skip
-    """Whether the model's answer may be shown: every figure's value written as given, every
-    `[#n]` within the `citation_count` given, no number but the figures', their document
-    counts and those in `allowed` (the question and the lines the writer was given), and the
-    locale's script (Arabic for `ar`, else Latin) ahead of the other."""
+    """Whether the model's answer may be shown: every figure's value written as given (any of
+    `_value_pattern`'s forms, digits folded), every `[#n]` within the `citation_count` given,
+    every other number in it, compared whole, one of the figures' document counts or of
+    `numbers` (the period's years, the left-out count), and the locale's script (Arabic for
+    `ar`, else Latin) ahead of the other."""
     if not answer.strip() or len(answer) > MAX_ANSWER_CHARS:
         return False
     folded = _fold(answer)
@@ -645,8 +648,8 @@ def check_answer(
         if pattern.search(rest) is None:
             return False
         rest = pattern.sub(" ", rest)
-    known = _numbers(_fold(allowed)) | {str(f["document_count"]) for f in figures}
-    if not _numbers(rest) <= known:
+    known = {str(n) for n in numbers} | {str(f["document_count"]) for f in figures}
+    if any(token not in known for token in _NUMBER.findall(rest)):
         return False
     arabic, latin = len(_ARABIC.findall(rest)), len(_LATIN.findall(rest))
     return arabic > latin if locale == "ar" else latin > arabic

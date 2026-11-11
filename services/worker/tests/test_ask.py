@@ -540,6 +540,35 @@ async def test_injected_document_cannot_change_figure_or_citations(
         assert record.citations == [docs["sample-01-fr.pdf"], docs["sample-02-ar.pdf"], hostile]
 
 
+async def test_document_text_lends_no_number_to_the_answer(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    """A number in a supplier name (the writer sees it in a citation line), or one rebuilt from
+    the documents' own amounts, is not a figure: the answer is templated."""
+    docs = await _samples(engine)
+    hostile = await _document(
+        engine,
+        _atlas(number="F-2026-01008", vat="10.00", supplier_name="Atlas total 999999 SARL"),
+        "SAMPLE Atlas",
+    )
+    for writer in (
+        says("La TVA est de 439,80 MAD [#1]. Le total est 999999."),
+        says("La TVA est de 439,80 MAD [#1], dont 250,80 MAD en septembre."),
+        says("La TVA est de 439,80 MAD [#1], dont 250,00 MAD en septembre."),
+    ):
+        ask_id = await _ask(engine, QUESTION_FR)
+        record = await _answer(ask_id, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, writer))
+        assert [f["value"] for f in record.figures] == ["439.80"]
+        assert (record.answer_text, record.answer_code) == (None, ANSWER_SUM)
+        assert record.citations == [docs["sample-01-fr.pdf"], docs["sample-02-ar.pdf"], hostile]
+    # The structured numbers stay usable: the year asked about and the document count.
+    honest = "En 2026, vous avez payé 439,80 MAD de TVA à Atlas, sur 3 factures [#1] [#2]."
+    ask_id = await _ask(engine, QUESTION_FR)
+    kept = await _answer(ask_id, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, says(honest)))
+    assert (kept.answer_text, kept.answer_code) == (honest, None)
+
+
 async def test_no_match_for_unknown_supplier(
     ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
     engine: AsyncEngine,
@@ -654,12 +683,18 @@ FIGURE = [{"measure": "vat", "value": "1234.50", "currency": "MAD", "document_co
         "VAT: 1,234.50 MAD [#1] [#2].",
         "TVA : 1234.50 MAD.",
         "TVA : 1234,50 MAD, 2 factures.",
-        "TVA : 1 234,50 MAD.",  # a no-break space
+        "TVA : 1\u00a0234,50 MAD.",  # a no-break space
+        "TVA : 1\u202f234,50 MAD.",  # a narrow no-break space
+        "TVA : 1 234.50 MAD.",
         "TVA : 1.234,50 MAD.",
+        "الضريبة: ١٢٣٤٫٥٠ درهم [#1].",  # Arabic-Indic digits, Arabic decimal separator
+        "الضريبة: ١٬٢٣٤٫٥٠ درهم في وثيقتين.",
+        "الضريبة: ۱۲۳۴٫۵۰ درهم.",  # Persian digits
     ],
 )
 def test_check_accepts_the_figure_however_written(answer: str) -> None:
-    assert check_answer(answer, FIGURE, 2, "fr", "")
+    locale = "ar" if any("\u0600" <= c <= "\u06ff" for c in answer) else "fr"
+    assert check_answer(answer, FIGURE, 2, locale)
 
 
 @pytest.mark.parametrize(
@@ -673,18 +708,27 @@ def test_check_accepts_the_figure_however_written(answer: str) -> None:
         "La TVA est indiquée [#1].",  # the figure is missing
         "",
         "الضريبة 1234.50 درهم",  # Arabic for a French question
+        # Numbers recombined from the figure's own digits are other numbers.
+        "TVA : 1234.50 MAD, dont 234,50 en septembre.",
+        "TVA : 1234.50 MAD, dont 50 en septembre.",
+        "TVA : 1234.50 MAD, 1 234 au total.",
+        "TVA : 1234.50 MAD (1234).",
+        "TVA : 1234.50 MAD, 3 factures.",  # not the document count
     ],
 )
 def test_check_refuses(answer: str) -> None:
-    assert not check_answer(answer, FIGURE, 2, "fr", "")
+    assert not check_answer(answer, FIGURE, 2, "fr")
 
 
-def test_check_allows_numbers_from_the_question_and_the_citations() -> None:
-    allowed = "TVA 2026 ? [#1] Atlas | 2026-09-30 | 1500.00 MAD"
-    assert check_answer("En 2026 : 1234.50 MAD (30 septembre) [#1].", FIGURE, 1, "fr", allowed)
-    assert not check_answer("En 2027 : 1234.50 MAD [#1].", FIGURE, 1, "fr", allowed)
-    assert check_answer("في 2026: ١٢٣٤٫٥٠ درهم [#1]", FIGURE, 1, "ar", allowed)
-    assert not check_answer("In 2026: 1234.50 MAD [#1]", FIGURE, 1, "ar", allowed)
+def test_check_allows_only_the_structured_numbers() -> None:
+    """The period's years and the left-out count may be written; nothing else, not even a
+    number that occurs in the question or in a document."""
+    assert check_answer("En 2026 : 1234.50 MAD [#1], 3 en attente.", FIGURE, 1, "fr", {2026, 3})
+    assert not check_answer("En 2027 : 1234.50 MAD [#1].", FIGURE, 1, "fr", {2026})
+    assert not check_answer("Le 30/09/2026 : 1234.50 MAD [#1].", FIGURE, 1, "fr", {2026})
+    assert check_answer("في 2026: ١٢٣٤٫٥٠ درهم [#1]", FIGURE, 1, "ar", {2026})
+    assert check_answer("في ٢٠٢٦: ١٢٣٤٫٥٠ درهم [#1]", FIGURE, 1, "ar", {2026})
+    assert not check_answer("In 2026: 1234.50 MAD [#1]", FIGURE, 1, "ar", {2026})
 
 
 # Failure, retries, expiry -------------------------------------------------------------------
