@@ -12,7 +12,8 @@ from. The one DELETE the triggers allow is `purge_document`'s, but for removing 
 is an annotation). Saved views (v4, `saved_view`) are the workspace's, not a document's. A
 document's chunks and their embeddings (v5, `doc_chunk`) are replaced as a whole by
 `replace_chunks` (gate `sijil.reembed`) and deleted by the purge; never updated. Embeddings,
-like every value here, stay in this database.
+like every value here, stay in this database. Ask's questions and answers (v6, `ask_query`)
+are not document data: they expire, and the purge deletes those quoting the purged document.
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -44,7 +45,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 5
+SCHEMA_VERSION: Final = 6
 # bge-m3's dimensions (SIJIL_EMBEDDING_MODEL): `doc_chunk.embedding` is vector(1024).
 EMBEDDING_DIM: Final = 1024
 MAX_ENGINES: Final = 32
@@ -367,6 +368,50 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         IF sealed THEN
             PERFORM set_config('sijil.purge_sealed', target::text, true);
         END IF;
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
+    ),
+    # v6: Ask's questions and answers (`sijil_core.ask_store`). Not document data, so no lock
+    # trigger: a daily task deletes questions after 90 days. An answer quotes documents, so the
+    # purge also deletes every answer that cites (`citations`) or counted (`counted`) the
+    # purged document: only its tombstone remains.
+    6: (
+        """CREATE TABLE ask_query (
+        id uuid PRIMARY KEY,
+        question text NOT NULL CHECK (char_length(question) BETWEEN 1 AND 500),
+        locale text NOT NULL CHECK (locale IN ('fr', 'ar', 'en')),
+        state text NOT NULL DEFAULT 'queued'
+            CHECK (state IN ('queued', 'answering', 'answered', 'failed')),
+        intent jsonb,
+        answer_text text,
+        answer_code text,
+        figures jsonb NOT NULL DEFAULT '[]',
+        citations uuid[] NOT NULL DEFAULT '{}',
+        counted uuid[] NOT NULL DEFAULT '{}',
+        excluded jsonb NOT NULL DEFAULT '{}',
+        error_code text,
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL,
+        answered_at timestamptz
+    )""",
+        "CREATE INDEX ask_query_created ON ask_query (created_at)",
+        "CREATE INDEX ask_query_citations ON ask_query USING gin (citations)",
+        "CREATE INDEX ask_query_counted ON ask_query USING gin (counted)",
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM ask_query WHERE citations @> ARRAY[target] OR counted @> ARRAY[target];
         DELETE FROM doc_chunk WHERE ledger_id = target;
         DELETE FROM document_tag WHERE ledger_id = target;
         DELETE FROM search_doc WHERE ledger_id = target;
@@ -733,8 +778,8 @@ def effective_fields(
 
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
     """Deletes the document's `document_fields`, `extraction_run`, `correction_note`,
-    `search_doc`, `document_tag` and `doc_chunk` rows, all or nothing, through the schema's
-    `purge_document()` function. Idempotent.
+    `search_doc`, `document_tag` and `doc_chunk` rows, and the `ask_query` answers citing or
+    counting it, all or nothing, through the schema's `purge_document()` function. Idempotent.
 
     The index triggers refuse every DELETE but one whose ledger id the GUC `sijil.purge` names,
     which the function sets with `set_config(..., true)` (`SET LOCAL`) and clears again before
