@@ -211,6 +211,33 @@ async def fail_ask(conn: AsyncConnection, ask_id: UUID, code: str, *, now: datet
     return result.first() is not None
 
 
+async def stale_queued(conn: AsyncConnection, before: datetime, limit: int) -> list[UUID]:
+    """Questions still `queued` that were asked before `before`, oldest first."""
+    result = await conn.execute(
+        text(
+            "SELECT id FROM ask_query WHERE state = 'queued' AND created_at < :before "
+            "ORDER BY created_at, id LIMIT :limit"
+        ),
+        {"before": before, "limit": limit},
+    )
+    return list(result.scalars())
+
+
+async def fail_abandoned(
+    conn: AsyncConnection, before: datetime, code: str, *, now: datetime
+) -> list[UUID]:
+    """`failed` with `code` for every question still `queued` or `answering` that was asked
+    before `before`; their ids."""
+    result = await conn.execute(
+        text(
+            "UPDATE ask_query SET state = 'failed', error_code = :code, answered_at = :now "
+            "WHERE state IN ('queued', 'answering') AND created_at < :before RETURNING id"
+        ),
+        {"before": before, "code": code, "now": now},
+    )
+    return list(result.scalars())
+
+
 async def answer_is_live(conn: AsyncConnection, record: AskRecord) -> bool:
     """Whether every document the answer cites or counted is still live (a removed one is
     waiting for its purge, which deletes the answer)."""

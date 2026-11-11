@@ -298,3 +298,7 @@ def test_ask_tasks_run_on_the_ask_queue() -> None:
         "schedule": crontab(hour=4, minute=0),
         "options": {"queue": "ask"},
     }
+    # Lost questions are re-sent, abandoned ones failed, every 300 s on the Ask worker.
+    sweep = make_celery(_settings()).conf.beat_schedule["sweep-asks"]
+    assert sweep == {"task": "sijil.sweep_asks", "schedule": 300, "options": {"queue": "ask"}}
+    assert getattr(tasks.sweep_asks_task, "queue", None) == "ask"

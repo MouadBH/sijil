@@ -39,12 +39,14 @@ The model never sees a figure it could change: the stored figures are the comput
 leaves the workspace's index database and the allow-listed Ollama. Ollama unavailable raises for
 the task to retry (the M3 rules); once the retries are spent the question is `failed` with
 `ask.unavailable` and audited `ask.failed` `{code}` (`record_ask_failed`). The audit never
-carries the question or the answer.
+carries the question or the answer. A lost message is caught by `sweep_questions` (every
+300 s): a question queued for more than 2 minutes is sent again, and one not answered within
+30 minutes is failed with `ask.unavailable`.
 """
 
 import logging
 import re
-from collections.abc import Collection, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -63,6 +65,7 @@ from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.retention import region_local_date
 from sijil_core.search_query import MAX_QUERY, SearchFilters, build_search
 from sijil_core.text import search_normalise
+from sijil_worker.pending import PendingExtractions
 from sijil_worker.settings import AskSettings
 
 log = logging.getLogger(__name__)
@@ -693,17 +696,9 @@ async def expire_questions(
     """Daily (`sijil.expire_asks`): deletes the questions asked more than RETENTION_DAYS ago
     in every workspace of this region; how many went. A workspace that fails is logged by its
     class and skipped."""
-    async with sessions() as session:
-        found = (
-            await session.execute(
-                select(Workspace, Organisation.region)
-                .join(Organisation, Organisation.id == Workspace.org_id)
-                .where(Organisation.region == settings.region, Workspace.state.in_(_EXPIRING))
-            )
-        ).all()
     before = now - timedelta(days=ask_store.RETENTION_DAYS)
     deleted = 0
-    for workspace, region in found:
+    for workspace, region in await _region_workspaces(sessions, settings):
         try:
             assert_region(region, settings)
             engine = await index.engine(workspace)
@@ -713,3 +708,68 @@ async def expire_questions(
             name = type(exc).__name__
             log.warning("questions of workspace %s not expired: %s", workspace.id, name)
     return deleted
+
+
+async def _region_workspaces(
+    sessions: async_sessionmaker[AsyncSession], settings: AskSettings
+) -> list[tuple[Workspace, str]]:
+    async with sessions() as session:
+        found = (
+            await session.execute(
+                select(Workspace, Organisation.region)
+                .join(Organisation, Organisation.id == Workspace.org_id)
+                .where(Organisation.region == settings.region, Workspace.state.in_(_EXPIRING))
+            )
+        ).all()
+    return [(workspace, region) for workspace, region in found]
+
+
+# A question still `queued` this long lost its message; one not answered this long is failed.
+STALE_QUEUED: Final = timedelta(minutes=2)
+ABANDONED: Final = timedelta(minutes=30)
+SWEEP_BATCH: Final = 100
+
+
+async def sweep_questions(
+    *,
+    sessions: async_sessionmaker[AsyncSession],
+    index: IndexEngines,
+    settings: AskSettings,
+    pending: PendingExtractions,
+    send: Callable[[UUID, UUID], Awaitable[None]],
+    now: datetime,
+) -> tuple[int, int]:
+    """Every 300 s (`sijil.sweep_asks`), in every workspace of this region: a question
+    `queued` or `answering` for more than ABANDONED is `failed` with `ask.unavailable` and
+    audited `ask.failed` (a late message for it is then a no-op); one `queued` for more than
+    STALE_QUEUED is sent again, once its `ask:pending:<id>` key is claimed (a second sweep
+    finds the claim and sends nothing). A re-send racing a first run is harmless: only a
+    `queued` or `answering` question is answered, and `store_answer` stores one answer.
+    Returns (re-sent, failed). A workspace or a send that fails is logged and skipped."""
+    resent = failed = 0
+    for workspace, region in await _region_workspaces(sessions, settings):
+        try:
+            assert_region(region, settings)
+            engine = await index.engine(workspace)
+            async with engine.begin() as conn:
+                gone = await ask_store.fail_abandoned(conn, now - ABANDONED, UNAVAILABLE, now=now)
+            for ask_id in gone:
+                await _ensure_audited(sessions, engine, workspace.id, ask_id, now)
+            failed += len(gone)
+            async with engine.connect() as conn:
+                stale = await ask_store.stale_queued(conn, now - STALE_QUEUED, SWEEP_BATCH)
+        except Exception as exc:
+            name = type(exc).__name__
+            log.warning("questions of workspace %s not swept: %s", workspace.id, name)
+            continue
+        for ask_id in stale:
+            if not await pending.claim(ask_id):
+                continue
+            try:
+                await send(ask_id, workspace.id)
+            except Exception as exc:
+                await pending.clear(ask_id)
+                log.warning("question %s re-send failed: %s", ask_id, type(exc).__name__)
+                continue
+            resent += 1
+    return resent, failed

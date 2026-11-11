@@ -14,6 +14,7 @@ REQUEUE_UNLOCKED_INTERVAL_S = 300
 REQUEUE_UNREMOVED_INTERVAL_S = 300
 REQUEUE_UNPURGED_INTERVAL_S = 300
 SWEEP_EXPORTS_INTERVAL_S = 300
+SWEEP_ASKS_INTERVAL_S = 300
 QUEUES = (
     "default",
     "provisioning",
@@ -88,6 +89,13 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "task": "sijil.expire_exports",
                 "schedule": crontab(hour=3, minute=0),
                 "options": {"queue": "export"},
+            },
+            # Lost questions sent again, abandoned ones failed (sijil_worker.ask), on the Ask
+            # worker: it holds the master key that opens the index databases.
+            "sweep-asks": {
+                "task": "sijil.sweep_asks",
+                "schedule": SWEEP_ASKS_INTERVAL_S,
+                "options": {"queue": "ask"},
             },
             # Questions asked more than 90 days ago go (sijil_worker.ask), on the Ask worker.
             "expire-asks-daily": {

@@ -25,6 +25,7 @@ from sijil_core.paperless import (
     PaperlessUnavailable,
 )
 from sijil_core.pending import (
+    ASK_PREFIX,
     EMBED_PREFIX,
     EXPORT_PREFIX,
     PENDING_TTL_S,
@@ -34,7 +35,12 @@ from sijil_core.pending import (
 from sijil_core.region import RegionMismatch
 from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
 from sijil_worker.ask import UNAVAILABLE as ASK_UNAVAILABLE
-from sijil_worker.ask import answer_question, expire_questions, record_ask_failed
+from sijil_worker.ask import (
+    answer_question,
+    expire_questions,
+    record_ask_failed,
+    sweep_questions,
+)
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -1448,3 +1454,39 @@ async def _expire_asks() -> int:
 def expire_asks_task() -> int:
     """Daily, on the Ask worker: questions asked more than 90 days ago are deleted."""
     return asyncio.run(_expire_asks())
+
+
+async def _sweep_asks() -> tuple[int, int]:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ask_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.answer_question",
+            kwargs={"ask_id": str(ask_id), "workspace_id": str(workspace_id)},
+            queue="ask",
+        )
+
+    try:
+        return await sweep_questions(
+            sessions=sessions,
+            index=engines,
+            settings=settings,
+            pending=PendingExtractions(redis, prefix=ASK_PREFIX),
+            send=send,
+            now=utcnow(),
+        )
+    finally:
+        await redis.aclose()
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.sweep_asks", queue="ask")
+def sweep_asks_task() -> tuple[int, int]:
+    """Every 300 s, on the Ask worker: re-send lost questions and fail abandoned ones
+    (sijil_worker.ask.sweep_questions)."""
+    return asyncio.run(_sweep_asks())

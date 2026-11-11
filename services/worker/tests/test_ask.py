@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 import pytest
+from redis.asyncio import Redis
 from sqlalchemy import select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import (
@@ -40,6 +41,7 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, fields_digest
 from sijil_core.index import EMBEDDING_DIM, FieldsRow, IndexEngines
 from sijil_core.ollama import OllamaClient, OllamaUnavailable
+from sijil_core.pending import ASK_PREFIX
 from sijil_core.search_index import SearchLedgerFacts, mark_search_state, refresh_search_doc
 from sijil_worker.ask import (
     ANSWER_COUNT,
@@ -51,7 +53,9 @@ from sijil_worker.ask import (
     check_answer,
     expire_questions,
     record_ask_failed,
+    sweep_questions,
 )
+from sijil_worker.pending import PendingExtractions
 from sijil_worker.settings import AskSettings
 from tests.support.index_db import throwaway_index_db
 
@@ -810,3 +814,121 @@ async def test_questions_expire_after_90_days(
     async with engine.connect() as conn:
         left = set(await conn.scalars(text("SELECT id FROM ask_query")))
     assert left == {recent}
+
+
+# The sweep ----------------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def own_engines(
+    ready: Workspace, index_db_url: str, keys: LocalKeyService,
+    sessions: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[IndexEngines]:  # fmt: skip
+    """The throw-away index database for `ready` only: the sweep visits every workspace of the
+    region, and the shared test database holds other tests' workspaces too."""
+
+    def factory(url: URL) -> AsyncEngine:
+        if url.database != ready.index_db_name:
+            raise LookupError("another test's workspace")
+        return create_async_engine(index_db_url)
+
+    found = IndexEngines(SETTINGS, keys, sessions, engine_factory=factory)
+    yield found
+    await found.aclose()
+
+
+async def _asked_at(engine: AsyncEngine, at: datetime, state: str = "queued") -> uuid.UUID:
+    ask_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await ask_store.create_ask(
+            conn, ask_id, question=QUESTION_FR, locale="fr", created_by=uuid.uuid4(), now=at
+        )
+        if state == "answering":
+            assert await ask_store.claim_ask(conn, ask_id) is not None
+    return ask_id
+
+
+async def _state(engine: AsyncEngine, ask_id: uuid.UUID) -> tuple[str, str | None]:
+    async with engine.connect() as conn:
+        record = await ask_store.read_ask(conn, ask_id)
+    assert record is not None
+    return record.state, record.error_code
+
+
+async def test_sweep_resends_questions_queued_too_long_once(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], own_engines: IndexEngines,
+    redis: Redis,
+) -> None:  # fmt: skip
+    engine = await own_engines.engine(ready)
+    lost = await _asked_at(engine, NOW - timedelta(minutes=3))
+    fresh = await _asked_at(engine, NOW - timedelta(minutes=1))
+    running = await _asked_at(engine, NOW - timedelta(minutes=5), "answering")
+    sent: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def send(ask_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append((ask_id, workspace_id))
+
+    pending = PendingExtractions(redis, prefix=ASK_PREFIX)
+    for _ in range(2):  # the second sweep finds the claim: no second message
+        await sweep_questions(
+            sessions=sessions, index=own_engines, settings=SETTINGS, pending=pending,
+            send=send, now=NOW,
+        )  # fmt: skip
+    assert sent == [(lost, ready.id)]
+    assert await redis.exists(f"ask:pending:{lost}") == 1
+    assert {await _state(engine, i) for i in (lost, fresh)} == {("queued", None)}
+    assert await _state(engine, running) == ("answering", None)
+
+
+async def test_sweep_fails_questions_left_too_long(
+    db: AsyncSession, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    own_engines: IndexEngines, redis: Redis,
+) -> None:  # fmt: skip
+    engine = await own_engines.engine(ready)
+    queued = await _asked_at(engine, NOW - timedelta(minutes=31))
+    answering = await _asked_at(engine, NOW - timedelta(minutes=45), "answering")
+    young = await _asked_at(engine, NOW - timedelta(minutes=29), "answering")
+    sent: list[uuid.UUID] = []
+
+    async def send(ask_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append(ask_id)
+
+    await sweep_questions(
+        sessions=sessions, index=own_engines, settings=SETTINGS,
+        pending=PendingExtractions(redis, prefix=ASK_PREFIX), send=send, now=NOW,
+    )  # fmt: skip
+    assert sent == []  # failed, not sent again
+    for ask_id in (queued, answering):
+        assert await _state(engine, ask_id) == ("failed", UNAVAILABLE)
+    assert await _state(engine, young) == ("answering", None)
+    events = await _events(db, ready, "ask.failed")
+    assert sorted(e.target_id or "" for e in events) == sorted([str(queued), str(answering)])
+    assert all(e.data == {"code": "ask.unavailable"} for e in events)
+    # A late message for a failed question does nothing.
+    late = FakeOllama(VAT_ATLAS_2026, says("429.80 MAD"))
+    async with late.client() as client:
+        await answer_question(
+            queued, sessions=sessions, index=own_engines, ollama=client, settings=SETTINGS,
+            workspace_id=ready.id, now=NOW,
+        )  # fmt: skip
+    assert late.chats == [] and await _state(engine, queued) == ("failed", UNAVAILABLE)
+
+
+async def test_a_resend_racing_a_slow_first_run_answers_once(
+    db: AsyncSession, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    engines: IndexEngines, engine: AsyncEngine,
+) -> None:  # fmt: skip
+    """The first run claimed the question and is still writing when the re-sent message runs
+    and answers it: the first run's answer is then refused, and one answer is audited."""
+    await _samples(engine)
+    ask_id = await _asked_at(engine, NOW - timedelta(minutes=3), "answering")
+    second = await _answer(
+        ask_id, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, says("429.80 MAD [#1]"))
+    )
+    assert second.state == "answered" and second.answer_text == "429.80 MAD [#1]"
+    late = ask_store.Answer(intent={"kind": "lookup"}, answer_text="x", answer_code=None)
+    async with engine.begin() as conn:
+        assert not await ask_store.store_answer(conn, ask_id, late, now=NOW)
+    async with engine.connect() as conn:
+        assert await ask_store.read_ask(conn, ask_id) == second
+    assert len(await _events(db, ready, "ask.answered")) == 1

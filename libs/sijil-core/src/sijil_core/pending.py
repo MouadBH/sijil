@@ -19,6 +19,8 @@ PURGE_PREFIX: Final = "purge"
 EMBED_PREFIX: Final = "embed"
 # Keyed by export job id, not a document: `export:pending:<job_id>`.
 EXPORT_PREFIX: Final = "export"
+# Keyed by question id: `ask:pending:<ask_id>`, claimed by the Ask sweep before a re-send.
+ASK_PREFIX: Final = "ask"
 
 
 def pending_key(ledger_id: UUID, prefix: str = EXTRACT_PREFIX) -> str:
