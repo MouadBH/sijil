@@ -264,7 +264,7 @@ seed=$(sed -n 's/^SIJIL_EXPORT_SIGNING_KEY=//p' .env)
 held=$(compose exec -T worker-export printenv SIJIL_EXPORT_SIGNING_KEY 2>/dev/null | tr -d '\r')
 [ -n "$seed" ] && [ "$held" = "$seed" ] \
   && pass "export worker holds the signing seed" || fail "export worker signing seed"
-for svc in control-plane worker worker-extraction worker-seal worker-removal smtp beat; do
+for svc in control-plane worker worker-extraction worker-seal worker-removal worker-ask smtp beat; do
   names=$(env_names "$svc")
   values=$(compose exec -T "$svc" sh -c 'env | cut -d= -f2-' 2>/dev/null | tr -d '\r')
   if grep -qx exec-failed <<<"$names" || [ -z "$names" ]; then
@@ -277,6 +277,34 @@ for svc in control-plane worker worker-extraction worker-seal worker-removal smt
     pass "$svc holds neither the signing seed nor the export key"
   fi
 done
+# The Ask worker: consuming `ask`, on `core` and `ai` only (no tenant network), with no Docker
+# socket and no object-store key of any kind (no seal, removal or export key).
+ping_out=$(compose exec -T worker-ask celery -A sijil_worker.main_ask inspect ping \
+  --timeout 10 2>/dev/null)
+grep -A1 'ask@' <<<"$ping_out" | grep -q pong \
+  && pass "ask worker answers celery ping" || fail "ask worker ping"
+sock=$(compose exec -T worker-ask sh -c \
+  'if [ -S /var/run/docker.sock ]; then echo socket; else echo none; fi' 2>/dev/null | tr -d '\r')
+case "$sock" in
+  none) pass "ask worker has no Docker socket" ;;
+  socket) fail "ask worker has the Docker socket" ;;
+  *) fail "ask worker socket check could not run (exec failed)" ;;
+esac
+ask_id=$(compose ps -q worker-ask 2>/dev/null)
+nets=$(docker inspect "$ask_id" \
+  --format '{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}' 2>/dev/null)
+[ "$nets" = "${project:-sijil}_ai ${project:-sijil}_core " ] \
+  && pass "ask worker is on the core and ai networks only" \
+  || fail "ask worker networks: '$nets' (only ${project:-sijil}_ai and _core expected)"
+names=$(env_names worker-ask)
+if grep -qx exec-failed <<<"$names" || ! grep -qx SIJIL_MASTER_KEY <<<"$names"; then
+  fail "ask worker env check could not run (exec failed)"
+elif grep -Eq '^SIJIL_OBJECTSTORE_|^SIJIL_EXPORT_SIGNING_KEY$|^SIJIL_PROVISIONER_' <<<"$names"; then
+  fail "ask worker holds an object-store key, the signing seed or the provisioner role"
+else
+  pass "ask worker holds no seal, removal, export or app key"
+fi
+
 public=$(sed -n 's/^SIJIL_EXPORT_PUBLIC_KEY=//p' .env)
 curl -s localhost:8000/v1/regions/ma-cas/export-key | grep -qF "\"public_key\":\"$public\"" \
   && pass "control plane publishes the region's export key" || fail "published export key"

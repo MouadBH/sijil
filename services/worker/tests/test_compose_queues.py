@@ -38,7 +38,7 @@ def test_ollama_is_capped_and_fails_fast_when_busy() -> None:
     # The model sizes its thread pool from the host's CPUs (eight), not the quota: eight threads
     # under six CPUs were throttled to 0.4 tokens/s (measured), so every client asks for six.
     text = COMPOSE
-    for anchor in ("x-worker-env", "x-extraction-env"):
+    for anchor in ("x-worker-env", "x-extraction-env", "x-ask-env"):
         env = text.split(f"{anchor}: &", 1)[1].split("\n\n", 1)[0]
         assert re.search(r'^  SIJIL_OLLAMA_NUM_THREAD: "6"$', env, re.MULTILINE), anchor
     assert re.search(r'^      OLLAMA_NUM_PARALLEL: "1"$', block, re.MULTILINE)
@@ -272,3 +272,48 @@ def test_the_daily_expiry_runs_on_the_export_worker() -> None:
     assert entry["options"] == {"queue": "export"}
     sweep = make_celery(settings).conf.beat_schedule["sweep-exports"]
     assert (sweep["task"], sweep["schedule"]) == ("sijil.sweep_exports", 300)
+
+
+def test_ask_worker_consumes_only_ask_one_at_a_time_on_core_and_ai() -> None:
+    """Ask's own worker: one question at a time on the shared Ollama, reading only the index
+    databases, so no tenant network, no Docker socket and no published port."""
+    block = _block("worker-ask")
+    raw = _key(block, "command")
+    assert raw is not None
+    command = json.loads(raw)
+    assert command[:5] == ["celery", "-A", "sijil_worker.main_ask", "worker", "-Q"]
+    assert _queues(command) == {"ask"}
+    assert command[command.index("--concurrency") + 1] == "1"
+    assert command[command.index("-n") + 1] == "ask@%h"
+    assert _key(block, "environment") == "*ask-env"
+    assert _key(block, "networks") == "[core, ai]"
+    assert _key(block, "ports") is None
+    assert "docker.sock" not in block
+    assert "group_add" not in block
+    src = ROOT / "services" / "worker" / "src" / "sijil_worker"
+    assert "reconcile_on_start" not in (src / "main_ask.py").read_text()
+
+
+def test_ask_worker_env_holds_no_store_key() -> None:
+    """The region, the broker, the database as the app role, the master key (the index
+    databases) and the Ollama settings; no object-store key of any kind, no signing seed, no
+    provisioner role."""
+    env = _anchor("ask-env")
+    assert "<<: *sijil-env" in env
+    for present in (
+        "SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}",
+        "SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:",
+        "SIJIL_OLLAMA_URL: http://ollama:11434",
+        "SIJIL_AI_ALLOWED_HOSTS: ollama",
+        "SIJIL_ASK_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}",
+        "SIJIL_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}",
+    ):
+        assert present in env, present
+    for absent in (
+        "*objectstore-env",
+        "OBJECTSTORE",
+        "SIJIL_PROVISIONER_DATABASE_URL",
+        "SIJIL_EXPORT_SIGNING_KEY",
+        "SIJIL_TENANT_IMAGE",
+    ):
+        assert absent not in env, absent

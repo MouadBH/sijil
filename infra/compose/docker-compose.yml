@@ -130,6 +130,21 @@ x-export-env: &export-env
   SIJIL_OBJECTSTORE_BUCKET: sijil-originals-${SIJIL_REGION:?SIJIL_REGION is required}
   SIJIL_EXPORT_SIGNING_KEY: ${SIJIL_EXPORT_SIGNING_KEY:?}
 
+# The Ask worker (`sijil_worker.settings.AskSettings`): the region, the broker, the database as
+# the app role, the master key (to open the workspaces' index databases, where questions,
+# answers and the documents' search rows live) and the in-region Ollama. No object-store key of
+# any kind, no provisioner role, no signing seed.
+x-ask-env: &ask-env
+  <<: *sijil-env
+  SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
+  SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
+  SIJIL_OLLAMA_URL: http://ollama:11434
+  SIJIL_AI_ALLOWED_HOSTS: ollama
+  # The extraction model reads the question and writes the answer; bge-m3 embeds the question.
+  SIJIL_ASK_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+  SIJIL_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}
+  SIJIL_OLLAMA_NUM_THREAD: "6"
+
 x-tenant-networks: &all-tenant-networks [tenant_t1, tenant_t2]
 
 services:
@@ -393,6 +408,22 @@ services:
     command: ["celery", "-A", "sijil_worker.main_export", "worker", "-Q", "export", "--concurrency", "1", "-n", "export@%h", "--loglevel", "INFO"]
     environment: *export-env
     networks: [core]
+    depends_on:
+      redis: { condition: service_started }
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+  worker-ask:
+    # Ask (sijil.answer_question) and the questions' daily expiry (sijil.expire_asks). It reads
+    # the workspaces' index databases (never Paperless) and calls Ollama, one question at a
+    # time. On `core` and `ai` only: no tenant network, no published port, no Docker socket.
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    restart: unless-stopped
+    command: ["celery", "-A", "sijil_worker.main_ask", "worker", "-Q", "ask", "--concurrency", "1", "-n", "ask@%h", "--loglevel", "INFO"]
+    environment: *ask-env
+    networks: [core, ai]
     depends_on:
       redis: { condition: service_started }
       postgres: { condition: service_healthy }
