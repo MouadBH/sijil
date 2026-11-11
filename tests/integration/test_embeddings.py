@@ -26,7 +26,7 @@ from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import EMBEDDING_DIM, FieldsRow
 from sijil_core.ollama import OllamaClient, OllamaError
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
-from sijil_worker.embed import chunk_texts
+from sijil_worker.embed import chunk_texts, source_digest
 from sijil_worker.settings import WorkerSettings
 from tests.support.index_db import throwaway_index_db
 
@@ -125,7 +125,9 @@ async def test_real_bge_m3_embeddings_rank_the_similar_document_first(
                 print(f"EMBEDDING-DIMS {item['file']} {sorted(dims)}")
                 assert dims == {EMBEDDING_DIM} == {1024}
             chunks = list(zip(texts, vectors, strict=True))
-            assert await index.replace_chunks(conn, ledger_id, model, chunks)
+            assert await index.replace_chunks(
+                conn, ledger_id, model, chunks, source_sha256=source_digest(texts)
+            )
         print(f"EMBEDDING-SECONDS {len(MANIFEST)} documents {time.monotonic() - started:.1f}s")
 
         for file, question in QUESTIONS.items():

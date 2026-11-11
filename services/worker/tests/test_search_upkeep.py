@@ -50,9 +50,16 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.paperless import PaperlessClient
-from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc, upsert_search_doc
+from sijil_core.search_index import (
+    SearchLedgerFacts,
+    mark_search_state,
+    refresh_search_doc,
+    set_tags,
+    upsert_search_doc,
+)
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
+from sijil_worker.embed import chunk_input, source_digest
 from sijil_worker.search import resync_search
 from sijil_worker.settings import BrokerSettings, WorkerSettings
 from tests.support.index_db import throwaway_index_db
@@ -483,3 +490,132 @@ async def test_one_unreadable_document_does_not_stop_the_resync(
     assert (await _search(conn, removed.id) or {})["state"] == "removed"
     assert await _resynced(db, ready) == [{"fixed": 3, "failed": 1}]
     assert "SAMPLE" not in caplog.text  # logged by class only
+
+
+# Embeddings ---------------------------------------------------------------------------------
+# The resync also sends `sijil.embed_document` for each live document whose chunks are missing
+# or were made from another chunk input (`doc_chunk.source_sha256`): a lost message, or a change
+# no message followed (a review edit). Tags are not chunk input.
+
+
+def _recorder() -> tuple[list[tuple[uuid.UUID, uuid.UUID]], Any]:
+    sent: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def send(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append((ledger_id, workspace_id))
+
+    return sent, send
+
+
+async def _embedded(conn: AsyncConnection, ledger_id: uuid.UUID) -> None:
+    """Chunks made from the document's current chunk input (vectors are placeholders)."""
+    texts = await chunk_input(conn, ledger_id)
+    assert texts
+    vectors = [[0.5] * index.EMBEDDING_DIM for _ in texts]
+    assert await index.replace_chunks(
+        conn, ledger_id, "bge-m3", list(zip(texts, vectors, strict=True)),
+        source_sha256=source_digest(texts),
+    )  # fmt: skip
+
+
+async def _live(
+    db: AsyncSession, conn: AsyncConnection, ws: Workspace, user: User, state: DocumentState,
+    doc_id: int,
+) -> DocumentLedger:  # fmt: skip
+    row = await _ledger(db, ws, user, state, doc_id)
+    await _fields(conn, row.id)
+    await _search_row(conn, row, state, f"Facture SAMPLE {doc_id}")
+    return row
+
+
+async def test_resync_enqueues_a_lost_embedding(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    lost = [
+        await _live(db, conn, ready, user, state, 190 + n)
+        for n, state in enumerate(
+            (DocumentState.received, DocumentState.needs_review, DocumentState.filed,
+             DocumentState.sealed)
+        )
+    ]  # fmt: skip
+    sent, send = _recorder()
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        await _run(sessions, keys, engines, enqueue_embed=send)
+    assert sorted(sent) == sorted((row.id, ready.id) for row in lost)
+
+
+async def test_resync_enqueues_after_a_needs_review_field_edit(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    row = await _live(db, conn, ready, user, DocumentState.needs_review, 201)
+    await _embedded(conn, row.id)
+    # A reviewer's edit (PATCH fields): the fields row and the search row, no embedding sent.
+    await index.update_fields(
+        conn, row.id, {"supplier_name": "Rif Imprimerie SAMPLE"}, source="user",
+        updated_by=user.id, now=NOW,
+    )  # fmt: skip
+    facts = SearchLedgerFacts(
+        ledger_id=row.id, state="needs_review", ingested_at=row.ingested_at, region="ma-cas",
+        now=NOW,
+    )  # fmt: skip
+    await refresh_search_doc(conn, facts)
+    sent, send = _recorder()
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        await _run(sessions, keys, engines, enqueue_embed=send)
+    assert sent == [(row.id, ready.id)]
+
+
+async def test_resync_does_not_enqueue_a_tag_only_change(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """A tag write bumps `search_doc.updated_at` but is not chunk input."""
+    row = await _live(db, conn, ready, user, DocumentState.filed, 211)
+    await _embedded(conn, row.id)
+    await set_tags(conn, row.id, ["bureau", "urgent"], by=user.id, now=NOW + timedelta(days=1))
+    sent, send = _recorder()
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        await _run(sessions, keys, engines, enqueue_embed=send)
+    assert sent == []
+
+
+async def test_resync_does_not_enqueue_an_up_to_date_document(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    rows = [
+        await _live(db, conn, ready, user, state, 220 + n)
+        for n, state in enumerate((DocumentState.filed, DocumentState.sealed))
+    ]
+    for row in rows:
+        await _embedded(conn, row.id)
+    sent, send = _recorder()
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        assert await _run(sessions, keys, engines, enqueue_embed=send) == 0
+    assert sent == []
+    assert await _resynced(db, ready) == []
+
+
+async def test_resync_never_enqueues_a_terminal_document(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """Removed with a row still live (marked by this run), or already marked: never sent."""
+    unmarked = await _ledger(db, ready, user, DocumentState.removed, 231)
+    await _fields(conn, unmarked.id)
+    await _search_row(conn, unmarked, DocumentState.filed, "Facture SAMPLE retirée")
+    marked = await _ledger(db, ready, user, DocumentState.removed, 232)
+    await _fields(conn, marked.id)
+    await _search_row(conn, marked, DocumentState.filed, "Facture SAMPLE retirée")
+    await mark_search_state(conn, marked.id, DocumentState.removed)
+    sent, send = _recorder()
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        await _run(sessions, keys, engines, enqueue_embed=send)
+    assert sent == []

@@ -22,7 +22,11 @@ purged document never gets a row again. Under the lock (`_write`):
   `document_fields`). With `full=True` and one workspace (`sijil.search_backfill`), every
   live row is rebuilt, text included. A document that fails (Paperless, the index) is logged
   by its class, counted and skipped; the run goes on. A workspace with fixes or failures gets
-  one `search.resynced` `{fixed, failed}` event.
+  one `search.resynced` `{fixed, failed}` event. Last, with `enqueue_embed`, every live
+  document (`received`, `needs_review`, `filed`, `sealed`) whose chunks are missing or were
+  made from another chunk input (`doc_chunk.source_sha256`, sijil_worker.embed) gets
+  `sijil.embed_document` again: a lost message, or a review edit. Not `search_doc.updated_at`,
+  which a tag write moves.
 
 Only consumed (or unsupported) documents are indexed: one still being ingested, or whose
 ingest failed, has no text and nothing to find. Content goes only to the workspace's own index
@@ -54,6 +58,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.index import IndexEngines
+from sijil_core.ingest import Enqueue
 from sijil_core.paperless import PaperlessClient
 from sijil_core.region import assert_region
 from sijil_core.search_index import (
@@ -65,6 +70,7 @@ from sijil_core.search_index import (
 )
 from sijil_core.settings import CoreSettings
 from sijil_core.text import normalise
+from sijil_worker.embed import needs_embedding
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +174,7 @@ async def resync_search(
     now: datetime,
     workspace_id: UUID | None = None,
     full: bool = False,
+    enqueue_embed: Enqueue | None = None,
 ) -> int:
     """See the module docstring. Returns how many rows were fixed in all. A workspace that
     fails as a whole (its index or Paperless unreachable) is logged and skipped (the next run
@@ -187,8 +194,9 @@ async def resync_search(
         assert_region(region, settings)
         try:
             fixed, failed = await _resync_workspace(
-                sessions, keys, index, paperless, workspace, region, now, full=full
-            )
+                sessions, keys, index, paperless, workspace, region, now, full=full,
+                enqueue_embed=enqueue_embed,
+            )  # fmt: skip
         except Exception as exc:
             if workspace_id is not None:
                 raise
@@ -226,6 +234,7 @@ async def _resync_workspace(
     now: datetime,
     *,
     full: bool,
+    enqueue_embed: Enqueue | None = None,
 ) -> tuple[int, int]:
     """(fixed, failed). The snapshot below only chooses what to look at: each write reads the
     ledger again under its lock (`_write`)."""
@@ -290,4 +299,28 @@ async def _resync_workspace(
                 )
                 continue
             fixed += 1
+    if enqueue_embed is not None:
+        live = [lid for lid, state, _, _ in rows if state not in TERMINAL_STATES]
+        await _resend_embeddings(engine, workspace.id, live, enqueue_embed)
     return fixed, failed
+
+
+async def _resend_embeddings(
+    engine: AsyncEngine, workspace_id: UUID, live: list[UUID], enqueue_embed: Enqueue
+) -> int:
+    """Sends `sijil.embed_document` (deduplicated by the sender) for each live document whose
+    chunks are missing or stale (`sijil_worker.embed.needs_embedding`). A document that fails
+    is logged by its class and skipped. Returns how many were sent."""
+    sent = 0
+    for ledger_id in live:
+        try:
+            async with engine.connect() as conn:
+                stale = await needs_embedding(conn, ledger_id)
+            if stale:
+                await enqueue_embed(ledger_id, workspace_id)
+                sent += 1
+        except Exception as exc:
+            log.warning("embedding check of document %s failed: %s", ledger_id, type(exc).__name__)
+    if sent:
+        log.info("embeddings re-sent for %d documents of workspace %s", sent, workspace_id)
+    return sent

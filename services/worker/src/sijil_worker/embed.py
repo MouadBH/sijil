@@ -14,21 +14,26 @@ no-op. It:
 4. replaces the document's chunks (`index.replace_chunks`, gate `sijil.reembed`) with the
    ledger row held FOR SHARE, as the search writes do: a removal or a purge waits for the
    write or happens before it, and the schema function writes only for a live search row, so
-   a removed document never gets chunks back.
+   a removed document never gets chunks back. Each chunk carries `source_digest` of the chunk
+   input; the daily `sijil.search_resync` sends the embedding again for a live document whose
+   chunks are missing or were made from another input (`needs_embedding`): a lost message, or
+   a change no message followed (a review edit). A tag is not chunk input.
 
 The text and the vectors go only to the workspace's own index database and the allow-listed
 Ollama. Transient failures raise for the task to retry (the M3 rules); a final one is audited
 `document.embedding_failed` `{code}` (`record_embedding_failed`).
 """
 
+import hashlib
+import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Final
 from uuid import UUID
 
 from sqlalchemy import select, text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from sijil_core import audit
 from sijil_core import index as index_db
@@ -98,6 +103,44 @@ def chunk_texts(values: Mapping[str, str | None], content: str) -> list[str]:
     return ([line] if line else []) + content_windows(content)
 
 
+def source_digest(texts: Sequence[str]) -> str:
+    """SHA-256 of the chunk input exactly as chunked (every chunk, in order, unambiguously
+    delimited): stored with the chunks as `source_sha256`, compared by the resync."""
+    return hashlib.sha256(json.dumps(list(texts), ensure_ascii=False).encode()).hexdigest()
+
+
+async def chunk_input(conn: AsyncConnection, ledger_id: UUID) -> list[str] | None:
+    """The document's chunks to embed (`chunk_texts`: its effective values and the text of its
+    live search row); None when it has no live search row (not indexed yet, or terminal)."""
+    content = (
+        await conn.execute(
+            text(
+                "SELECT content FROM search_doc WHERE ledger_id = :id "
+                "AND state NOT IN ('removed', 'deleting', 'deleted')"
+            ),
+            {"id": ledger_id},
+        )
+    ).scalar()
+    if content is None:
+        return None
+    fields = await index_db.read_fields(conn, ledger_id)
+    corrections = await index_db.read_corrections(conn, ledger_id)
+    values: dict[str, str | None] = {}
+    if fields is not None:
+        values = {k: v for k, (v, _) in index_db.effective_fields(fields, corrections).items()}
+    return chunk_texts(values, content)
+
+
+async def needs_embedding(conn: AsyncConnection, ledger_id: UUID) -> bool:
+    """Whether the document has chunk input but no chunks, or chunks made from another input
+    (the daily resync sends `sijil.embed_document` for it). A document with nothing to chunk,
+    or no live search row, never does."""
+    texts = await chunk_input(conn, ledger_id)
+    if not texts:
+        return False
+    return await index_db.chunks_source(conn, ledger_id) != source_digest(texts)
+
+
 async def _job(
     sessions: async_sessionmaker[AsyncSession],
     settings: ExtractionSettings,
@@ -143,23 +186,9 @@ async def embed_document(
         return False
     engine = await index.engine(workspace)
     async with engine.connect() as conn:
-        content = (
-            await conn.execute(
-                text(
-                    "SELECT content FROM search_doc WHERE ledger_id = :id "
-                    "AND state NOT IN ('removed', 'deleting', 'deleted')"
-                ),
-                {"id": ledger_id},
-            )
-        ).scalar()
-        if content is None:
-            return False  # not indexed yet (the resync writes it), or marked terminal
-        fields = await index_db.read_fields(conn, ledger_id)
-        corrections = await index_db.read_corrections(conn, ledger_id)
-    values: dict[str, str | None] = {}
-    if fields is not None:
-        values = {k: v for k, (v, _) in index_db.effective_fields(fields, corrections).items()}
-    texts = chunk_texts(values, content)
+        texts = await chunk_input(conn, ledger_id)
+    if texts is None:
+        return False  # not indexed yet (the resync writes it), or marked terminal
     vectors = await ollama.embed(settings.embedding_model, texts)
     if any(len(vector) != EMBEDDING_DIM for vector in vectors):
         raise OllamaBadOutput("ai.bad_output: embedding dimensions")
@@ -173,7 +202,11 @@ async def embed_document(
             return False
         async with engine.begin() as conn:
             written = await index_db.replace_chunks(
-                conn, ledger_id, settings.embedding_model, list(zip(texts, vectors, strict=True))
+                conn,
+                ledger_id,
+                settings.embedding_model,
+                list(zip(texts, vectors, strict=True)),
+                source_sha256=source_digest(texts),
             )
         await session.rollback()  # nothing written here: it only releases the lock
     return written

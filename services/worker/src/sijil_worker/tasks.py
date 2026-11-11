@@ -751,6 +751,7 @@ async def _search_resync(workspace_id: str | None) -> int:
             now=utcnow(),
             workspace_id=UUID(workspace_id) if workspace_id else None,
             full=workspace_id is not None,
+            enqueue_embed=_send_embed,
         )
     finally:
         await engines.aclose()

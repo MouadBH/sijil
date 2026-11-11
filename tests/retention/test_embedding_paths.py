@@ -44,6 +44,7 @@ def _vector(seed: int) -> list[float]:
     return [((seed + i) % 7) / 7 for i in range(EMBEDDING_DIM)]
 
 
+SOURCE = "a" * 64  # the digest of the chunk input (sijil_worker.embed.source_digest)
 CHUNKS = [("invoice | Atlas Télécom SAMPLE SARL", _vector(1)), ("Facture SAMPLE", _vector(2))]
 
 
@@ -78,7 +79,7 @@ async def _document(conn: AsyncConnection, *, sealed: bool) -> uuid.UUID:
         ledger_id=ledger_id, state=state, ingested_at=ARRIVAL, region="ma-cas", now=NOW
     )
     await refresh_search_doc(conn, facts, "Facture SAMPLE Télécom")
-    assert await index.replace_chunks(conn, ledger_id, MODEL, CHUNKS)
+    assert await index.replace_chunks(conn, ledger_id, MODEL, CHUNKS, source_sha256=SOURCE)
     return ledger_id
 
 
@@ -139,11 +140,13 @@ async def test_reembed_leaves_the_sealed_fields_untouched(conn: AsyncConnection)
     ledger_id = await _document(conn, sealed=True)
     before = await index.read_fields(conn, ledger_id)
     replaced = [("Facture SAMPLE corrigée", _vector(3))]
-    assert await index.replace_chunks(conn, ledger_id, MODEL, replaced)
+    assert await index.replace_chunks(conn, ledger_id, MODEL, replaced, source_sha256="b" * 64)
     after = await index.read_fields(conn, ledger_id)
     assert after == before
     assert after is not None and after.fields_sha256 == fields_digest(VALUES)
     assert await _chunks(conn, ledger_id) == 1
+    assert await index.chunks_source(conn, ledger_id) == "b" * 64
+    assert await index.chunks_source(conn, uuid.uuid4()) is None
 
 
 @pytest.mark.parametrize("state", [DocumentState.removed, DocumentState.deleting])
@@ -154,8 +157,12 @@ async def test_reembed_of_a_terminal_or_purged_document_writes_nothing(
     the old ones wait for the purge); after the purge there is no search row to write for."""
     ledger_id = await _document(conn, sealed=state is DocumentState.deleting)
     await mark_search_state(conn, ledger_id, state)
-    assert not await index.replace_chunks(conn, ledger_id, MODEL, [("x", _vector(4))])
+    assert not await index.replace_chunks(
+        conn, ledger_id, MODEL, [("x", _vector(4))], source_sha256=SOURCE
+    )
     assert await _chunks(conn, ledger_id) == 2
     await index.purge_document(conn, ledger_id, sealed=state is DocumentState.deleting)
-    assert not await index.replace_chunks(conn, ledger_id, MODEL, [("x", _vector(4))])
+    assert not await index.replace_chunks(
+        conn, ledger_id, MODEL, [("x", _vector(4))], source_sha256=SOURCE
+    )
     assert await _chunks(conn, ledger_id) == 0

@@ -308,6 +308,8 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
     # v5: a document's chunks and their embeddings (`replace_chunks`, sijil_worker.embed), for
     # Ask's retrieval by meaning. Never updated: a re-embedding replaces the whole set under the
     # gate `sijil.reembed` (one ledger id), and the purge deletes them under `sijil.purge`.
+    # Every chunk carries `source_sha256`, the digest of the document's whole chunk input, so
+    # the daily resync can tell chunks made from another input (`chunks_source`).
     5: (
         f"""CREATE TABLE doc_chunk (
         ledger_id uuid NOT NULL,
@@ -315,6 +317,7 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         text text NOT NULL,
         embedding vector({EMBEDDING_DIM}) NOT NULL,
         model text NOT NULL,
+        source_sha256 text NOT NULL,
         created_at timestamptz NOT NULL DEFAULT now(),
         PRIMARY KEY (ledger_id, n)
     )""",
@@ -336,8 +339,8 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         # Writes only for a live search row, which it holds FOR SHARE until the transaction
         # ends: a removal's mark or a purge then waits, and a document already marked terminal
         # or purged never gets chunks again. True when the chunks were replaced.
-        """CREATE FUNCTION reembed_document(target uuid, model_name text, texts text[],
-        embeddings text[]) RETURNS boolean
+        """CREATE FUNCTION reembed_document(target uuid, model_name text, source text,
+        texts text[], embeddings text[]) RETURNS boolean
     LANGUAGE plpgsql AS $$
     BEGIN
         IF cardinality(texts) IS DISTINCT FROM cardinality(embeddings) THEN
@@ -352,8 +355,8 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         PERFORM set_config('sijil.reembed', target::text, true);
         DELETE FROM doc_chunk WHERE ledger_id = target;
         PERFORM set_config('sijil.reembed', '', true);
-        INSERT INTO doc_chunk (ledger_id, n, text, embedding, model)
-            SELECT target, i - 1, texts[i], CAST(embeddings[i] AS vector), model_name
+        INSERT INTO doc_chunk (ledger_id, n, text, embedding, model, source_sha256)
+            SELECT target, i - 1, texts[i], CAST(embeddings[i] AS vector), model_name, source
             FROM generate_subscripts(texts, 1) AS i;
         RETURN true;
     END $$""",
@@ -767,9 +770,12 @@ async def replace_chunks(
     ledger_id: UUID,
     model: str,
     chunks: Sequence[tuple[str, Sequence[float]]],
+    *,
+    source_sha256: str,
 ) -> bool:
     """Replaces the document's chunks (text and embedding, numbered from 0 in order) with
-    `chunks`, all or nothing, through the schema's `reembed_document()`: it opens the gate
+    `chunks`, each row carrying `source_sha256` (the digest of the chunk input they were made
+    from), all or nothing, through the schema's `reembed_document()`: it opens the gate
     `sijil.reembed` for this ledger id only, deletes, closes it and inserts. One statement, so
     this holds on an AUTOCOMMIT connection too.
 
@@ -779,12 +785,27 @@ async def replace_chunks(
     literals = [_vector_literal(vector) for _, vector in chunks]
     result = await conn.execute(
         text(
-            "SELECT reembed_document(CAST(:id AS uuid), :model, CAST(:texts AS text[]), "
-            "CAST(:embeddings AS text[]))"
+            "SELECT reembed_document(CAST(:id AS uuid), :model, :source, "
+            "CAST(:texts AS text[]), CAST(:embeddings AS text[]))"
         ),
-        {"id": ledger_id, "model": model, "texts": [t for t, _ in chunks], "embeddings": literals},
+        {
+            "id": ledger_id,
+            "model": model,
+            "source": source_sha256,
+            "texts": [t for t, _ in chunks],
+            "embeddings": literals,
+        },
     )
     return bool(result.scalar())
+
+
+async def chunks_source(conn: AsyncConnection, ledger_id: UUID) -> str | None:
+    """The `source_sha256` the document's chunks were made from; None when it has none."""
+    result = await conn.execute(
+        text("SELECT source_sha256 FROM doc_chunk WHERE ledger_id = :id ORDER BY n LIMIT 1"),
+        {"id": ledger_id},
+    )
+    return result.scalar()
 
 
 async def find_possible_duplicates(

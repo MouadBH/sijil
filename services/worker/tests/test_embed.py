@@ -50,11 +50,13 @@ from sijil_worker.embed import (
     MAX_WINDOWS,
     OVERLAP_CHARS,
     WINDOW_CHARS,
+    chunk_input,
     chunk_texts,
     content_windows,
     embed_document,
     fields_line,
     record_embedding_failed,
+    source_digest,
 )
 from sijil_worker.runtime.base import TenantSpec
 from sijil_worker.runtime.postgres import drop_tenant_databases, ensure_tenant_databases
@@ -140,6 +142,12 @@ def test_chunks_fields_line_and_windows() -> None:
     assert texts[0] == line
     assert texts[1:] == windows
     assert chunk_texts(dict.fromkeys(FIELD_NAMES), "") == []
+
+    # The digest of the chunk input: any change to a chunk, or to how the text is cut, moves it.
+    digest = source_digest(texts)
+    assert len(digest) == 64 and digest == source_digest(list(texts))
+    assert source_digest(["a b", "c"]) != source_digest(["a", "b c"])
+    assert source_digest([*texts[:-1], texts[-1] + "."]) != digest
 
 
 # Fixtures ----------------------------------------------------------------------------------
@@ -300,6 +308,13 @@ async def test_embed_writes_vectors_into_workspace_index_db(
     assert ollama.inputs == [expected]  # one request, every chunk
     assert await _chunks(engine, row.id) == [(n, t, "bge-m3") for n, t in enumerate(expected)]
     async with engine.connect() as conn:
+        # Every chunk carries the digest of the whole chunk input, which the resync compares.
+        sources = await conn.scalars(
+            text("SELECT DISTINCT source_sha256 FROM doc_chunk WHERE ledger_id = :id"),
+            {"id": row.id},
+        )
+        assert list(sources) == [source_digest(expected)]
+        assert await chunk_input(conn, row.id) == expected
         nearest = await conn.scalar(
             text(
                 "SELECT ledger_id FROM doc_chunk ORDER BY embedding <=> CAST(:q AS vector) LIMIT 1"
