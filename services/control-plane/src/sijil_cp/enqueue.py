@@ -22,6 +22,8 @@ EXPORT_TASK = ("sijil.build_export", "export")
 SEARCH_BACKFILL_TASK = ("sijil.search_backfill", "default")
 # The extraction worker: the in-region Ollama, one request at a time.
 EMBED_TASK = ("sijil.embed_document", "embedding")
+# The Ask worker: the index databases and the in-region Ollama, one question at a time.
+ASK_TASK = ("sijil.answer_question", "ask")
 
 
 class Enqueuer(Protocol):
@@ -53,6 +55,10 @@ class Enqueuer(Protocol):
 
     def send_embed(self, ledger_id: UUID, workspace_id: UUID) -> None:
         """Embed a document's chunks again (extraction worker, queue `embedding`)."""
+        ...
+
+    def send_ask(self, ask_id: UUID, workspace_id: UUID) -> None:
+        """Answer a question (Ask worker, queue `ask`)."""
         ...
 
 
@@ -92,6 +98,12 @@ class CeleryEnqueuer:
 
     def send_embed(self, ledger_id: UUID, workspace_id: UUID) -> None:
         self._send_document(EMBED_TASK, ledger_id, workspace_id)
+
+    def send_ask(self, ask_id: UUID, workspace_id: UUID) -> None:
+        name, queue = ASK_TASK
+        self._app.send_task(
+            name, kwargs={"ask_id": str(ask_id), "workspace_id": str(workspace_id)}, queue=queue
+        )
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task

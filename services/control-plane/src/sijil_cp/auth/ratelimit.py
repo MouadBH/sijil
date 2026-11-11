@@ -15,6 +15,9 @@ SIGNUP_WINDOW_S = 60 * 60
 ORG_CREATE_LIMIT = 10  # per client IP
 ORG_CREATE_WINDOW_S = 60 * 60
 MAX_OWNED_ORGS = 3  # organisations a user may own
+# Each question runs the model twice: bound what one user can queue.
+ASK_LIMIT = 20  # per user
+ASK_WINDOW_S = 60
 
 
 def login_key(email: str, ip: str) -> str:
@@ -26,6 +29,10 @@ def login_key(email: str, ip: str) -> str:
 def ip_key(action: str, ip: str) -> str:
     digest = hashlib.sha256(f"{action}\x00{ip}".encode()).hexdigest()
     return f"ratelimit:{action}:{digest}"
+
+
+def user_key(action: str, user_id: UUID) -> str:
+    return f"ratelimit:{action}:{user_id}"
 
 
 def totp_key(user_id: UUID) -> str:

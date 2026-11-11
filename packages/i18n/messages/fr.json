@@ -20,6 +20,19 @@
     },
     "tag": {
       "invalid": "Une étiquette compte de 1 à 50 caractères, et un document en porte 20 au plus."
+    },
+    "ask": {
+      "not_found": "Cette question n'existe plus.",
+      "question_invalid": "Une question compte de 3 à 500 caractères.",
+      "unavailable": "Les réponses sont indisponibles pour le moment. Réessayez dans quelques minutes.",
+      "rate_limited": "Trop de questions. Patientez une minute, puis réessayez.",
+      "answer": {
+        "sum": "{measure, select, vat {TVA} total_ttc {Total TTC} other {Total HT}} : {value} {currency}, sur {count, plural, one {# document} other {# documents}}.",
+        "count": "{count, plural, =0 {Aucun document correspondant.} one {# document correspondant.} other {# documents correspondants.}}",
+        "lookup": "{count, plural, =0 {Aucun document trouvé.} one {# document trouvé.} other {# documents trouvés.}}",
+        "no_match": "Aucun document ne correspond à cette question.",
+        "excluded": "{count, plural, one {# document en attente de vérification n'a pas été compté.} other {# documents en attente de vérification n'ont pas été comptés.}}"
+      }
     }
   }
 }

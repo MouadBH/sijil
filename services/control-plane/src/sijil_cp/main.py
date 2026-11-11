@@ -9,6 +9,7 @@ from sijil_core.index import IndexEngines
 from sijil_core.storage import S3ExportStore, S3ObjectStore
 from sijil_cp import __version__
 from sijil_cp.api import (
+    ask,
     auth,
     corrections,
     documents,
@@ -90,6 +91,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(retention.router)
     v1.include_router(removal.router)
     v1.include_router(search.router)
+    v1.include_router(ask.router)
     v1.include_router(exports.router)
     v1.include_router(exports.regions)
     app.include_router(v1)
