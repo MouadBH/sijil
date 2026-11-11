@@ -20,6 +20,8 @@ REMOVE_TASK = ("sijil.remove_original", "removal")
 EXPORT_TASK = ("sijil.build_export", "export")
 # The main worker: it holds the index database settings and the tenants' service tokens.
 SEARCH_BACKFILL_TASK = ("sijil.search_backfill", "default")
+# The extraction worker: the in-region Ollama, one request at a time.
+EMBED_TASK = ("sijil.embed_document", "embedding")
 
 
 class Enqueuer(Protocol):
@@ -47,6 +49,10 @@ class Enqueuer(Protocol):
 
     def send_search_backfill(self, workspace_id: UUID) -> None:
         """Rebuild a workspace's search rows (worker, queue `default`)."""
+        ...
+
+    def send_embed(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        """Embed a document's chunks again (extraction worker, queue `embedding`)."""
         ...
 
 
@@ -83,6 +89,9 @@ class CeleryEnqueuer:
     def send_search_backfill(self, workspace_id: UUID) -> None:
         name, queue = SEARCH_BACKFILL_TASK
         self._app.send_task(name, kwargs={"workspace_id": str(workspace_id)}, queue=queue)
+
+    def send_embed(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self._send_document(EMBED_TASK, ledger_id, workspace_id)
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task

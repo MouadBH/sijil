@@ -8,7 +8,8 @@ stay as they were; exports use `index.effective_fields` and flag the corrected v
 Like a field edit, it holds the ledger lock, commits its audit event first and writes the index
 after: an applied note always has its event, and an index failure answers 503
 `field.update_failed`. The note and the search row's effective values (`search_doc`) are written
-in one index transaction, so search shows the corrected value as soon as the request answers.
+in one index transaction, so search shows the corrected value as soon as the request answers;
+then the document's embedding is sent (`sijil.embed_document`), which reads that row.
 """
 
 import logging
@@ -35,6 +36,7 @@ from sijil_cp.api.review import (
     _locked_ledger,
     _parsed,
     _search_facts,
+    send_embedding,
 )
 from sijil_cp.deps import require_totp_compliance
 from sijil_cp.errors import ApiError
@@ -105,4 +107,5 @@ async def add_correction(
         # A logged correction that did not apply: acceptable, and said so.
         log.warning("correction of document %s not applied: %s", doc_id, type(exc).__name__)
         raise ApiError(UPDATE_FAILED, 503) from None
+    await send_embedding(request, ledger.id, workspace.id)
     return CorrectionOut.model_validate(note, from_attributes=True)

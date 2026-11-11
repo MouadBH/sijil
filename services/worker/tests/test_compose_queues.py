@@ -71,9 +71,22 @@ def test_extraction_worker_env_is_least_privilege() -> None:
         "SIJIL_OLLAMA_URL",
         "SIJIL_AI_ALLOWED_HOSTS",
         "SIJIL_EXTRACTION_MODEL",
+        "SIJIL_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}",
     ):
         assert present in env, present
     assert "SIJIL_PROVISIONER_DATABASE_URL" in _anchor("worker-env")
+
+
+def test_make_models_pulls_the_extraction_and_the_embedding_model() -> None:
+    block = _block("ollama-pull")
+    assert "OLLAMA_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}" in block
+    assert "OLLAMA_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}" in block
+    entrypoint = _key(block, "entrypoint")
+    assert entrypoint is not None
+    assert 'ollama pull \\"$$OLLAMA_MODEL\\"' in entrypoint
+    assert 'ollama pull \\"$$OLLAMA_EMBEDDING_MODEL\\"' in entrypoint
+    env_example = (ROOT / "infra" / "compose" / ".env.example").read_text()
+    assert re.search(r"^SIJIL_EMBEDDING_MODEL=bge-m3$", env_example, re.MULTILINE)
 
 
 def test_main_worker_does_not_consume_extraction() -> None:
@@ -85,11 +98,12 @@ def test_main_worker_does_not_consume_extraction() -> None:
 
 
 def test_extraction_worker_consumes_only_extraction_one_at_a_time() -> None:
+    """Extraction and embedding share the one Ollama: one request at a time, on this pool."""
     block = _block("worker-extraction")
     raw = _key(block, "command")
     assert raw is not None
     command = json.loads(raw)
-    assert _queues(command) == {"extraction"}
+    assert _queues(command) == {"extraction", "embedding"}
     assert command[command.index("--concurrency") + 1] == "1"
     assert _key(block, "environment") == "*extraction-env"
     assert "sijil_worker.main_extraction" in command

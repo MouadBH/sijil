@@ -231,11 +231,46 @@ async def test_latest_correction_wins(
     assert effective["number"] == (INVOICE["number"], False)
 
 
+async def test_correction_sends_the_embedding_after_the_index_write(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, redis: Any,
+) -> None:  # fmt: skip
+    """The corrected value is in `search_doc` before the message leaves. While the seal's own
+    embedding is still queued (its key held), it will read the correction: none is added."""
+    row = await _sealed(member, ws, db, memory_store, index_conn)
+    assert enqueuer.embeds == [(row.id, ws.id)]
+    body = {"field": "total_ttc", "value": "1200.00", "reason": REASON}
+    r = await member.client.post(_url(ws, row, "corrections"), json=body)
+    assert r.status_code == 201, r.text
+    assert enqueuer.embeds == [(row.id, ws.id)]
+
+    seen: list[Any] = []
+
+    def send(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        seen.append((ledger_id, workspace_id))
+
+    enqueuer.send_embed = send
+    await redis.delete(f"embed:pending:{row.id}")  # the seal's embedding has started
+    r = await member.client.post(
+        _url(ws, row, "corrections"), json=body | {"field": "vat", "value": "200.00"}
+    )
+    assert r.status_code == 201, r.text
+    assert seen == [(row.id, ws.id)]
+    found = (
+        await index_conn.execute(
+            text("SELECT total_ttc, vat FROM search_doc WHERE ledger_id = :id"), {"id": row.id}
+        )
+    ).one()
+    assert tuple(str(v) for v in found) == ("1200.00", "200.00")
+
+
 async def test_an_index_failure_after_the_audit_is_503(
     member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
-    index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch,
+    index_conn: AsyncConnection, monkeypatch: pytest.MonkeyPatch, enqueuer: Any, redis: Any,
 ) -> None:  # fmt: skip
     row = await _sealed(member, ws, db, memory_store, index_conn)
+    await redis.delete(f"embed:pending:{row.id}")
+    sent_before = list(enqueuer.embeds)
 
     async def boom(*_a: Any, **_k: Any) -> None:
         raise OSError("index down")
@@ -247,6 +282,7 @@ async def test_an_index_failure_after_the_audit_is_503(
     )
     assert (r.status_code, _code(r)) == (503, "field.update_failed")
     assert len(await _events(db, ws, "document.corrected")) == 1
+    assert enqueuer.embeds == sent_before  # nothing changed in the index: nothing to embed
 
 
 async def test_fields_of_a_removed_document_carry_no_corrections(

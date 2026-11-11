@@ -23,8 +23,9 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
    ruling P1); audit `document.filed` / `document.needs_review`. Only a row still `received`
    moves, so it is routed once;
 7. after the commit, best effort, writes its search row (`sijil_worker.search.index_document`:
-   the routed state, the fields and the whole normalised text, when this run read it) and
-   names the document in its own Paperless (title and type).
+   the routed state, the fields and the whole normalised text, when this run read it), sends
+   its embedding (`sijil.embed_document`, sijil_worker.embed) and names the document in its
+   own Paperless (title and type).
 
 An `unsupported` row has no Paperless document: it gets an empty fields row flagged
 `ingest.unsupported_format` and goes straight to review, with no extraction.
@@ -693,6 +694,7 @@ async def extract_document(
     settings: ExtractionSettings,
     now: datetime,
     workspace_id: UUID | None = None,
+    enqueue_embed: Enqueue | None = None,
 ) -> None:
     """See the module docstring. Raises OllamaUnavailable / PaperlessUnavailable (transient)
     for the caller to retry; any other exception is final for the caller."""
@@ -724,11 +726,23 @@ async def extract_document(
     # 3. Score and route it, once.
     if await _route(sessions, index, store, job.workspace, row, now) is not None:
         # The search row follows the routing, after its commit (`content` None, when this run
-        # did not read the text, keeps what the row holds).
+        # did not read the text, keeps what the row holds), then its embedding, from that row.
         await index_document(
             sessions, index, ledger_id, settings=settings, now=now, content=content
         )
+        await _send_embed(enqueue_embed, ledger_id, job.workspace.id)
         await _name_in_paperless(job, paperless, row)
+
+
+async def _send_embed(enqueue_embed: Enqueue | None, ledger_id: UUID, workspace_id: UUID) -> None:
+    """Best effort, after the routing commit: a lost message leaves the document without
+    chunks until its next seal or correction."""
+    if enqueue_embed is None:
+        return
+    try:
+        await enqueue_embed(ledger_id, workspace_id)
+    except Exception as exc:
+        log.warning("embedding enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
 
 
 async def record_extraction_failed(
@@ -741,6 +755,7 @@ async def record_extraction_failed(
     settings: ExtractionSettings,
     now: datetime,
     workspace_id: UUID | None = None,
+    enqueue_embed: Enqueue | None = None,
 ) -> None:
     """Retries ran out (or a final error): flag `extraction_failed` (with `code`), audit it and
     route the document (to review), once.
@@ -787,6 +802,7 @@ async def record_extraction_failed(
     await _ensure_audited(sessions, workspace.id, ledger_id, row, now)
     if await _route(sessions, index, store, workspace, row, now, final=True) is not None:
         await index_document(sessions, index, ledger_id, settings=settings, now=now)
+        await _send_embed(enqueue_embed, ledger_id, workspace.id)
 
 
 async def requeue_unextracted(

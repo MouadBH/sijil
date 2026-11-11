@@ -14,7 +14,16 @@ REQUEUE_UNLOCKED_INTERVAL_S = 300
 REQUEUE_UNREMOVED_INTERVAL_S = 300
 REQUEUE_UNPURGED_INTERVAL_S = 300
 SWEEP_EXPORTS_INTERVAL_S = 300
-QUEUES = ("default", "provisioning", "ingest", "extraction", "seal", "removal", "export")
+QUEUES = (
+    "default",
+    "provisioning",
+    "ingest",
+    "extraction",
+    "embedding",
+    "seal",
+    "removal",
+    "export",
+)
 
 
 def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -> Celery:

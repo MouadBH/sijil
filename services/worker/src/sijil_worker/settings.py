@@ -63,6 +63,8 @@ class ExtractionSettings(KeySettings, BrokerSettings):
     # Extraction (M3): the in-region Ollama only. Its host must be on `ai_allowed_hosts`
     # (comma-separated in SIJIL_AI_ALLOWED_HOSTS), or the client refuses to start.
     extraction_model: str = "qwen3:4b"
+    # Embeddings of the chunks (M5, sijil_worker.embed), on the same Ollama: 1024 dimensions.
+    embedding_model: str = "bge-m3"
     ollama_url: str = "http://ollama:11434"
     ai_allowed_hosts: Annotated[frozenset[str], NoDecode] = frozenset({"ollama"})
     # The model's threads (SIJIL_OLLAMA_NUM_THREAD): as many as Ollama's CPU quota, since it

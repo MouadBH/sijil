@@ -15,7 +15,8 @@ completes exactly once when it is called again:
    final`, the later of its retention and the fiscal year of `retention_basis`, never lowered:
    ruling P1) and `document.sealed` audited, in one transaction;
 4. after the commit, `sijil.lock_sealed` to the seal worker (queue `seal`), which switches the
-   original to COMPLIANCE at the committed `retention_until`, and `sijil.mirror_fields`.
+   original to COMPLIANCE at the committed `retention_until`, `sijil.mirror_fields` and
+   `sijil.embed_document` (the extraction worker, queue `embedding`).
 The search row (`sijil_core.search_index`) becomes `sealed` in step 2's transaction.
 
 Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
@@ -61,7 +62,7 @@ from sijil_core.db.models import (
 )
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, parse_field
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
-from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
+from sijil_core.pending import EMBED_PREFIX, LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
@@ -541,37 +542,52 @@ async def _after_commit(request: Request, ledger_id: UUID, workspace_id: UUID) -
     `requeue_unlocked` sweep (and flagged by the drift check after an hour); a lost mirror
     only delays Paperless's copy."""
     enqueuer = get_enqueuer(request)
-    if await _claim_lock(request, ledger_id):
+    if await _claim(request, ledger_id, LOCK_PREFIX):
         try:
             await asyncio.to_thread(enqueuer.send_lock, ledger_id, workspace_id)
         except Exception as exc:  # noqa: BLE001 - the broker being down must not undo a seal
             log.warning("lock enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
-            await _release_lock(request, ledger_id)
+            await _release(request, ledger_id, LOCK_PREFIX)
     try:
         await asyncio.to_thread(enqueuer.send_mirror, ledger_id, workspace_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("mirror enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+    await send_embedding(request, ledger_id, workspace_id)
 
 
-async def _claim_lock(request: Request, ledger_id: UUID) -> bool:
-    """`lock:pending:<id>`, the key the seal worker clears and the sweep honours, so this
-    message and a sweep re-send never run together. False when one is already in flight. A
-    broker Redis that cannot answer does not stop the send (the worker is idempotent)."""
+async def send_embedding(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
+    """After a commit that changed what the document's search row holds (seal, correction):
+    `sijil.embed_document`, unless one is still queued (`embed:pending:<id>`), which will read
+    the new row when it runs. Best effort: a lost message leaves the older chunks in place."""
+    if not await _claim(request, ledger_id, EMBED_PREFIX):
+        return
+    try:
+        await asyncio.to_thread(get_enqueuer(request).send_embed, ledger_id, workspace_id)
+    except Exception as exc:  # noqa: BLE001 - the broker being down must not fail the request
+        log.warning("embedding enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+        await _release(request, ledger_id, EMBED_PREFIX)
+
+
+async def _claim(request: Request, ledger_id: UUID, prefix: str) -> bool:
+    """`<prefix>:pending:<id>`, the key the worker clears and the sweeps honour, so this
+    message and another send never run together (`lock`: the seal worker; `embed`: the
+    extraction worker). False when one is already in flight. A broker Redis that cannot answer
+    does not stop the send (the workers are idempotent)."""
     try:
         claimed = await request.app.state.redis.set(
-            pending_key(ledger_id, LOCK_PREFIX), "1", nx=True, ex=PENDING_TTL_S
+            pending_key(ledger_id, prefix), "1", nx=True, ex=PENDING_TTL_S
         )
     except Exception as exc:  # noqa: BLE001
-        log.warning("lock claim of document %s failed: %s", ledger_id, type(exc).__name__)
+        log.warning("%s claim of document %s failed: %s", prefix, ledger_id, type(exc).__name__)
         return True
     return bool(claimed)
 
 
-async def _release_lock(request: Request, ledger_id: UUID) -> None:
+async def _release(request: Request, ledger_id: UUID, prefix: str) -> None:
     try:
-        await request.app.state.redis.delete(pending_key(ledger_id, LOCK_PREFIX))
+        await request.app.state.redis.delete(pending_key(ledger_id, prefix))
     except Exception as exc:  # noqa: BLE001 - it expires anyway
-        log.warning("lock release of document %s failed: %s", ledger_id, type(exc).__name__)
+        log.warning("%s release of document %s failed: %s", prefix, ledger_id, type(exc).__name__)
 
 
 async def _sealer(

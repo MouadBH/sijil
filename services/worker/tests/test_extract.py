@@ -291,6 +291,7 @@ async def run(
     settings: WorkerSettings = SETTINGS,
     store: FakeStore | None = None,
     now: datetime = NOW,
+    enqueue_embed: Callable[[uuid.UUID, uuid.UUID], Awaitable[None]] | None = None,
 ) -> None:
     async with ollama.client() as client:
         await extract_document(
@@ -303,6 +304,7 @@ async def run(
             store=FakeStore() if store is None else store,
             settings=settings,
             now=now,
+            enqueue_embed=enqueue_embed,
         )
 
 
@@ -979,6 +981,82 @@ async def test_paperless_title_failure_does_not_change_routing(
     assert await actions(db, ready) == ["document.extracted", "document.needs_review"]
     assert "title" in caplog.text
     assert SUPPLIER_01["name"] not in caplog.text  # logged by code only
+
+
+@pytest.mark.parametrize("filed", [True, False])
+async def test_routing_sends_the_embedding_after_the_search_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    filed: bool,
+) -> None:
+    """Filed or sent to review, the document's embedding is sent once, after its search row
+    (which it reads) holds the routed state and the text."""
+    ledger = await make_ledger(db, ready)
+    sent: list[tuple[uuid.UUID, uuid.UUID, Any]] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        async with (await engines.engine(ready)).connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT state, content <> '' FROM search_doc WHERE ledger_id = :id"),
+                    {"id": ledger_id},
+                )
+            ).first()
+        sent.append((ledger_id, workspace_id, tuple(row) if row else None))
+
+    raw = RAW_01 if filed else {**RAW_01, "number": None}
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(
+            ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}), enqueue_embed=enqueue
+        )
+    state = "filed" if filed else "needs_review"
+    assert sent == [(ledger.id, ready.id, (state, True))]
+
+
+async def test_embedding_enqueue_failure_does_not_change_routing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = await make_ledger(db, ready)
+
+    async def broker_down(_l: uuid.UUID, _w: uuid.UUID) -> None:
+        raise ConnectionError("redis down")
+
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(
+            ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}),
+            enqueue_embed=broker_down,
+        )  # fmt: skip
+        assert _patches(router)  # the steps after it still ran
+    assert (await reload(db, ledger)).state is DocumentState.filed
+    assert "embedding enqueue" in caplog.text
+
+
+async def test_no_embedding_without_a_routing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """A document already routed (a redelivery) is not routed again, so nothing is sent."""
+    ledger = await make_ledger(db, ready, state=DocumentState.filed)
+    sent: list[uuid.UUID] = []
+
+    async def enqueue(ledger_id: uuid.UUID, _w: uuid.UUID) -> None:
+        sent.append(ledger_id)
+
+    await run(ledger, sessions, keys, engines, FakeOllama({}), enqueue_embed=enqueue)
+    assert sent == []
 
 
 async def test_totals_mismatch_routes_to_review(

@@ -369,6 +369,7 @@ async def test_seal_freezes_fields(
     assert (sealed.target_id, sealed.actor_id) == (str(row.id), str(member.user_id))
     assert enqueuer.locks == [(row.id, ws.id)]
     assert enqueuer.mirrors == [(row.id, ws.id)]
+    assert enqueuer.embeds == [(row.id, ws.id)]
 
     # No re-seal.
     r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
@@ -901,6 +902,50 @@ async def test_the_seal_claims_the_lock_pending_key_before_sending(
     assert r.status_code == 200, r.text
     assert enqueuer.locks == [(row.id, ws.id)]
     assert enqueuer.mirrors == [(row.id, ws.id), (other.id, ws.id)]
+
+
+async def test_the_seal_sends_the_embedding_once_after_the_commit(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, redis: Any,
+) -> None:  # fmt: skip
+    """`embed:pending:<id>` is claimed first: one already queued reads the sealed row when it
+    runs, so no second one is sent. A failed send releases the claim."""
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert enqueuer.embeds == [(row.id, ws.id)]
+    assert 0 < await redis.ttl(f"embed:pending:{row.id}") <= 3600
+
+    queued = await add_document(db, memory_store, index_conn, ws)
+    await redis.set(f"embed:pending:{queued.id}", "1", ex=3600)
+    r = await member.client.post(_url(ws, f"/documents/{queued.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert enqueuer.embeds == [(row.id, ws.id)]
+
+    def broken(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        raise ConnectionRefusedError("broker down")
+
+    lost = await add_document(db, memory_store, index_conn, ws)
+    enqueuer.send_embed = broken
+    r = await member.client.post(_url(ws, f"/documents/{lost.id}/seal"))
+    assert r.status_code == 200, r.text  # the seal stands
+    assert not await redis.exists(f"embed:pending:{lost.id}")
+
+
+def test_embedding_is_sent_to_the_embedding_queue(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sijil_cp.enqueue import CeleryEnqueuer
+
+    sent: list[tuple[str, dict[str, str], str]] = []
+    celery = CeleryEnqueuer("redis://127.0.0.1:1/0")
+    monkeypatch.setattr(
+        celery._app,  # noqa: SLF001
+        "send_task",
+        lambda name, kwargs, queue: sent.append((name, kwargs, queue)),
+    )
+    ledger_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+    celery.send_embed(ledger_id, workspace_id)
+    kwargs = {"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)}
+    assert sent == [("sijil.embed_document", kwargs, "embedding")]
 
 
 async def test_a_failed_lock_send_releases_its_claim(

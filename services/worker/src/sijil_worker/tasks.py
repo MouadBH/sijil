@@ -18,13 +18,19 @@ from sijil_core.crypto import LocalKeyService
 from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.index import IndexEngines
-from sijil_core.ollama import OllamaClient, OllamaError, OllamaUnavailable
+from sijil_core.ollama import OllamaBadOutput, OllamaClient, OllamaError, OllamaUnavailable
 from sijil_core.paperless import (
     PaperlessClient,
     PaperlessError,
     PaperlessUnavailable,
 )
-from sijil_core.pending import EXPORT_PREFIX, PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
+from sijil_core.pending import (
+    EMBED_PREFIX,
+    EXPORT_PREFIX,
+    PENDING_TTL_S,
+    PURGE_PREFIX,
+    REMOVE_PREFIX,
+)
 from sijil_core.region import RegionMismatch
 from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
 from sijil_worker.drift import (
@@ -34,6 +40,7 @@ from sijil_worker.drift import (
     record_check_failed,
 )
 from sijil_worker.eligibility import mark_eligible
+from sijil_worker.embed import embed_document, record_embedding_failed
 from sijil_worker.export import (
     EXPORT_FAILED,
     build_export,
@@ -392,6 +399,7 @@ async def _extract(ledger_id: str, workspace_id: str | None) -> None:
                 settings=settings,
                 now=utcnow(),
                 workspace_id=UUID(workspace_id) if workspace_id else None,
+                enqueue_embed=_send_embed,
             )
     finally:
         await engines.aclose()
@@ -413,6 +421,7 @@ async def _extract_failed(ledger_id: str, workspace_id: str | None, code: str) -
             settings=settings,
             now=utcnow(),
             workspace_id=UUID(workspace_id) if workspace_id else None,
+            enqueue_embed=_send_embed,
         )
     finally:
         await engines.aclose()
@@ -498,6 +507,136 @@ async def _requeue_extract() -> int:
 def requeue_unextracted_task() -> int:
     """Re-send extraction for consumed rows still `received` (a lost message)."""
     return asyncio.run(_requeue_extract())
+
+
+# Embeddings (sijil_worker.embed), on the extraction worker (the same Ollama, one at a time):
+# retried like extraction (`is_extract_transient`, `extract_countdown`, EXTRACT_MAX_RETRIES).
+# `embed:pending:<id>` is claimed by every sender and cleared when the run *starts*, not when
+# it ends: a message still queued reads the latest text when it runs, so a second one is
+# skipped, but a change committed while a run is reading must send a new one (it runs next,
+# concurrency 1), or the chunks would keep the older text.
+EMBED_TASK = ("sijil.embed_document", "embedding")
+
+
+async def _send_raw_embed(ledger_id: UUID, workspace_id: UUID) -> None:
+    name, queue = EMBED_TASK
+    current_app.send_task(
+        name,
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue=queue,
+    )
+
+
+async def _with_embed_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(ExtractionSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix=EMBED_PREFIX))
+    finally:
+        await redis.aclose()
+
+
+def _pending_embed_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_embed_pending(op))
+    except Exception as exc:
+        log.warning("embedding pending key update failed: %s", type(exc).__name__)
+
+
+async def _send_embed(ledger_id: UUID, workspace_id: UUID) -> None:
+    """Sends the embedding unless one is already queued for the document."""
+
+    async def op(pending: PendingExtractions) -> None:
+        await pending.send(_send_raw_embed, ledger_id, workspace_id)
+
+    await _with_embed_pending(op)
+
+
+def embedding_error_code(exc: BaseException) -> str:
+    """The machine code audited with `document.embedding_failed`."""
+    if isinstance(exc, OllamaUnavailable):
+        return "embedding.ai_unavailable"
+    if isinstance(exc, OllamaBadOutput):
+        return "embedding.ai_bad_output"
+    if isinstance(exc, OllamaError):
+        return "embedding.ai_error"
+    return "embedding.error"
+
+
+async def _embed(ledger_id: str, workspace_id: str) -> None:
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
+            await embed_document(
+                UUID(ledger_id),
+                sessions=sessions,
+                index=engines,
+                ollama=ollama,
+                settings=settings,
+                workspace_id=UUID(workspace_id),
+            )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _embed_failed(ledger_id: str, workspace_id: str, code: str) -> None:
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await record_embedding_failed(
+            UUID(ledger_id),
+            code,
+            sessions=make_sessionmaker(engine),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True,
+    name="sijil.embed_document",
+    queue="embedding",
+    max_retries=EXTRACT_MAX_RETRIES,
+)
+def embed_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A document's chunks embedded into its workspace's index (see sijil_worker.embed)."""
+    retries = int(self.request.retries or 0)
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    _pending_embed_quietly(clear)  # see EMBED_TASK
+    try:
+        asyncio.run(_embed(ledger_id, workspace_id))
+    except Exception as exc:
+        if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
+            countdown = extract_countdown(retries)
+
+            # The retry is queued for the document again: hold its key until it runs.
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_embed_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        code = embedding_error_code(exc)
+        try:
+            asyncio.run(_embed_failed(ledger_id, workspace_id, code))
+        except Exception as audit_exc:
+            log.error(
+                "embedding failure of document %s not recorded: %s",
+                ledger_id, type(audit_exc).__name__,
+            )  # fmt: skip
+        raise
 
 
 DRIFT_MAX_RETRIES = 5

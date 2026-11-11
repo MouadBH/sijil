@@ -37,6 +37,7 @@ def test_queues_declared() -> None:
         "provisioning",
         "ingest",
         "extraction",
+        "embedding",
         "seal",
         "removal",
         "export",

@@ -71,6 +71,8 @@ x-worker-env: &worker-env
   SIJIL_OLLAMA_URL: http://ollama:11434
   SIJIL_AI_ALLOWED_HOSTS: ollama
   SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+  # Embeddings of the documents' chunks (M5): same Ollama, 1024 dimensions.
+  SIJIL_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}
   # As many model threads as ollama's `cpus` (it would start one per host CPU, and eight
   # threads under six CPUs were throttled to 0.4 tokens/s, measured).
   SIJIL_OLLAMA_NUM_THREAD: "6"
@@ -84,6 +86,8 @@ x-extraction-env: &extraction-env
   SIJIL_OLLAMA_URL: http://ollama:11434
   SIJIL_AI_ALLOWED_HOSTS: ollama
   SIJIL_EXTRACTION_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+  # Embeddings of the documents' chunks (M5): same Ollama, 1024 dimensions.
+  SIJIL_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}
   # As many model threads as ollama's `cpus` (it would start one per host CPU, and eight
   # threads under six CPUs were throttled to 0.4 tokens/s, measured).
   SIJIL_OLLAMA_NUM_THREAD: "6"
@@ -189,10 +193,12 @@ services:
     # `make models`: the only Ollama process with internet, run on demand to fill the volume.
     image: ollama/ollama:0.40.13
     profiles: [models]
-    entrypoint: ["sh", "-c", "ollama serve & sleep 3 && ollama pull \"$$OLLAMA_MODEL\""]
+    entrypoint: ["sh", "-c", "ollama serve & sleep 3 && ollama pull \"$$OLLAMA_MODEL\" && ollama pull \"$$OLLAMA_EMBEDDING_MODEL\""]
     environment:
-      # `make models` passes SIJIL_EXTRACTION_MODEL here (see the Makefile).
+      # `make models` passes SIJIL_EXTRACTION_MODEL and SIJIL_EMBEDDING_MODEL here (see the
+      # Makefile).
       OLLAMA_MODEL: ${SIJIL_EXTRACTION_MODEL:-qwen3:4b}
+      OLLAMA_EMBEDDING_MODEL: ${SIJIL_EMBEDDING_MODEL:-bge-m3}
     volumes: [ollama:/root/.ollama]
     networks: [core]
 
@@ -328,14 +334,14 @@ services:
       tessdata-init: { condition: service_completed_successfully }
 
   worker-extraction:
-    # Extraction only (REC-2): the model is CPU-bound, so one request at a time, on its own
-    # pool, so ingest never waits behind it. It reads tenants' Paperless content (tenant
+    # Extraction and embedding only (REC-2, M5): the model is CPU-bound, so one request at a
+    # time, on its own pool, so ingest never waits behind it. It reads tenants' Paperless content (tenant
     # networks) and talks to Ollama (`ai`). It provisions nothing: no Docker socket.
     build:
       context: ../..
       dockerfile: services/worker/Dockerfile
     restart: unless-stopped
-    command: ["celery", "-A", "sijil_worker.main_extraction", "worker", "-Q", "extraction", "--concurrency", "1", "-n", "extraction@%h", "--loglevel", "INFO"]
+    command: ["celery", "-A", "sijil_worker.main_extraction", "worker", "-Q", "extraction,embedding", "--concurrency", "1", "-n", "extraction@%h", "--loglevel", "INFO"]
     environment: *extraction-env
     networks: [core, ai, tenant_t1, tenant_t2]
     depends_on:
