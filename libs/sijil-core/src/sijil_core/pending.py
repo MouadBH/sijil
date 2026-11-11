@@ -14,6 +14,9 @@ LOCK_PREFIX: Final = "lock"
 EXTRACT_PREFIX: Final = "extract"
 REMOVE_PREFIX: Final = "remove"
 PURGE_PREFIX: Final = "purge"
+# The control plane claims it before sending `sijil.embed_document` (seal, correction); the
+# worker does after routing.
+EMBED_PREFIX: Final = "embed"
 # Keyed by export job id, not a document: `export:pending:<job_id>`.
 EXPORT_PREFIX: Final = "export"
 

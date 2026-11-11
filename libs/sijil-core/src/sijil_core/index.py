@@ -9,7 +9,10 @@ this module raises as `RetentionLocked` so callers can answer 409. `extraction_r
 of what each model run said and is append-only, like `correction_note` (v2). The search index
 (v3, `sijil_core.search_index`: `search_doc`, `document_tag`) may change but never be deleted
 from. The one DELETE the triggers allow is `purge_document`'s, but for removing a tag (v4: a tag
-is an annotation). Saved views (v4, `saved_view`) are the workspace's, not a document's.
+is an annotation). Saved views (v4, `saved_view`) are the workspace's, not a document's. A
+document's chunks and their embeddings (v5, `doc_chunk`) are replaced as a whole by
+`replace_chunks` (gate `sijil.reembed`) and deleted by the purge; never updated. Embeddings,
+like every value here, stay in this database.
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -18,7 +21,7 @@ import asyncio
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal
@@ -41,7 +44,9 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 4
+SCHEMA_VERSION: Final = 5
+# bge-m3's dimensions (SIJIL_EMBEDDING_MODEL): `doc_chunk.embedding` is vector(1024).
+EMBEDDING_DIM: Final = 1024
 MAX_ENGINES: Final = 32
 LOCKED_CODE: Final = "retention.locked"
 # SQLSTATE the triggers raise it with (custom class "SJ": Sijil).
@@ -299,6 +304,75 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         created_at timestamptz NOT NULL,
         updated_at timestamptz NOT NULL
     )""",
+    ),
+    # v5: a document's chunks and their embeddings (`replace_chunks`, sijil_worker.embed), for
+    # Ask's retrieval by meaning. Never updated: a re-embedding replaces the whole set under the
+    # gate `sijil.reembed` (one ledger id), and the purge deletes them under `sijil.purge`.
+    5: (
+        f"""CREATE TABLE doc_chunk (
+        ledger_id uuid NOT NULL,
+        n int NOT NULL CHECK (n >= 0),
+        text text NOT NULL,
+        embedding vector({EMBEDDING_DIM}) NOT NULL,
+        model text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (ledger_id, n)
+    )""",
+        "CREATE INDEX doc_chunk_embedding ON doc_chunk USING hnsw (embedding vector_cosine_ops)",
+        """CREATE FUNCTION doc_chunk_gated() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'DELETE'
+           AND (current_setting('sijil.purge', true) IS NOT DISTINCT FROM OLD.ledger_id::text
+                OR current_setting('sijil.reembed', true)
+                   IS NOT DISTINCT FROM OLD.ledger_id::text) THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+    END $$""",
+        """CREATE TRIGGER doc_chunk_gated BEFORE UPDATE OR DELETE ON doc_chunk
+        FOR EACH ROW EXECUTE FUNCTION doc_chunk_gated()""",
+        """CREATE TRIGGER doc_chunk_no_truncate BEFORE TRUNCATE ON doc_chunk
+        FOR EACH STATEMENT EXECUTE FUNCTION doc_chunk_gated()""",
+        # Writes only for a live search row, which it holds FOR SHARE until the transaction
+        # ends: a removal's mark or a purge then waits, and a document already marked terminal
+        # or purged never gets chunks again. True when the chunks were replaced.
+        """CREATE FUNCTION reembed_document(target uuid, model_name text, texts text[],
+        embeddings text[]) RETURNS boolean
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        IF cardinality(texts) IS DISTINCT FROM cardinality(embeddings) THEN
+            RAISE EXCEPTION 'index.chunks_mismatch' USING ERRCODE = 'SJ003';
+        END IF;
+        PERFORM 1 FROM search_doc
+            WHERE ledger_id = target AND state NOT IN ('removed', 'deleting', 'deleted')
+            FOR SHARE;
+        IF NOT FOUND THEN
+            RETURN false;
+        END IF;
+        PERFORM set_config('sijil.reembed', target::text, true);
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        PERFORM set_config('sijil.reembed', '', true);
+        INSERT INTO doc_chunk (ledger_id, n, text, embedding, model)
+            SELECT target, i - 1, texts[i], CAST(embeddings[i] AS vector), model_name
+            FROM generate_subscripts(texts, 1) AS i;
+        RETURN true;
+    END $$""",
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
     ),
 }
 
@@ -656,7 +730,7 @@ def effective_fields(
 
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
     """Deletes the document's `document_fields`, `extraction_run`, `correction_note`,
-    `search_doc` and `document_tag` rows, all or nothing, through the schema's
+    `search_doc`, `document_tag` and `doc_chunk` rows, all or nothing, through the schema's
     `purge_document()` function. Idempotent.
 
     The index triggers refuse every DELETE but one whose ledger id the GUC `sijil.purge` names,
@@ -680,6 +754,37 @@ async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool
         if _locked(exc):
             raise RetentionLocked from exc
         raise
+
+
+def _vector_literal(vector: Sequence[float]) -> str:
+    if len(vector) != EMBEDDING_DIM:
+        raise ValueError(f"an embedding has {len(vector)} dimensions, not {EMBEDDING_DIM}")
+    return "[" + ",".join(repr(float(x)) for x in vector) + "]"
+
+
+async def replace_chunks(
+    conn: AsyncConnection,
+    ledger_id: UUID,
+    model: str,
+    chunks: Sequence[tuple[str, Sequence[float]]],
+) -> bool:
+    """Replaces the document's chunks (text and embedding, numbered from 0 in order) with
+    `chunks`, all or nothing, through the schema's `reembed_document()`: it opens the gate
+    `sijil.reembed` for this ledger id only, deletes, closes it and inserts. One statement, so
+    this holds on an AUTOCOMMIT connection too.
+
+    Writes nothing and returns False unless the document has a live `search_doc` row (none, or
+    one marked removed, deleting or deleted): a removed or purged document never gets chunks
+    back. An embedding of other than EMBEDDING_DIM dimensions raises ValueError."""
+    literals = [_vector_literal(vector) for _, vector in chunks]
+    result = await conn.execute(
+        text(
+            "SELECT reembed_document(CAST(:id AS uuid), :model, CAST(:texts AS text[]), "
+            "CAST(:embeddings AS text[]))"
+        ),
+        {"id": ledger_id, "model": model, "texts": [t for t, _ in chunks], "embeddings": literals},
+    )
+    return bool(result.scalar())
 
 
 async def find_possible_duplicates(

@@ -210,3 +210,79 @@ def test_environment_proxies_are_ignored(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("ALL_PROXY", "http://proxy.example.com:3128")
     ai = OllamaClient("http://ollama:11434", {"ollama"})
     assert ai._http._trust_env is False
+
+
+def vectors(*rows: list[float]) -> httpx.Response:
+    return httpx.Response(200, json={"model": "bge-m3", "embeddings": list(rows)})
+
+
+async def test_embed_request_shape() -> None:
+    """One `/api/embed` call for all the inputs, on the allowed host, in input order."""
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return vectors([0.1, 0.2], [0.3, 0.4])
+
+    transport = httpx.MockTransport(handler)
+    async with OllamaClient(
+        "http://ollama:11434", {"ollama"}, num_thread=6, transport=transport
+    ) as ai:
+        result = await ai.embed("bge-m3", ["Facture SAMPLE", "فاتورة"])
+    assert result == [[0.1, 0.2], [0.3, 0.4]]
+    (request,) = seen
+    assert request.url.host == "ollama"
+    assert request.url.path == "/api/embed"
+    assert json.loads(request.content) == {
+        "model": "bge-m3",
+        "input": ["Facture SAMPLE", "فاتورة"],
+        "truncate": True,
+        "options": {"num_thread": 6},
+    }
+
+
+async def test_embed_of_nothing_sends_nothing() -> None:
+    def handler(_r: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request expected")
+
+    async with client(handler) as ai:
+        assert await ai.embed("bge-m3", []) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"embeddings": [[0.1, 0.2]]},  # one vector for two inputs
+        {"embeddings": [[0.1, "x"], [0.3, 0.4]]},
+        {"embeddings": [[0.1, 0.2], []]},
+        {"embeddings": [[0.1, True], [0.3, 0.4]]},
+        {"embeddings": "nope"},
+        {"done": True},
+    ],
+)
+async def test_embed_malformed_answer_is_bad_output(body: object) -> None:
+    async with client(lambda _r: httpx.Response(200, json=body)) as ai:
+        with pytest.raises(OllamaBadOutput):
+            await ai.embed("bge-m3", ["a", "b"])
+
+
+async def test_embed_errors_classified_like_chat() -> None:
+    """The same error classes as `chat_json`: 5xx and an unpulled model are transient."""
+
+    def down(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "busy"})
+
+    def missing(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": "model 'bge-m3' not found"})
+
+    def refused(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "bad"})
+
+    for handler in (down, missing):
+        async with client(handler) as ai:
+            with pytest.raises(OllamaUnavailable):
+                await ai.embed("bge-m3", ["a"])
+    async with client(refused) as ai:
+        with pytest.raises(OllamaError) as final:
+            await ai.embed("bge-m3", ["a"])
+    assert not isinstance(final.value, OllamaUnavailable)
