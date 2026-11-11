@@ -23,6 +23,7 @@ QUEUES = (
     "seal",
     "removal",
     "export",
+    "ask",
 )
 
 
@@ -88,12 +89,18 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "schedule": crontab(hour=3, minute=0),
                 "options": {"queue": "export"},
             },
+            # Questions asked more than 90 days ago go (sijil_worker.ask), on the Ask worker.
+            "expire-asks-daily": {
+                "task": "sijil.expire_asks",
+                "schedule": crontab(hour=4, minute=0),
+                "options": {"queue": "ask"},
+            },
         },
     )
 
     if reconcile_on_start:
-        # The main worker only (it has the Docker socket): the extraction, seal, removal and export
-        # workers never ask for a reconcile.
+        # The main worker only (it has the Docker socket): the extraction, seal, removal, export
+        # and Ask workers never ask for a reconcile.
         @worker_ready.connect(weak=False)
         def _reconcile_on_start(**_: Any) -> None:
             app.send_task("sijil.reconcile_tenants")

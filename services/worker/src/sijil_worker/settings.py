@@ -54,16 +54,12 @@ class ExportSettings(KeySettings, StorageSettings, BrokerSettings):
         return decode_key(self.export_signing_key.get_secret_value())
 
 
-class ExtractionSettings(KeySettings, BrokerSettings):
-    """What extraction and routing need, and nothing for provisioning: the extraction worker
-    boots with this alone (least privilege: no provisioner role, no Docker settings)."""
+class AiSettings(CoreSettings):
+    """The in-region Ollama, for the workers that call it. Its host must be on
+    `ai_allowed_hosts` (comma-separated in SIJIL_AI_ALLOWED_HOSTS), or the client refuses to
+    start."""
 
-    # Control-plane database, as the app role (DML only), same as the control plane.
-    database_url: str
-    # Extraction (M3): the in-region Ollama only. Its host must be on `ai_allowed_hosts`
-    # (comma-separated in SIJIL_AI_ALLOWED_HOSTS), or the client refuses to start.
-    extraction_model: str = "qwen3:4b"
-    # Embeddings of the chunks (M5, sijil_worker.embed), on the same Ollama: 1024 dimensions.
+    # Embeddings of the chunks (M5, sijil_worker.embed) and of Ask's questions: 1024 dimensions.
     embedding_model: str = "bge-m3"
     ollama_url: str = "http://ollama:11434"
     ai_allowed_hosts: Annotated[frozenset[str], NoDecode] = frozenset({"ollama"})
@@ -77,6 +73,27 @@ class ExtractionSettings(KeySettings, BrokerSettings):
         if isinstance(v, str):
             return frozenset(h.strip().lower() for h in v.split(",") if h.strip())
         return v
+
+
+class ExtractionSettings(KeySettings, BrokerSettings, AiSettings):
+    """What extraction and routing need, and nothing for provisioning: the extraction worker
+    boots with this alone (least privilege: no provisioner role, no Docker settings)."""
+
+    # Control-plane database, as the app role (DML only), same as the control plane.
+    database_url: str
+    # Extraction (M3), on the in-region Ollama.
+    extraction_model: str = "qwen3:4b"
+
+
+class AskSettings(KeySettings, BrokerSettings, AiSettings):
+    """The Ask worker (`-Q ask`, sijil_worker.ask): the control-plane database as the app role,
+    the broker, the master key (to open the workspaces' index databases) and the in-region
+    Ollama. No object-store key of any kind, no provisioner role, no tenant settings: it reads
+    and writes the index databases only."""
+
+    database_url: str
+    # The chat model that reads the question and writes the answer (SIJIL_ASK_MODEL).
+    ask_model: str = "qwen3:4b"
 
 
 class WorkerSettings(ExtractionSettings):

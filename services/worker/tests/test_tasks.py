@@ -8,14 +8,16 @@ import docker.errors
 import pytest
 import requests
 from botocore.exceptions import ClientError, EndpointConnectionError
+from celery.schedules import crontab
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.models import Job, JobKind, JobStatus, Workspace, WorkspaceState
+from sijil_core.ollama import OllamaUnavailable
 from sijil_core.paperless import PaperlessError, PaperlessForbidden, PaperlessUnavailable
 from sijil_core.region import RegionMismatch
 from sijil_worker import tasks
-from sijil_worker.app import make_celery
+from sijil_worker.app import QUEUES, make_celery
 from sijil_worker.ingest import INGEST_MAX_RETRIES, ConsumeFailed, WorkspaceNotActive
 from sijil_worker.settings import WorkerSettings
 
@@ -240,3 +242,59 @@ def test_drift_check_records_a_failed_check_when_retries_run_out(
     assert isinstance(result.result, PaperlessUnavailable)
     assert len(attempts) == tasks.DRIFT_MAX_RETRIES + 1
     assert failed == [(ARGS[1], "engine_unreachable")]  # once, when nothing will retry
+
+
+# Ask (sijil_worker.ask) -------------------------------------------------------------------
+
+ASK_KWARGS = {"ask_id": ARGS[0], "workspace_id": ARGS[1]}
+
+
+def test_ask_is_retried_while_the_model_is_down_then_fails(
+    eager_app: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts: list[str] = []
+    failed: list[tuple[str, str, str]] = []
+
+    async def down(ask_id: str, workspace_id: str) -> None:
+        attempts.append(ask_id)
+        raise OllamaUnavailable("ai.unavailable: HTTP 503", 503)
+
+    async def record(ask_id: str, workspace_id: str, code: str) -> None:
+        failed.append((ask_id, workspace_id, code))
+
+    monkeypatch.setattr(tasks, "extract_countdown", lambda retries: 0)
+    monkeypatch.setattr(tasks, "_answer_question", down)
+    monkeypatch.setattr(tasks, "_ask_failed", record)
+    tasks.answer_question_task.apply(kwargs=ASK_KWARGS)
+    assert len(attempts) == tasks.EXTRACT_MAX_RETRIES + 1  # the M3 retry window
+    assert failed == [(ARGS[0], ARGS[1], "ask.unavailable")]  # once, when nothing will retry
+
+
+def test_ask_final_error_fails_at_once(eager_app: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts: list[str] = []
+    failed: list[str] = []
+
+    async def broken(ask_id: str, workspace_id: str) -> None:
+        attempts.append(ask_id)
+        raise RuntimeError("bug")
+
+    async def record(ask_id: str, workspace_id: str, code: str) -> None:
+        failed.append(code)
+
+    monkeypatch.setattr(tasks, "_answer_question", broken)
+    monkeypatch.setattr(tasks, "_ask_failed", record)
+    tasks.answer_question_task.apply(kwargs=ASK_KWARGS)
+    assert (attempts, failed) == ([ARGS[0]], ["ask.unavailable"])
+
+
+def test_ask_tasks_run_on_the_ask_queue() -> None:
+    assert "ask" in QUEUES
+    assert tasks.answer_question_task.name == "sijil.answer_question"
+    assert getattr(tasks.answer_question_task, "queue", None) == "ask"
+    assert getattr(tasks.expire_asks_task, "queue", None) == "ask"
+    entry = make_celery(_settings()).conf.beat_schedule["expire-asks-daily"]
+    assert entry == {
+        "task": "sijil.expire_asks",
+        "schedule": crontab(hour=4, minute=0),
+        "options": {"queue": "ask"},
+    }

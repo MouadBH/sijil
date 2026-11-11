@@ -33,6 +33,8 @@ from sijil_core.pending import (
 )
 from sijil_core.region import RegionMismatch
 from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
+from sijil_worker.ask import UNAVAILABLE as ASK_UNAVAILABLE
+from sijil_worker.ask import answer_question, expire_questions, record_ask_failed
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -77,6 +79,7 @@ from sijil_worker.removal import record_removal_failed, remove_original, requeue
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.search import resync_search
 from sijil_worker.settings import (
+    AskSettings,
     ExportSettings,
     ExtractionSettings,
     RemovalSettings,
@@ -1361,3 +1364,87 @@ def sweep_exports_task() -> tuple[int, int]:
     """Every 300 s: re-send lost exports and fail abandoned builds (sijil_worker.export). Runs
     on the main worker: it reads and updates jobs and sends tasks, and holds no export key."""
     return asyncio.run(_sweep_exports())
+
+
+# Ask (sijil_worker.ask), on the Ask worker: retried like extraction while the model or a
+# database is down (`is_extract_transient`, `extract_countdown`, EXTRACT_MAX_RETRIES); then,
+# or on any final error, the question is `failed` with `ask.unavailable`.
+
+
+async def _answer_question(ask_id: str, workspace_id: str) -> None:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
+            await answer_question(
+                UUID(ask_id),
+                sessions=sessions,
+                index=engines,
+                ollama=ollama,
+                settings=settings,
+                workspace_id=UUID(workspace_id),
+                now=utcnow(),
+            )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _ask_failed(ask_id: str, workspace_id: str, code: str) -> None:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        await record_ask_failed(
+            UUID(ask_id),
+            code,
+            sessions=sessions,
+            index=engines,
+            settings=settings,
+            workspace_id=UUID(workspace_id),
+            now=utcnow(),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.answer_question", queue="ask", max_retries=EXTRACT_MAX_RETRIES)
+def answer_question_task(self: "Task[Any, Any]", ask_id: str, workspace_id: str) -> None:
+    """A question about the workspace's archive answered (sijil_worker.ask)."""
+    try:
+        asyncio.run(_answer_question(ask_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
+            raise self.retry(exc=exc, countdown=extract_countdown(retries)) from exc
+        log.error("question %s failed: %s", ask_id, type(exc).__name__)
+        try:
+            asyncio.run(_ask_failed(ask_id, workspace_id, ASK_UNAVAILABLE))
+        except Exception as audit_exc:
+            log.error("question %s failure not recorded: %s", ask_id, type(audit_exc).__name__)
+
+
+async def _expire_asks() -> int:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        return await expire_questions(
+            sessions=sessions, index=engines, settings=settings, now=utcnow()
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.expire_asks", queue="ask")
+def expire_asks_task() -> int:
+    """Daily, on the Ask worker: questions asked more than 90 days ago are deleted."""
+    return asyncio.run(_expire_asks())

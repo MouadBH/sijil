@@ -41,4 +41,5 @@ def test_queues_declared() -> None:
         "seal",
         "removal",
         "export",
+        "ask",
     )
