@@ -164,6 +164,10 @@ class _Facts:
     citations: list[_Doc]
     excluded: int
     snippets: list[tuple[int, str]]  # (citation number, text)
+    # The cited documents' structured values the answer may repeat: their amounts (HT, VAT,
+    # TTC) and retention basis dates. Never their number, supplier or text.
+    cited_amounts: list[str]
+    cited_dates: list[date]
 
 
 # The workspace ------------------------------------------------------------------------------
@@ -333,7 +337,7 @@ async def _answer(
     years = {d.year for d in (intent.period_from, intent.period_to) if d is not None}
     checked = isinstance(written, str) and check_answer(
         written.strip(), facts.figures, len(facts.citations), record.locale,
-        {*years, facts.excluded},
+        {*years, facts.excluded}, facts.cited_amounts, facts.cited_dates,
     )  # fmt: skip
     return ask_store.Answer(
         intent=intent.as_json(),
@@ -408,12 +412,24 @@ async def _facts(engine: AsyncEngine, intent: Intent, vector: list[float] | None
             citations = members[:MAX_CITATIONS] if summed else [d for d, _ in ranked[:KEEP]]
             numbers = {doc.id: n for n, doc in enumerate(citations, start=1)}
             chosen = [(numbers[d.id], s) for d, s in ranked if d.id in numbers][:MAX_SNIPPETS]
+            cited = (
+                await conn.execute(
+                    text(
+                        "SELECT total_ht, vat, total_ttc, basis_date FROM search_doc "
+                        "WHERE ledger_id = ANY(:ids)"
+                    ),
+                    {"ids": list(numbers)},
+                )
+            ).all()
+            amounts = {str(v) for r in cited for v in (r.total_ht, r.vat, r.total_ttc) if v}
             return _Facts(
                 figures=figures,
                 counted=[m.id for m in members],
                 citations=citations,
                 excluded=excluded,
                 snippets=chosen,
+                cited_amounts=sorted(amounts),
+                cited_dates=sorted({r.basis_date for r in cited}),
             )
 
 
@@ -631,15 +647,25 @@ def _value_pattern(value: str) -> re.Pattern[str]:
     return re.compile(rf"(?<![\d.,]){sign}(?:{'|'.join(forms)})(?!\d|[.,]\d)")
 
 
+def _date_pattern(day: date) -> re.Pattern[str]:
+    """`day` written whole: `2026-03-15`, `15/03/2026` or `15.03.2026` (day and month with or
+    without their leading zero)."""
+    iso = f"{day.year}-{day.month:02d}-{day.day:02d}"
+    dmy = f"0?{day.day}[/.]0?{day.month}[/.]{day.year}"
+    return re.compile(rf"(?<![\d.,])(?:{iso}|{dmy})(?!\d)")
+
+
 def check_answer(
     answer: str, figures: Sequence[dict[str, Any]], citation_count: int, locale: str,
-    numbers: Collection[int] = (),
+    numbers: Collection[int] = (), amounts: Collection[str] = (), dates: Collection[date] = (),
 ) -> bool:  # fmt: skip
     """Whether the model's answer may be shown: every figure's value written as given (any of
     `_value_pattern`'s forms, digits folded), every `[#n]` within the `citation_count` given,
-    every other number in it, compared whole, one of the figures' document counts or of
-    `numbers` (the period's years, the left-out count), and the locale's script (Arabic for
-    `ar`, else Latin) ahead of the other."""
+    every other number in it, compared whole, one of: the figures' document counts, `numbers`
+    (the period's years, the left-out count), a cited document's amount in `amounts` (any of
+    the same forms) or date in `dates` (`2026-03-15`, `15/03/2026`, `15.03.2026`, or its day,
+    month or year alone); and the locale's script (Arabic for `ar`, else Latin) ahead of the
+    other."""
     if not answer.strip() or len(answer) > MAX_ANSWER_CHARS:
         return False
     folded = _fold(answer)
@@ -651,7 +677,13 @@ def check_answer(
         if pattern.search(rest) is None:
             return False
         rest = pattern.sub(" ", rest)
+    for amount in amounts:
+        rest = _value_pattern(amount).sub(" ", rest)
     known = {str(n) for n in numbers} | {str(f["document_count"]) for f in figures}
+    for day in dates:
+        rest = _date_pattern(day).sub(" ", rest)
+        known |= {str(day.year), str(day.month), f"{day.month:02d}", str(day.day)}
+        known.add(f"{day.day:02d}")
     if any(token not in known for token in _NUMBER.findall(rest)):
         return False
     arabic, latin = len(_ARABIC.findall(rest)), len(_LATIN.findall(rest))

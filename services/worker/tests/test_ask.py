@@ -12,7 +12,7 @@ import hashlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -548,8 +548,9 @@ async def test_document_text_lends_no_number_to_the_answer(
     ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
     engine: AsyncEngine,
 ) -> None:  # fmt: skip
-    """A number in a supplier name (the writer sees it in a citation line), or one rebuilt from
-    the documents' own amounts, is not a figure: the answer is templated."""
+    """A number in a supplier name (the writer sees it in a citation line), one rebuilt from
+    the documents' own amounts, an amount of a document not cited, or an invoice number, is
+    not a figure: the answer is templated."""
     docs = await _samples(engine)
     hostile = await _document(
         engine,
@@ -559,7 +560,9 @@ async def test_document_text_lends_no_number_to_the_answer(
     for writer in (
         says("La TVA est de 439,80 MAD [#1]. Le total est 999999."),
         says("La TVA est de 439,80 MAD [#1], dont 250,80 MAD en septembre."),
-        says("La TVA est de 439,80 MAD [#1], dont 250,00 MAD en septembre."),
+        # 462.78 is the total of a SAMPLE invoice of another supplier, not cited here.
+        says("La TVA est de 439,80 MAD [#1], hors 462,78 MAD d'eau."),
+        says("La TVA est de 439,80 MAD [#1], facture F-2026-01001."),
     ):
         ask_id = await _ask(engine, QUESTION_FR)
         record = await _answer(ask_id, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, writer))
@@ -571,6 +574,30 @@ async def test_document_text_lends_no_number_to_the_answer(
     ask_id = await _ask(engine, QUESTION_FR)
     kept = await _answer(ask_id, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, says(honest)))
     assert (kept.answer_text, kept.answer_code) == (honest, None)
+
+
+async def test_answer_repeating_the_cited_invoices_is_kept(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    """A natural answer repeats each cited invoice's amounts and date: kept."""
+    await _samples(engine)
+    natural = (
+        "Vous avez payé 429,80 MAD de TVA à Atlas en 2026 : 250.00 MAD sur la facture du "
+        "2026-09-30 (1 500,00 MAD TTC, 1250.00 HT) [#1] et 179,80 MAD le 31/08/2026 "
+        "(1078.80 TTC) [#2]."
+    )
+    ask_id = await _ask(engine, QUESTION_FR)
+    kept = await _answer(
+        ask_id, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, says(natural))
+    )
+    assert (kept.answer_text, kept.answer_code) == (natural, None)
+    arabic = "دفعتم ٤٢٩٫٨٠ درهم: ٢٥٠٫٠٠ في ٣٠.٠٩.٢٠٢٦ [#1] و١٧٩٫٨٠ في ٢٠٢٦-٠٨-٣١ [#2]."
+    other = await _ask(engine, QUESTION_AR, "ar")
+    kept_ar = await _answer(
+        other, ready, sessions, engines, FakeOllama(VAT_ATLAS_2026, says(arabic))
+    )
+    assert (kept_ar.answer_text, kept_ar.answer_code) == (arabic, None)
 
 
 async def test_no_match_for_unknown_supplier(
@@ -733,6 +760,22 @@ def test_check_allows_only_the_structured_numbers() -> None:
     assert check_answer("في 2026: ١٢٣٤٫٥٠ درهم [#1]", FIGURE, 1, "ar", {2026})
     assert check_answer("في ٢٠٢٦: ١٢٣٤٫٥٠ درهم [#1]", FIGURE, 1, "ar", {2026})
     assert not check_answer("In 2026: 1234.50 MAD [#1]", FIGURE, 1, "ar", {2026})
+
+
+def test_check_allows_the_cited_documents_amounts_and_dates() -> None:
+    amounts = ["1500.00", "1250.00", "250.00"]
+    dates = [date(2026, 3, 15)]
+    for written in ("2026-03-15", "15/03/2026", "15.03.2026", "15 mars 2026", "le 15/3"):
+        answer = f"1234.50 MAD ; la facture du {written} : 1 500,00 TTC, 1,250.00 HT, 250,00 [#1]."
+        assert check_answer(answer, FIGURE, 1, "fr", (), amounts, dates), written
+    # Not a cited document's: another amount, another date, an invoice number.
+    for answer in (
+        "1234.50 MAD ; 462,78 MAD [#1].",
+        "1234.50 MAD ; le 16/03/2026 [#1].",
+        "1234.50 MAD ; facture F-2026-01001 [#1].",
+        "1234.50 MAD ; 1500.80 [#1].",
+    ):
+        assert not check_answer(answer, FIGURE, 1, "fr", (), amounts, dates), answer
 
 
 # Failure, retries, expiry -------------------------------------------------------------------
