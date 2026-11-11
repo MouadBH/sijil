@@ -100,8 +100,10 @@ Arabic or English. Answer with one JSON object holding exactly these keys:
 the default for "how much") or "total_ht" (the amount without tax); else null.
 - supplier: the supplier's name, or its 15-digit ICE, as the question writes it; null when it \
 names none.
-- document_type: invoice, receipt, contract, bank_statement, payslip, tax_notice or other when \
-the question names one; else null.
+- document_type: only when the question names a kind of document ("factures", "فواتير": \
+invoice; "reçus": receipt; "contrat": contract; "relevé bancaire": bank_statement; "bulletin \
+de paie": payslip; "avis d'imposition": tax_notice); else null. A tax asked for as an amount \
+(TVA, VAT, الضريبة على القيمة المضافة) is the measure, never a document type.
 - period_from, period_to: the first and the last day (YYYY-MM-DD) of the period the question \
 names; a year is YYYY-01-01 to YYYY-12-31; relative periods ("last month") count from today's \
 date, which the user message gives; null when it names no period.
