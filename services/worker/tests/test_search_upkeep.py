@@ -3,7 +3,8 @@
 The resync compares each `search_doc` row's state with the ledger, fixes the ones that differ
 (a terminal ledger state is marked, never upserted), creates the missing ones (content fetched
 from Paperless once, fields from `document_fields`), fills an empty text, purges the row of
-a purged document and audits `search.resynced` `{fixed, failed}`. The
+a purged document, rewrites a row whose values drifted from their sources (audited
+`search.repaired`) and audits `search.resynced` `{fixed, failed}`. The
 backfill rebuilds every live row. Ingest and extraction upkeep are in test_ingest.py and
 test_extract.py, next to their harnesses.
 
@@ -55,7 +56,6 @@ from sijil_core.search_index import (
     mark_search_state,
     refresh_search_doc,
     set_tags,
-    upsert_search_doc,
 )
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
@@ -182,10 +182,11 @@ async def _fields(conn: AsyncConnection, ledger_id: uuid.UUID) -> None:
 async def _search_row(
     conn: AsyncConnection, row: DocumentLedger, state: DocumentState, content: str
 ) -> None:
+    """The row as production writes it: from the fields and notes the index holds."""
     facts = SearchLedgerFacts(
         ledger_id=row.id, state=state, ingested_at=row.ingested_at, region="ma-cas", now=NOW
     )
-    await upsert_search_doc(conn, facts, None, [], content)
+    await refresh_search_doc(conn, facts, content)
 
 
 async def _search(conn: AsyncConnection, ledger_id: uuid.UUID) -> dict[str, Any] | None:
@@ -619,3 +620,134 @@ async def test_resync_never_enqueues_a_terminal_document(
         _paperless(router, {})
         await _run(sessions, keys, engines, enqueue_embed=send)
     assert sent == []
+
+
+# Final review I1: the resync compares values, not only the state ------------------------------
+# `search_doc` is a derived row the index role may UPDATE (only DELETE and TRUNCATE are gated),
+# so the resync compares each live row's derived columns and tags with what its sources (the
+# ledger, `document_fields`, `correction_note`, `document_tag`) give, rewrites any that differ
+# and audits `search.repaired` `{columns}` (column names only) per document.
+
+
+async def _repaired(db: AsyncSession, ws: Workspace) -> list[tuple[str | None, dict[str, Any]]]:
+    rows = await db.scalars(
+        select(AuditEvent)
+        .where(AuditEvent.workspace_id == ws.id, AuditEvent.action == "search.repaired")
+        .order_by(AuditEvent.seq)
+        .execution_options(populate_existing=True)
+    )
+    return [(e.target_id, dict(e.data)) for e in rows]
+
+
+async def _values(conn: AsyncConnection, ledger_id: uuid.UUID) -> dict[str, Any]:
+    found = await conn.execute(
+        text(
+            "SELECT state, supplier_name, supplier_ice, total_ttc, currency, basis_date, tags,"
+            " supplier_norm, corrected FROM search_doc WHERE ledger_id = :id"
+        ),
+        {"id": ledger_id},
+    )
+    return dict(found.mappings().one())
+
+
+async def test_resync_repairs_values_changed_by_direct_sql(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    sealed = await _live(db, conn, ready, user, DocumentState.sealed, 241)
+    untouched = await _live(db, conn, ready, user, DocumentState.filed, 242)
+    await set_tags(conn, sealed.id, ["bureau"], by=user.id, now=NOW)
+    before = await _values(conn, sealed.id)
+    # The index role's credentials, no gate: Ask's sums and the export read these columns.
+    await conn.execute(
+        text(
+            "UPDATE search_doc SET total_ttc = 1.00, supplier_ice = '009999999000099',"
+            " supplier_name = 'Autre SAMPLE', supplier_norm = 'autre sample',"
+            " basis_date = '2019-01-01', tags = '{faux}' WHERE ledger_id = :id"
+        ),
+        {"id": sealed.id},
+    )
+    with respx.mock(assert_all_called=False) as router:
+        routes = _paperless(router, {241: "SAMPLE 241", 242: "SAMPLE 242"})
+        assert await _run(sessions, keys, engines) == 1
+    assert not any(r.called for r in routes.values())  # the text is kept, never re-fetched
+    assert await _values(conn, sealed.id) == before
+    assert (await _search(conn, sealed.id) or {})["content"] == "Facture SAMPLE 241"
+    assert await _repaired(db, ready) == [
+        (
+            str(sealed.id),
+            {"columns": "basis_date,supplier_ice,supplier_name,supplier_norm,tags,total_ttc"},
+        )
+    ]
+    assert await _resynced(db, ready) == [{"fixed": 1, "failed": 0}]
+    assert (await _search(conn, untouched.id) or {})["state"] == "filed"
+    # In step now: nothing repaired twice.
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        assert await _run(sessions, keys, engines) == 0
+    assert len(await _repaired(db, ready)) == 1
+
+
+async def test_resync_repairs_a_corrected_value_and_a_currency_changed_by_sql(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """The effective value is the correction note's, not the sealed one."""
+    row = await _live(db, conn, ready, user, DocumentState.sealed, 251)
+    await index.add_correction(
+        conn, row.id, "total_ttc", "1600.00", REASON, created_by=user.id, now=NOW
+    )
+    facts = SearchLedgerFacts(
+        ledger_id=row.id, state="sealed", ingested_at=row.ingested_at, region="ma-cas", now=NOW
+    )
+    await refresh_search_doc(conn, facts)
+    await conn.execute(
+        text(
+            "UPDATE search_doc SET total_ttc = 1500.00, currency = 'EUR', corrected = '{}'"
+            " WHERE ledger_id = :id"
+        ),
+        {"id": row.id},
+    )
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        assert await _run(sessions, keys, engines) == 1
+    found = await _values(conn, row.id)
+    assert (str(found["total_ttc"]), found["currency"]) == ("1600.00", "MAD")
+    assert found["corrected"] == ["total_ttc"]
+    assert await _repaired(db, ready) == [
+        (str(row.id), {"columns": "corrected,currency,total_ttc"})
+    ]
+
+
+async def test_resync_revives_a_live_document_marked_terminal_by_sql(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """A terminal state is one-way in the ledger: a live ledger row (read under its lock) with
+    a terminal search row was changed by hand, and would drop out of search and every sum."""
+    row = await _live(db, conn, ready, user, DocumentState.sealed, 261)
+    await conn.execute(
+        text("UPDATE search_doc SET state = 'removed' WHERE ledger_id = :id"), {"id": row.id}
+    )
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        assert await _run(sessions, keys, engines) == 1
+    assert (await _search(conn, row.id) or {})["state"] == "sealed"
+    assert await _repaired(db, ready) == [(str(row.id), {"columns": "state"})]
+
+
+async def test_resync_does_not_audit_a_routine_state_fix_as_a_repair(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """A row a best-effort write left behind (routing after extraction) is a fix, not a
+    repair: its state lags the ledger's."""
+    row = await _ledger(db, ready, user, DocumentState.filed, 271)
+    await _search_row(conn, row, DocumentState.received, "Facture SAMPLE 271")
+    await _fields(conn, row.id)
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        assert await _run(sessions, keys, engines) == 1
+    assert (await _values(conn, row.id))["supplier_name"] == VALUES["supplier_name"]
+    assert await _repaired(db, ready) == []
+    assert await _resynced(db, ready) == [{"fixed": 1, "failed": 0}]
