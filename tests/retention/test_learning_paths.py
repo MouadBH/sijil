@@ -3,8 +3,8 @@
 `sijil.learn_from_document` reads a document's effective values and writes the workspace's
 `supplier` record, then sets a correspondent on the document's Paperless copy. It never changes
 the sealed `document_fields` row, its `fields_sha256` or the ledger, and a document already
-removed (or deleted) teaches nothing and gets no Paperless call. A record is workspace knowledge:
-the purge of the document it was learnt from leaves it.
+removed (or deleted) teaches nothing and gets no Paperless call. The purge of the last live
+document carrying an ICE deletes its record, so a mistaken upload leaves no supplier knowledge.
 """
 
 import hashlib
@@ -39,6 +39,7 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, fields_digest
 from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.paperless import PaperlessClient
+from sijil_core.search_index import SearchLedgerFacts, mark_search_state, refresh_search_doc
 from sijil_worker.learning import learn_from_document
 from sijil_worker.settings import WorkerSettings
 from tests.support.index_db import throwaway_index_db
@@ -112,6 +113,11 @@ async def _document(
         )
         if sealed:
             await index.seal_fields(conn, row.id, fields_sha256=digest, sealed_at=NOW)
+        state = DocumentState.sealed if sealed else DocumentState.filed
+        facts = SearchLedgerFacts(
+            ledger_id=row.id, state=state, ingested_at=NOW, region="ma-cas", now=NOW
+        )
+        await refresh_search_doc(conn, facts, "SAMPLE")
     return row
 
 
@@ -185,15 +191,46 @@ async def test_a_removed_document_teaches_nothing_and_its_paperless_copy_is_unto
         assert await suppliers.get(conn, "001905837000041") is None
 
 
-async def test_the_purge_leaves_the_learnt_record(
+async def _remove_and_purge(
+    db: AsyncSession, engines: IndexEngines, ws: Workspace, user: User, ledger_id: Any
+) -> None:
+    """The removal's own path: the ledger UPDATE, the search row marked, then the purge."""
+    await db.execute(
+        text(
+            "UPDATE document_ledger SET state = 'removed', removed_at = now(), "
+            "removed_by = :u, removal_reason = 'a duplicate upload' WHERE id = :id"
+        ),
+        {"u": user.id, "id": ledger_id},
+    )
+    await db.commit()
+    async with (await engines.engine(ws)).begin() as conn:
+        await mark_search_state(conn, ledger_id, DocumentState.removed)
+        await index.purge_document(conn, ledger_id)
+        assert await index.read_fields(conn, ledger_id) is None
+
+
+async def test_removing_the_only_document_with_an_ice_removes_its_record(
     db: AsyncSession, engines: IndexEngines, keys: LocalKeyService, workspace: Workspace,
     user: User,
 ) -> None:  # fmt: skip
-    row = await _document(db, engines, workspace, user)
+    row = await _document(db, engines, workspace, user, sealed=False)
     with respx.mock(assert_all_called=False) as router:
         _paperless(router)
         assert await _learn(db, engines, keys, row.id)
-    async with (await engines.engine(workspace)).begin() as conn:
-        await index.purge_document(conn, row.id, sealed=True)
-        assert await index.read_fields(conn, row.id) is None
+    await _remove_and_purge(db, engines, workspace, user, row.id)
+    async with (await engines.engine(workspace)).connect() as conn:
+        assert await suppliers.get(conn, "001905837000041") is None
+
+
+async def test_removing_one_of_two_documents_keeps_the_record(
+    db: AsyncSession, engines: IndexEngines, keys: LocalKeyService, workspace: Workspace,
+    user: User,
+) -> None:  # fmt: skip
+    gone = await _document(db, engines, workspace, user, sealed=False)
+    await _document(db, engines, workspace, user)
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router)
+        assert await _learn(db, engines, keys, gone.id)
+    await _remove_and_purge(db, engines, workspace, user, gone.id)
+    async with (await engines.engine(workspace)).connect() as conn:
         assert await suppliers.get(conn, "001905837000041") is not None

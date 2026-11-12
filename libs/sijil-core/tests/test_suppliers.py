@@ -2,7 +2,7 @@
 
 A record is keyed by ICE. A newly confirmed name replaces the record's name and the previous one
 is kept as an alias (deduplicated after `search_normalise`, at most 10). Without an ICE nothing
-is learnt. Records are workspace knowledge, not one document's data: the purge leaves them.
+is learnt. The purge of the last live document carrying an ICE deletes its record.
 """
 
 import random
@@ -16,8 +16,10 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from sijil_core import index, suppliers
+from sijil_core.db.models import DocumentState
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import FieldsRow
+from sijil_core.search_index import SearchLedgerFacts, mark_search_state, refresh_search_doc
 from tests.support.index_db import throwaway_index_db
 
 pytestmark = pytest.mark.db
@@ -46,7 +48,7 @@ def _ice() -> str:
 
 
 def test_schema_v7_is_the_supplier_table() -> None:
-    assert index.SCHEMA_VERSION == 7
+    assert index.SCHEMA_VERSION >= 7
     assert any("CREATE TABLE supplier" in sql for sql in index._DDL[7])  # noqa: SLF001
 
 
@@ -145,17 +147,45 @@ async def test_the_table_refuses_a_malformed_record(conn: AsyncConnection) -> No
         )
 
 
-async def test_the_purge_leaves_supplier_records(conn: AsyncConnection) -> None:
-    """Workspace knowledge, not the document's data: purging the document it was learnt from
-    keeps the record."""
-    ice = _ice()
+async def _carrier(conn: AsyncConnection, ice: str, name: str) -> uuid.UUID:
+    """A filed document carrying this ICE, with its search row."""
     ledger_id = uuid.uuid4()
-    values = dict.fromkeys(FIELD_NAMES) | {"supplier_name": "SAMPLE Purge", "supplier_ice": ice}
-    await index.write_extraction(
-        conn,
-        FieldsRow(ledger_id=ledger_id, values=values, updated_at=NOW),
+    values = dict.fromkeys(FIELD_NAMES) | {"supplier_name": name, "supplier_ice": ice}
+    row = FieldsRow(ledger_id=ledger_id, values=values, updated_at=NOW)
+    await index.write_extraction(conn, row)
+    facts = SearchLedgerFacts(
+        ledger_id=ledger_id, state=DocumentState.filed, ingested_at=NOW, region="ma-cas", now=NOW
     )
+    await refresh_search_doc(conn, facts, "SAMPLE")
+    return ledger_id
+
+
+async def test_the_purge_of_the_only_carrier_deletes_the_record(conn: AsyncConnection) -> None:
+    """A mistaken upload leaves no supplier knowledge: the record goes with the last live
+    document carrying its ICE."""
+    ice = _ice()
+    only = await _carrier(conn, ice, "SAMPLE Purge")
     await suppliers.learn(conn, ice=ice, name="SAMPLE Purge", source="review", actor=None, now=NOW)
-    await index.purge_document(conn, ledger_id)
-    assert await index.read_fields(conn, ledger_id) is None
+    await mark_search_state(conn, only, DocumentState.removed)
+    await index.purge_document(conn, only)
+    assert await index.read_fields(conn, only) is None
+    assert await suppliers.get(conn, ice) is None
+
+
+async def test_the_purge_keeps_a_record_another_live_document_carries(
+    conn: AsyncConnection,
+) -> None:
+    ice, other_ice = _ice(), _ice()
+    gone = await _carrier(conn, ice, "SAMPLE Purge")
+    kept = await _carrier(conn, ice, "SAMPLE Purge")
+    await suppliers.learn(conn, ice=ice, name="SAMPLE Purge", source="review", actor=None, now=NOW)
+    await suppliers.learn(
+        conn, ice=other_ice, name="SAMPLE Autre", source="review", actor=None, now=NOW
+    )
+    await mark_search_state(conn, gone, DocumentState.removed)
+    await index.purge_document(conn, gone)
     assert await suppliers.get(conn, ice) is not None
+    assert await suppliers.get(conn, other_ice) is not None  # another ICE is never touched
+    await mark_search_state(conn, kept, DocumentState.removed)
+    await index.purge_document(conn, kept)
+    assert await suppliers.get(conn, ice) is None

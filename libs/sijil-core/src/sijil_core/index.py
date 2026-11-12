@@ -15,7 +15,7 @@ document's chunks and their embeddings (v5, `doc_chunk`) are replaced as a whole
 like every value here, stay in this database. Ask's questions and answers (v6, `ask_query`)
 are not document data: they expire, and the purge deletes those quoting the purged document.
 Supplier records (v7, `supplier`, `sijil_core.suppliers`) are the workspace's knowledge, learnt
-from reviewers, not one document's data: the purge leaves them.
+from reviewers; the purge of the last live document carrying an ICE deletes its record (v8).
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -47,7 +47,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 7
+SCHEMA_VERSION: Final = 8
 # bge-m3's dimensions (SIJIL_EMBEDDING_MODEL): `doc_chunk.embedding` is vector(1024).
 EMBEDDING_DIM: Final = 1024
 MAX_ENGINES: Final = 32
@@ -425,9 +425,8 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
     END $$""",
     ),
     # v7: the workspace's supplier records (`sijil_core.suppliers`), one per ICE, learnt when a
-    # reviewer confirms or corrects a supplier. Workspace knowledge, not a document's data:
-    # `purge_document` leaves them (the name came from a reviewer, and other documents share
-    # it). The trigram index is on the normalised name, as Ask's resolver compares it.
+    # reviewer confirms or corrects a supplier. The trigram index is on the normalised name, as
+    # Ask's resolver compares it.
     7: (
         """CREATE TABLE supplier (
         ice text PRIMARY KEY CHECK (ice ~ '^[0-9]{15}$'),
@@ -440,6 +439,42 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
     )""",
         "CREATE INDEX supplier_name_trgm ON supplier "
         "USING gin (search_normalise(name) gin_trgm_ops)",
+    ),
+    # v8: a record is the knowledge of the documents that carry its ICE, so it lives no longer
+    # than they do: the purge reads every ICE the purged document carried (its search row, its
+    # fields, its correction notes) and deletes the record of each that no other live search
+    # row carries. A mistaken upload leaves no supplier knowledge behind.
+    8: (
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    DECLARE
+        carried text[];
+    BEGIN
+        SELECT array_agg(DISTINCT ice) INTO carried FROM (
+            SELECT supplier_ice AS ice FROM search_doc WHERE ledger_id = target
+            UNION SELECT "values" ->> 'supplier_ice' FROM document_fields WHERE ledger_id = target
+            UNION SELECT value FROM correction_note
+                WHERE ledger_id = target AND field = 'supplier_ice'
+        ) found WHERE ice IS NOT NULL;
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM ask_query WHERE citations @> ARRAY[target] OR counted @> ARRAY[target];
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        DELETE FROM supplier s WHERE s.ice = ANY(coalesce(carried, '{}'))
+            AND NOT EXISTS (
+                SELECT 1 FROM search_doc d WHERE d.supplier_ice = s.ice
+                  AND d.state NOT IN ('removed', 'deleting', 'deleted')
+            );
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
     ),
 }
 
@@ -797,8 +832,9 @@ def effective_fields(
 
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
     """Deletes the document's `document_fields`, `extraction_run`, `correction_note`,
-    `search_doc`, `document_tag` and `doc_chunk` rows, and the `ask_query` answers citing or
-    counting it, all or nothing, through the schema's `purge_document()` function. Idempotent.
+    `search_doc`, `document_tag` and `doc_chunk` rows, the `ask_query` answers citing or
+    counting it, and the `supplier` record of each ICE it carried that no other live search row
+    carries, all or nothing, through the schema's `purge_document()` function. Idempotent.
 
     The index triggers refuse every DELETE but one whose ledger id the GUC `sijil.purge` names,
     which the function sets with `set_config(..., true)` (`SET LOCAL`) and clears again before
