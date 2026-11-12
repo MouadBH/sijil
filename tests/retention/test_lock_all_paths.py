@@ -11,8 +11,18 @@ a document, for every role, on an unsealed and on a sealed document.
 | 5 ledger SQL: DELETE, `sha256`, bare `removed`, `fields_sha256` | none | refused | refused |
 | 6 object-store delete: app, seal (and removal, sealed) key | none | refused | refused |
 | 7 index SQL without the purge GUC | none | refused | DELETE refused |
+| 8 API `PUT …/documents/{id}/tags` | each | fields unchanged | - |
+| 9 API search, saved view, Ask (and its worker) | each | nothing written | - |
+| 10 search and embedding SQL without the gate | none | refused | refused |
 
-Paths 4 to 7 have no role: no Sijil role (the Owner's included) reaches them through any API,
+Paths 8 and 9 (M5) are the annotations and the reads: on a sealed document a tag is allowed
+(Owner, Admin, Member) and a search, a saved view or a question is every role's; none of them
+writes the ledger (its `fields_sha256` included), the fields row, a correction or the original.
+Path 10 is `search_doc` and `doc_chunk` (DELETE, UPDATE, TRUNCATE) and `document_tag`
+(TRUNCATE): a plain DELETE on `document_tag` is the removal of a tag, an annotation (ruling, M5
+Task 1; index schema v4), proven by tests/retention/test_tag_paths.py to touch nothing else.
+
+Paths 4 to 7 and 10 have no role: no Sijil role (the Owner's included) reaches them through any API,
 and each refuses whoever holds the credential. 4 and 6 run against the live tenant t1 and
 RustFS (`make itest`); the rest against the test database (`make check`).
 
@@ -28,7 +38,7 @@ as they were and sends nothing to the removal worker; a refused removal or appro
 import hashlib
 import os
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import astuple, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -47,15 +57,19 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from sijil_core import index
-from sijil_core.db.models import AuditEvent, Membership, Role, Workspace
+from sijil_core import ask_store, index
+from sijil_core.db.models import AuditEvent, DocumentState, Membership, Role, Workspace
 from sijil_core.filetypes import FileKind
+from sijil_core.index import EMBEDDING_DIM
+from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc, set_tags
 from sijil_core.storage import ObjectRef, S3ObjectStore, StorageSettings
+from sijil_worker.ask import answer_question
 from sijil_worker.lock import lock_sealed
-from sijil_worker.settings import WorkerSettings
+from sijil_worker.settings import AskSettings, WorkerSettings
+from tests.support.fake_ollama import FakeOllama
 from tests.support.index_db import throwaway_index_db
 from tests.support.memory_store import MemoryObjectStore
-from tests.support.sealing import add_document, add_index_credential, engines_on
+from tests.support.sealing import INVOICE, add_document, add_index_credential, engines_on
 
 Actor = Any
 MakeActor = Callable[[str], Awaitable[Actor]]
@@ -114,10 +128,11 @@ class Doc:
 async def _document(
     state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
     store: MemoryObjectStore, conn: AsyncConnection,
+    values: Mapping[str, str | None] = INVOICE,
 ) -> Doc:  # fmt: skip
     """A filed document; sealed through the API and locked COMPLIANCE as the seal worker
     does, when `state` is "sealed"."""
-    row = await add_document(db, store, conn, ws)
+    row = await add_document(db, store, conn, ws, values=values)
     doc = Doc(row.id, ObjectRef(row.object_key, row.object_version_id))
     if state == "sealed":
         sealer = await _member(make_actor, db, ws, Role.member)
@@ -327,6 +342,161 @@ async def test_index_sql_without_the_purge_gate(
     before = await _snapshot(db, index_conn, memory_store, row)
     with pytest.raises(DBAPIError, match="retention.locked"):
         await index_conn.execute(text(INDEX_SQL[statement]), {"id": row.id})
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+
+
+# Paths 8 and 9 (M5): tags, search, saved views and Ask, per role, on a sealed document -------
+
+ASK_SETTINGS = AskSettings.model_construct(
+    region="ma-cas", environment="test", ask_model="qwen3:4b", embedding_model="bge-m3"
+)
+TAG = "SAMPLE-lock"
+
+
+def _own_invoice() -> dict[str, str | None]:
+    """The SAMPLE invoice with an ICE of its own: the index database is shared by the module,
+    so a search or a sum by this ICE finds this document only."""
+    return INVOICE | {"supplier_ice": f"00{uuid.uuid4().int % 10**13:013d}"}
+
+
+def _m5_expected(path: str, role: Role) -> int:
+    if path == "tags":
+        return 403 if role is Role.readonly else 200
+    return {"search": 200, "view": 201, "ask": 202}[path]
+
+
+async def _search_row(conn: AsyncConnection, ledger_id: uuid.UUID) -> Any:
+    return await conn.scalar(
+        text("SELECT to_jsonb(s) - 'updated_at' FROM search_doc s WHERE s.ledger_id = :id"),
+        {"id": ledger_id},
+    )
+
+
+async def _m5_call(actor: Actor, ws_id: uuid.UUID, row: Doc, path: str, ice: str) -> httpx.Response:
+    base = f"/v1/workspaces/{ws_id}"
+    client: httpx.AsyncClient = actor.client
+    if path == "tags":
+        return await client.put(f"{base}/documents/{row.id}/tags", json={"tags": [TAG]})
+    if path == "search":
+        return await client.post(f"{base}/search", json={"filters": {"q": ice}})
+    if path == "view":
+        body = {"name": "SAMPLE lock", "filters": {"supplier": ice}}
+        return await client.post(f"{base}/search/views", json=body)
+    if path == "ask":
+        question = {"question": "Quelle TVA avons-nous payée en 2026 ? (SAMPLE)", "locale": "fr"}
+        return await client.post(f"{base}/ask", json=question)
+    raise AssertionError(path)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("path", ["tags", "search", "view", "ask"])
+async def test_m5_api_path(
+    path: str, role: Role, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection, enqueuer: Any,
+    cp_app: FastAPI,
+) -> None:  # fmt: skip
+    """A tag (an annotation) and the reads leave the sealed document as it was; a question is
+    also answered by the Ask worker (a fake model), which writes its answer only."""
+    ws_id = ws.id  # a rollback expires the ORM row
+    values = _own_invoice()
+    ice = str(values["supplier_ice"])
+    row = await _document("sealed", make_actor, db, ws, memory_store, index_conn, values)
+    actor = await _member(make_actor, db, ws, role)
+    before = await _snapshot(db, index_conn, memory_store, row)
+    search_before = await _search_row(index_conn, row.id)
+    events_before = await _events(db, ws_id)
+    sent = (list(enqueuer.locks), list(enqueuer.removals))
+
+    r = await _m5_call(actor, ws_id, row, path, ice)
+
+    assert r.status_code == _m5_expected(path, role), r.text
+    actions = [e[0] for e in (await _events(db, ws_id))[len(events_before) :]]
+    if path == "search":
+        assert [item["id"] for item in r.json()["items"]] == [str(row.id)]
+    if path == "ask":
+        [(ask_id, _)] = enqueuer.asks
+        ollama = FakeOllama(
+            intent={"kind": "sum", "measure": "vat", "supplier": ice, "document_type": None,
+                    "period_from": "2026-01-01", "period_to": "2026-12-31", "keywords": None},
+            answer="SAMPLE [#1]",
+        )  # fmt: skip
+        async with ollama.client() as client:
+            await answer_question(
+                ask_id, sessions=async_sessionmaker(db.bind, expire_on_commit=False),
+                index=cp_app.state.index, ollama=client, settings=ASK_SETTINGS,
+                workspace_id=ws_id, now=datetime.now(UTC),
+            )  # fmt: skip
+        record = await ask_store.read_ask(index_conn, ask_id)
+        assert record is not None
+        assert (record.state, record.citations) == ("answered", [row.id])
+        assert record.figures[0]["value"] == INVOICE["vat"]
+        actions = [e[0] for e in (await _events(db, ws_id))[len(events_before) :]]
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert (enqueuer.locks, enqueuer.removals) == sent
+    search_after = await _search_row(index_conn, row.id)
+    if path == "tags" and role is not Role.readonly:
+        assert search_after == search_before | {"tags": [TAG.casefold()]}
+        assert actions == ["document.tagged"]
+        return
+    assert search_after == search_before
+    expected_actions = {
+        "tags": [],
+        "search": ["search.performed"],
+        "view": ["search.view_changed"],
+        "ask": ["ask.asked", "ask.answered"],
+    }
+    assert actions == expected_actions[path]
+
+
+# Path 10 (M5): direct SQL on the search and embedding tables ---------------------------------
+
+SEARCH_SQL = {
+    "search_doc_delete": "DELETE FROM search_doc WHERE ledger_id = :id",
+    "search_doc_truncate": "TRUNCATE search_doc",
+    "doc_chunk_delete": "DELETE FROM doc_chunk WHERE ledger_id = :id",
+    "doc_chunk_update": "UPDATE doc_chunk SET text = 'x' WHERE ledger_id = :id",
+    "doc_chunk_truncate": "TRUNCATE doc_chunk",
+    "document_tag_truncate": "TRUNCATE document_tag",
+}
+
+
+async def _search_rows(conn: AsyncConnection, ledger_id: uuid.UUID) -> tuple[Any, ...]:
+    tags = await conn.scalars(
+        text("SELECT tag FROM document_tag WHERE ledger_id = :id ORDER BY tag"), {"id": ledger_id}
+    )
+    chunks = await conn.scalars(
+        text("SELECT text FROM doc_chunk WHERE ledger_id = :id ORDER BY n"), {"id": ledger_id}
+    )
+    return (await _search_row(conn, ledger_id), list(tags), list(chunks))
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("statement", sorted(SEARCH_SQL))
+async def test_search_sql_without_the_gate(
+    state: str, statement: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """As the index database's superuser, with no gate open (`sijil.purge`, `sijil.reembed`):
+    a document's search row, its tags and its chunks stay, sealed or not."""
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    now = datetime.now(UTC)
+    facts = SearchLedgerFacts(
+        ledger_id=row.id,
+        state=DocumentState.sealed if state == "sealed" else DocumentState.filed,
+        ingested_at=now, region="ma-cas", now=now,
+    )  # fmt: skip
+    await refresh_search_doc(index_conn, facts, "Facture SAMPLE Télécom")
+    await set_tags(index_conn, row.id, [TAG.casefold()], by=uuid.uuid4(), now=now)
+    chunks = [("Facture SAMPLE", [1.0] + [0.0] * (EMBEDDING_DIM - 1))]
+    assert await index.replace_chunks(index_conn, row.id, "bge-m3", chunks, source_sha256="a" * 64)
+    before = await _snapshot(db, index_conn, memory_store, row)
+    rows_before = await _search_rows(index_conn, row.id)
+    assert rows_before[0] is not None and rows_before[1:] == ([TAG.casefold()], ["Facture SAMPLE"])
+    with pytest.raises(DBAPIError, match="retention.locked"):
+        await index_conn.execute(text(SEARCH_SQL[statement]), {"id": row.id})
+    assert await _search_rows(index_conn, row.id) == rows_before
     assert await _snapshot(db, index_conn, memory_store, row) == before
 
 
