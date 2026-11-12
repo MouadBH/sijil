@@ -7,12 +7,18 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
 1. reads the text Paperless extracted (never the PDF's own text layer, ruling P4), normalises
    it and keeps the first 12,000 characters; empty text is flagged `no_text`;
 2. asks Ollama twice (run A: PROMPT_A, seed 1; run B: PROMPT_B, seed 2) for the fields, as a
-   JSON object constrained by `extraction_schema()`;
+   JSON object constrained by `extraction_schema()`. Each 15-digit token of the text that is
+   the ICE of a workspace supplier record (`sijil_core.suppliers`, REC-5) adds a line
+   `Known supplier in this workspace: <name> (ICE <ice>)` to both prompts (`hint_lines`: at
+   most MAX_HINTS, each name stripped of control characters and cut at HINT_NAME_CHARS, since
+   a reviewer or a document wrote it);
 3. parses each run's values into canonical strings (`sijil_core.fields`), keeping run A's
-   value, or run B's where run A has none;
+   value, or run B's where run A has none. A kept ICE with a supplier record takes the
+   record's name (source `supplier_record`);
 4. records per-field signals (`sijil_core.confidence.compute_signals`: the runs agreeing,
    Paperless's own regex match for the type, the value in the text, the supplier already
-   known for the ICE, the date, VAT and totals checks) and the scores they give;
+   known for the ICE (its record, else the last sealed name), the date, VAT and totals checks)
+   and the scores they give;
 5. writes both runs (`extraction_run`) and the result (`document_fields`) to the workspace's
    index database in one transaction, then audits `document.extracted` (field values never
    enter the audit log, ruling P5);
@@ -43,7 +49,9 @@ run routes the stored row.
 """
 
 import logging
-from collections.abc import Callable, Mapping
+import re
+import unicodedata
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Final, Literal, Protocol
@@ -53,7 +61,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
-from sijil_core import audit
+from sijil_core import audit, suppliers
 from sijil_core import index as index_db
 from sijil_core.confidence import (
     Decision,
@@ -91,7 +99,8 @@ from sijil_core.retention import (
     retention_basis,
 )
 from sijil_core.storage import ObjectRef
-from sijil_core.text import normalise
+from sijil_core.suppliers import Supplier
+from sijil_core.text import normalise, search_normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
 from sijil_worker.pending import PendingExtractions
 from sijil_worker.search import index_document
@@ -109,6 +118,10 @@ BAD_OUTPUT: Final = "extraction.ai_bad_output"
 POSSIBLE_DUPLICATE: Final = "possible_duplicate"
 RETENTION_EXTEND_FAILED: Final = "retention.extend_failed"
 _RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
+SUPPLIER_RECORD: Final = "supplier_record"  # the source of a name taken from the record
+MAX_HINTS: Final = 5
+HINT_NAME_CHARS: Final = 120
+_ICE_TOKEN: Final = re.compile(r"(?<![0-9])[0-9]{15}(?![0-9])")
 REQUEUE_AFTER: Final = timedelta(minutes=15)
 REQUEUE_BATCH: Final = 50  # sends per sweep run
 REQUEUE_SCAN: Final = 500  # rows looked at per sweep run (in-flight ones are skipped)
@@ -216,6 +229,50 @@ Keys:
 
 def _user_message(content: str) -> str:
     return f"Document text:\n<<<\n{content}\n>>>"
+
+
+def ice_tokens(content: str) -> list[str]:
+    """The distinct 15-digit tokens of the text (Arabic-Indic digits folded), in order."""
+    return list(dict.fromkeys(_ICE_TOKEN.findall(search_normalise(content))))
+
+
+def _hint_name(name: str) -> str:
+    """Untrusted text inside the prompt: line and paragraph breaks become spaces, every other
+    control or format character (bidi overrides, escapes) goes, spaces collapse, and the name is
+    cut at HINT_NAME_CHARS."""
+    kept = []
+    for c in name:
+        category = unicodedata.category(c)
+        if c.isspace() or category in ("Zl", "Zp"):
+            kept.append(" ")
+        elif category[0] != "C":
+            kept.append(c)
+    return " ".join("".join(kept).split())[:HINT_NAME_CHARS].rstrip()
+
+
+def hint_lines(known: Sequence[Supplier]) -> list[str]:
+    """One line per supplier record (in the given order), at most MAX_HINTS; a name with
+    nothing left once sanitised gives none."""
+    lines = []
+    for supplier in known:
+        name = _hint_name(supplier.name)
+        if name:
+            lines.append(f"Known supplier in this workspace: {name} (ICE {supplier.ice})")
+    return lines[:MAX_HINTS]
+
+
+def _with_hints(prompt: str, hints: Sequence[str]) -> str:
+    return prompt + "\n" + "".join(f"{line}\n" for line in hints) if hints else prompt
+
+
+async def _known_in_text(index: IndexEngines, workspace: Workspace, content: str) -> list[Supplier]:
+    """The supplier records whose ICE the text carries, in the order the text gives them."""
+    ices = ice_tokens(content)
+    if not ices:
+        return []
+    async with (await index.engine(workspace)).connect() as conn:
+        found = {s.ice: s for s in await suppliers.find(conn, ices)}
+    return [found[ice] for ice in ices if ice in found]
 
 
 @dataclass(frozen=True)
@@ -460,7 +517,8 @@ async def _compute(
 ) -> tuple[FieldsRow, list[tuple[RunName, _Run]], str]:
     """Reads the content and runs the model twice; returns the row, the runs to record and the
     whole normalised text (for search; the model gets its first MAX_CONTENT_CHARS).
-    Writes nothing (the index is only read, for the known supplier): see `_write_once`."""
+    Writes nothing (the index is only read, for the hints and the known supplier): see
+    `_write_once`."""
     if job.doc_id is None or job.paperless_url is None:
         raise ValueError("no Paperless document to extract")
     async with paperless(job.paperless_url, token=job.token) as client:
@@ -471,8 +529,10 @@ async def _compute(
         if content.strip():
             # Paperless first: a failure there is retried before any model time is spent.
             paperless_type = await _paperless_type(client, job.doc_id)
-            runs.append(("a", await _ask(ollama, model, PROMPT_A, content, SEED_A)))
-            runs.append(("b", await _ask(ollama, model, PROMPT_B, content, SEED_B)))
+            hints = hint_lines(await _known_in_text(index, job.workspace, content))
+            prompt_a, prompt_b = _with_hints(PROMPT_A, hints), _with_hints(PROMPT_B, hints)
+            runs.append(("a", await _ask(ollama, model, prompt_a, content, SEED_A)))
+            runs.append(("b", await _ask(ollama, model, prompt_b, content, SEED_B)))
 
     values_a = runs[0][1].values if runs else None
     values_b = runs[1][1].values if runs else None
@@ -482,9 +542,18 @@ async def _compute(
         flags = (NO_TEXT,)
     elif values_a is None and values_b is None:
         flags = (EXTRACTION_FAILED, BAD_OUTPUT)
-    async with (await index.engine(job.workspace)).connect() as conn:
-        ice = values["supplier_ice"]
-        known = None if ice is None else await index_db.known_supplier(conn, ice)
+    known: str | None = None
+    record: Supplier | None = None
+    ice = values["supplier_ice"]
+    if ice is not None:
+        async with (await index.engine(job.workspace)).connect() as conn:
+            record = await suppliers.get(conn, ice)
+            if record is None:
+                known = await index_db.known_supplier(conn, ice)
+    source = dict.fromkeys(FIELD_NAMES, "extraction")
+    if record is not None:
+        values["supplier_name"] = record.name
+        source["supplier_name"] = SUPPLIER_RECORD
     signals = compute_signals(
         values_a,
         values_b,
@@ -492,6 +561,7 @@ async def _compute(
         paperless_type=paperless_type,
         known_supplier=known,
         today=region_local_date(now, job.region),
+        supplier_record=None if record is None else record.name,
     )
     row = FieldsRow(
         ledger_id=job.ledger_id,
@@ -500,7 +570,7 @@ async def _compute(
         confidence=scores(signals),
         signals=signals,
         flags=flags,
-        source=dict.fromkeys(FIELD_NAMES, "extraction"),
+        source=source,
         model=model,
         extracted_at=now,
         updated_at=now,

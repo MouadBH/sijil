@@ -146,12 +146,19 @@ def compute_signals(
     paperless_type: str | None,
     known_supplier: str | None,
     today: date,
+    supplier_record: str | None = None,
 ) -> dict[str, dict[str, bool | None]]:
     """Every field's signals, from the two runs' canonical values (None for a run that gave
     nothing usable), the normalised content, Paperless's suggested type, the supplier name
-    already sealed for the kept ICE, and the region-local date."""
+    already sealed for the kept ICE, and the region-local date.
+
+    `supplier_record` is the name of the workspace's supplier record for the kept ICE
+    (`sijil_core.suppliers`, REC-5): it replaces the kept name, and it is the known supplier.
+    `runs_agree` stays about what the runs said."""
     a, b = values_a or {}, values_b or {}
     value = kept(values_a, values_b)
+    if supplier_record is not None:
+        value["supplier_name"] = known_supplier = supplier_record
     folded = _fold(content)
     signals: dict[str, Signals] = {}
     for name in FIELD_NAMES:

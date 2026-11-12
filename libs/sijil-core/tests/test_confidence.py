@@ -281,6 +281,25 @@ def test_supplier_known_and_paperless_agrees() -> None:
     assert other["document_type"]["paperless_agrees"] is False
 
 
+def test_a_supplier_record_names_the_supplier_and_is_known() -> None:
+    """The workspace's record for the kept ICE (REC-5) is the kept name: it is known, and its
+    own presence in the text is checked. Whether the runs agreed is still about the runs."""
+    record = SUPPLIERS[MANIFEST["sample-01-fr.pdf"]["supplier_ice"]]["name"]
+    a = _values("sample-01-fr.pdf", supplier_name="Atlas Groupe SAMPLE")
+    b = _values("sample-01-fr.pdf", supplier_name="ATLAS TLC SAMPLE")
+    signals = compute_signals(
+        a, b, _content(_values("sample-01-fr.pdf")), paperless_type=None,
+        known_supplier="Autre Société SA", supplier_record=record, today=TODAY,
+    )  # fmt: skip
+    assert signals["supplier_name"] == {
+        "runs_agree": False,
+        "present": True,
+        "in_text": True,
+        "supplier_known": True,
+    }
+    assert signals["supplier_ice"]["supplier_known"] is True
+
+
 def test_runs_agree_and_kept_values() -> None:
     a = _values("sample-01-fr.pdf", number=None)
     b = _values("sample-01-fr.pdf", total_ttc="1050.00")
