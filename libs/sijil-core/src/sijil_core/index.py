@@ -14,6 +14,8 @@ document's chunks and their embeddings (v5, `doc_chunk`) are replaced as a whole
 `replace_chunks` (gate `sijil.reembed`) and deleted by the purge; never updated. Embeddings,
 like every value here, stay in this database. Ask's questions and answers (v6, `ask_query`)
 are not document data: they expire, and the purge deletes those quoting the purged document.
+Supplier records (v7, `supplier`, `sijil_core.suppliers`) are the workspace's knowledge, learnt
+from reviewers, not one document's data: the purge leaves them.
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -45,7 +47,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 6
+SCHEMA_VERSION: Final = 7
 # bge-m3's dimensions (SIJIL_EMBEDDING_MODEL): `doc_chunk.embedding` is vector(1024).
 EMBEDDING_DIM: Final = 1024
 MAX_ENGINES: Final = 32
@@ -421,6 +423,23 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         PERFORM set_config('sijil.purge', '', true);
         PERFORM set_config('sijil.purge_sealed', '', true);
     END $$""",
+    ),
+    # v7: the workspace's supplier records (`sijil_core.suppliers`), one per ICE, learnt when a
+    # reviewer confirms or corrects a supplier. Workspace knowledge, not a document's data:
+    # `purge_document` leaves them (the name came from a reviewer, and other documents share
+    # it). The trigram index is on the normalised name, as Ask's resolver compares it.
+    7: (
+        """CREATE TABLE supplier (
+        ice text PRIMARY KEY CHECK (ice ~ '^[0-9]{15}$'),
+        name text NOT NULL CHECK (char_length(name) > 0),
+        aliases text[] NOT NULL DEFAULT '{}' CHECK (cardinality(aliases) <= 10),
+        source text NOT NULL CHECK (source IN ('review', 'seal', 'correction')),
+        paperless_correspondent_id int,
+        updated_at timestamptz NOT NULL,
+        updated_by uuid
+    )""",
+        "CREATE INDEX supplier_name_trgm ON supplier "
+        "USING gin (search_normalise(name) gin_trgm_ops)",
     ),
 }
 
