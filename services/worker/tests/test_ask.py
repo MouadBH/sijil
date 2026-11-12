@@ -642,6 +642,36 @@ async def test_supplier_resolved_by_an_alias_of_its_record(
     assert [f["value"] for f in record.figures] == [str(_manifest_sum("tva", atlas, 2026))]
 
 
+async def test_a_near_namesake_record_never_beats_the_named_supplier(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    """ "Atlas Télécom Maroc" is not "Atlas Télécom Services" (trigram 0.48): a record for the
+    latter never answers for the former, whose own (not yet learnt) documents are live."""
+    await _samples(engine)
+    atlas = MANIFEST[0]["supplier_ice"]
+    maroc = "003355779000046"  # SAMPLE: Atlas Télécom Maroc (fictitious)
+    async with engine.begin() as conn:
+        await suppliers.learn(
+            conn, ice=atlas, name="Atlas Télécom Services", source="seal", actor=None, now=NOW
+        )
+    values = _atlas(
+        supplier_name="Atlas Télécom Maroc", supplier_ice=maroc, number="F-MA-1", vat="77.00",
+        total_ht="385.00", total_ttc="462.00",
+    )  # fmt: skip
+    await _document(engine, values, "SAMPLE Atlas Télécom Maroc facture F-MA-1")
+    ask_id = await _ask(engine, "TVA payée à Atlas Télécom Maroc en 2026 ?")
+    intent = VAT_ATLAS_2026 | {"supplier": "Atlas Télécom Maroc"}
+    record = await _answer(ask_id, ready, sessions, engines, FakeOllama(intent, says("x")))
+    assert [f["value"] for f in record.figures] == ["77.00"]
+
+    # The record still wins its own name, and a tie.
+    ask_id = await _ask(engine, "TVA payée à Atlas Télécom Services en 2026 ?")
+    intent = VAT_ATLAS_2026 | {"supplier": "Atlas Télécom Services"}
+    record = await _answer(ask_id, ready, sessions, engines, FakeOllama(intent, says("x")))
+    assert [f["value"] for f in record.figures] == [str(_manifest_sum("tva", atlas, 2026))]
+
+
 async def test_a_record_without_live_documents_is_no_match(
     ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
     engine: AsyncEngine,

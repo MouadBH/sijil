@@ -7,13 +7,13 @@ a question still `queued` or `answering` (`ask_store.claim_ask`); anything else 
 1. asks the model for the question's intent (`ask_intent`): one `chat_json` call with the
    question, its locale and today's region-local date; the output, whatever it is, goes
    through `validate_intent` (malformed output is a bare lookup, never a sum);
-2. resolves the supplier the intent names: first against the workspace's supplier records
-   (`sijil_core.suppliers`, REC-5), by a 15-digit ICE exactly, else the best normalised name
-   or alias at trigram similarity >= 0.4, kept only when a live document has that ICE; else
-   against the live `search_doc` rows: an ICE exactly, else the best `supplier_norm` at
-   trigram similarity >= 0.4 (both sides `search_normalise`d), taken by its ICE when it has
-   one (so the French and the Arabic name of one supplier are one supplier). None found: the
-   answer is `ask.answer.no_match`;
+2. resolves the supplier the intent names: a 15-digit ICE that a live document carries;
+   else the best match, both sides `search_normalise`d, at trigram similarity >= 0.4, among
+   the workspace's supplier records (`sijil_core.suppliers`, REC-5: name or alias, with a
+   live document of its ICE) and the live `search_doc` names (taken by their ICE when they
+   have one, so the French and the Arabic name of one supplier are one supplier). An exact
+   name or alias wins outright, then the higher similarity; a tie goes to the record. None
+   found: the answer is `ask.answer.no_match`;
 3. for a sum or a count, computes the figures in one aggregate over the `filed` and `sealed`
    rows matching the intent's supplier, document type and period (on `basis_date`, as
    exports): `sum(<measure>)` as numeric per currency (amounts in different currencies are
@@ -436,54 +436,41 @@ async def _facts(engine: AsyncEngine, intent: Intent, vector: list[float] | None
             )
 
 
-async def _recorded_supplier(conn: AsyncConnection, folded: str, ice: str | None) -> str | None:
-    """The ICE of the supplier record `folded` names (its ICE, else its most trigram-similar
-    normalised name or alias, >= SUPPLIER_SIMILARITY), when a live document has that ICE."""
-    live = f"EXISTS (SELECT 1 FROM search_doc d WHERE d.supplier_ice = s.ice AND d.{_LIVE})"  # noqa: S608
-    if ice is not None:
-        found = await conn.scalar(
-            text(f"SELECT s.ice FROM supplier s WHERE s.ice = :ice AND {live}"),  # noqa: S608
-            {"ice": ice},
+async def _recorded_supplier(
+    conn: AsyncConnection, folded: str
+) -> tuple[bool, float, _Supplier] | None:
+    """The supplier record `folded` names best (its normalised name or an alias, at trigram
+    similarity >= SUPPLIER_SIMILARITY), with a live document of its ICE: (exact, score, it)."""
+    best = (
+        await conn.execute(
+            text(
+                f"""
+                SELECT s.ice, m.score, m.exact FROM supplier s
+                CROSS JOIN LATERAL (
+                    SELECT max(similarity(search_normalise(n), :name)) AS score,
+                        bool_or(search_normalise(n) = :name) AS exact
+                    FROM unnest(array_prepend(s.name, s.aliases)) AS n
+                ) m
+                WHERE m.score >= :t AND EXISTS (
+                    SELECT 1 FROM search_doc d WHERE d.supplier_ice = s.ice AND d.{_LIVE}
+                )
+                ORDER BY m.exact DESC, m.score DESC, s.ice
+                LIMIT 1
+                """  # noqa: S608
+            ),
+            {"name": folded, "t": SUPPLIER_SIMILARITY},
         )
-        return str(found) if found is not None else None
-    best = await conn.scalar(
-        text(
-            f"""
-            SELECT s.ice FROM supplier s
-            CROSS JOIN LATERAL (
-                SELECT max(similarity(search_normalise(n), :name)) AS score
-                FROM unnest(array_prepend(s.name, s.aliases)) AS n
-            ) m
-            WHERE m.score >= :t AND {live}
-            ORDER BY m.score DESC, s.ice
-            LIMIT 1
-            """  # noqa: S608
-        ),
-        {"name": folded, "t": SUPPLIER_SIMILARITY},
-    )
-    return str(best) if best is not None else None
-
-
-async def resolve_supplier(conn: AsyncConnection, name: str) -> _Supplier | None:
-    """The live supplier `name` means: a supplier record's (`_recorded_supplier`), else, among
-    the live documents, a 15-digit ICE exactly, else the most trigram-similar `supplier_norm`
-    (>= SUPPLIER_SIMILARITY), by its ICE when it has one. None: no such supplier among the
-    live documents."""
-    folded = search_normalise(name).strip()
-    digits = re.sub(r"[\s.-]", "", folded)
-    is_ice = re.fullmatch(r"[0-9]{15}", digits) is not None
-    if folded:
-        recorded = await _recorded_supplier(conn, folded, digits if is_ice else None)
-        if recorded is not None:
-            return _Supplier(ice=recorded, norm="")
-    if is_ice:
-        found = await conn.scalar(
-            text(f"SELECT 1 FROM search_doc WHERE supplier_ice = :ice AND {_LIVE} LIMIT 1"),  # noqa: S608
-            {"ice": digits},
-        )
-        return None if found is None else _Supplier(ice=digits, norm="")
-    if not folded:
+    ).first()
+    if best is None:
         return None
+    return bool(best.exact), float(best.score), _Supplier(ice=best.ice, norm="")
+
+
+async def _live_supplier(
+    conn: AsyncConnection, folded: str
+) -> tuple[bool, float, _Supplier] | None:
+    """The live search row's supplier `folded` names best (`supplier_norm`, at trigram
+    similarity >= SUPPLIER_SIMILARITY), by its ICE when it has one: (exact, score, it)."""
     # `%` uses the trigram index at this threshold, for this transaction only.
     await conn.execute(
         text("SELECT set_config('pg_trgm.similarity_threshold', :t, true)"),
@@ -493,11 +480,12 @@ async def resolve_supplier(conn: AsyncConnection, name: str) -> _Supplier | None
         await conn.execute(
             text(
                 f"""
-                SELECT supplier_ice, supplier_norm FROM search_doc
+                SELECT supplier_ice, supplier_norm, similarity(supplier_norm, :name) AS score
+                FROM search_doc
                 WHERE {_LIVE} AND supplier_norm <> '' AND supplier_norm % :name
                   AND similarity(supplier_norm, :name) >= :t
-                ORDER BY similarity(supplier_norm, :name) DESC, supplier_ice IS NULL,
-                    supplier_norm, supplier_ice
+                ORDER BY supplier_norm = :name DESC, similarity(supplier_norm, :name) DESC,
+                    supplier_ice IS NULL, supplier_norm, supplier_ice
                 LIMIT 1
                 """  # noqa: S608
             ),
@@ -506,7 +494,32 @@ async def resolve_supplier(conn: AsyncConnection, name: str) -> _Supplier | None
     ).first()
     if best is None:
         return None
-    return _Supplier(ice=best.supplier_ice or None, norm=best.supplier_norm)
+    found = _Supplier(ice=best.supplier_ice or None, norm=best.supplier_norm)
+    return best.supplier_norm == folded, float(best.score), found
+
+
+async def resolve_supplier(conn: AsyncConnection, name: str) -> _Supplier | None:
+    """The live supplier `name` means: a 15-digit ICE a live document carries; else the best
+    of the supplier records (name or alias, `_recorded_supplier`) and the live search rows
+    (`_live_supplier`): an exact normalised name wins outright, then the higher trigram
+    similarity, and a tie goes to the record. None: no such supplier among the live
+    documents."""
+    folded = search_normalise(name).strip()
+    digits = re.sub(r"[\s.-]", "", folded)
+    if re.fullmatch(r"[0-9]{15}", digits):
+        found = await conn.scalar(
+            text(f"SELECT 1 FROM search_doc WHERE supplier_ice = :ice AND {_LIVE} LIMIT 1"),  # noqa: S608
+            {"ice": digits},
+        )
+        return None if found is None else _Supplier(ice=digits, norm="")
+    if not folded:
+        return None
+    recorded = await _recorded_supplier(conn, folded)
+    live = await _live_supplier(conn, folded)
+    if recorded is None or live is None:
+        best = recorded or live
+        return None if best is None else best[2]
+    return recorded[2] if recorded[:2] >= live[:2] else live[2]
 
 
 def _where(intent: Intent, supplier: _Supplier | None) -> tuple[str, dict[str, Any]]:
