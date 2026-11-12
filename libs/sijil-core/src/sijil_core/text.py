@@ -31,3 +31,22 @@ def search_normalise(s: str) -> str:
     s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
     s = _ARABIC_MARKS.sub("", s)
     return s.translate(_SEARCH_MAP)
+
+
+def _trigrams(s: str) -> set[str]:
+    words = "".join(c if c.isalnum() else " " for c in s.lower()).split()
+    found: set[str] = set()
+    for word in words:
+        padded = f"  {word} "
+        found.update(padded[i : i + 3] for i in range(len(padded) - 2))
+    return found
+
+
+def trigram_similarity(a: str, b: str) -> float:
+    """pg_trgm's `similarity(a, b)`: each word (letters and digits, lower-cased) padded with
+    two spaces before and one after, and the Jaccard index of the two trigram sets; 0 when
+    either has none. Callers fold both sides first (`search_normalise`)."""
+    ta, tb = _trigrams(a), _trigrams(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)

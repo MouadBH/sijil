@@ -9,12 +9,14 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
 2. asks Ollama twice (run A: PROMPT_A, seed 1; run B: PROMPT_B, seed 2) for the fields, as a
    JSON object constrained by `extraction_schema()`. Each 15-digit token of the text that is
    the ICE of a workspace supplier record (`sijil_core.suppliers`, REC-5) adds a line
-   `Known supplier in this workspace: <name> (ICE <ice>)` to both prompts (`hint_lines`: at
+   `Known company in this workspace: <name> (ICE <ice>)` to both prompts (`hint_lines`: at
    most MAX_HINTS, each name stripped of control characters and cut at HINT_NAME_CHARS, since
-   a reviewer or a document wrote it);
+   a reviewer or a document wrote it). A company, not a supplier: the ICE may be the client's;
 3. parses each run's values into canonical strings (`sijil_core.fields`), keeping run A's
    value, or run B's where run A has none. A kept ICE with a supplier record takes the
-   record's name (source `supplier_record`);
+   record's name (source `supplier_record`); unless a run's own name matches the record's
+   name or an alias (`confidence.names_match`), the row is flagged `supplier_mismatch` (to
+   review: the ICE may be another company's, such as the client's);
 4. records per-field signals (`sijil_core.confidence.compute_signals`: the runs agreeing,
    Paperless's own regex match for the type, the value in the text, the supplier already
    known for the ICE (its record, else the last sealed name), the date, VAT and totals checks)
@@ -64,6 +66,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionm
 from sijil_core import audit, suppliers
 from sijil_core import index as index_db
 from sijil_core.confidence import (
+    SUPPLIER_MISMATCH,
     Decision,
     compute_signals,
     kept,
@@ -257,7 +260,7 @@ def hint_lines(known: Sequence[Supplier]) -> list[str]:
     for supplier in known:
         name = _hint_name(supplier.name)
         if name:
-            lines.append(f"Known supplier in this workspace: {name} (ICE {supplier.ice})")
+            lines.append(f"Known company in this workspace: {name} (ICE {supplier.ice})")
     return lines[:MAX_HINTS]
 
 
@@ -561,8 +564,10 @@ async def _compute(
         paperless_type=paperless_type,
         known_supplier=known,
         today=region_local_date(now, job.region),
-        supplier_record=None if record is None else record.name,
+        supplier_record=None if record is None else (record.name, *record.aliases),
     )
+    if record is not None and signals["supplier_name"]["supplier_known"] is False:
+        flags = (*flags, SUPPLIER_MISMATCH)
     row = FieldsRow(
         ledger_id=job.ledger_id,
         document_type=values["document_type"],

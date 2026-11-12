@@ -4,6 +4,7 @@ import json
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -103,6 +104,7 @@ def test_weights_table_is_the_design_one() -> None:
         "ingest.unsupported_format",
         "extraction_failed",
         "retention.extend_failed",
+        "supplier_mismatch",
     }
 
 
@@ -281,23 +283,55 @@ def test_supplier_known_and_paperless_agrees() -> None:
     assert other["document_type"]["paperless_agrees"] is False
 
 
-def test_a_supplier_record_names_the_supplier_and_is_known() -> None:
-    """The workspace's record for the kept ICE (REC-5) is the kept name: it is known, and its
-    own presence in the text is checked. Whether the runs agreed is still about the runs."""
-    record = SUPPLIERS[MANIFEST["sample-01-fr.pdf"]["supplier_ice"]]["name"]
-    a = _values("sample-01-fr.pdf", supplier_name="Atlas Groupe SAMPLE")
-    b = _values("sample-01-fr.pdf", supplier_name="ATLAS TLC SAMPLE")
-    signals = compute_signals(
+RECORD = SUPPLIERS[MANIFEST["sample-01-fr.pdf"]["supplier_ice"]]["name"]
+
+
+def _record_signals(name_a: str | None, name_b: str | None, *aliases: str) -> dict[str, Any]:
+    a = _values("sample-01-fr.pdf", supplier_name=name_a)
+    b = _values("sample-01-fr.pdf", supplier_name=name_b)
+    return compute_signals(
         a, b, _content(_values("sample-01-fr.pdf")), paperless_type=None,
-        known_supplier="Autre Société SA", supplier_record=record, today=TODAY,
+        known_supplier="Autre Société SA", supplier_record=(RECORD, *aliases), today=TODAY,
     )  # fmt: skip
+
+
+def test_a_supplier_record_is_known_when_the_runs_name_it() -> None:
+    """The workspace's record for the kept ICE (REC-5) is the kept name. It is known when a
+    run's own name matches it (folded, trigram >= 0.6); the runs agree when both do."""
+    signals = _record_signals("ATLAS TÉLÉCOM SERVICES", "Atlas Telecom Services")
     assert signals["supplier_name"] == {
-        "runs_agree": False,
+        "runs_agree": True,
         "present": True,
         "in_text": True,
         "supplier_known": True,
     }
     assert signals["supplier_ice"]["supplier_known"] is True
+    assert score("supplier_name", signals["supplier_name"]) == 1.0
+    one = _record_signals("ATLAS TÉLÉCOM SERVICES", "ATLAS TLC SAMPLE")
+    assert (one["supplier_name"]["supplier_known"], one["supplier_name"]["runs_agree"]) == (
+        True,
+        False,
+    )
+
+
+def test_a_run_name_matching_an_alias_is_known() -> None:
+    signals = _record_signals("ATS Maroc SAMPLE", "ATS MAROC SAMPLE", "ATS Maroc SAMPLE")
+    assert signals["supplier_name"]["supplier_known"] is True
+    assert signals["supplier_name"]["runs_agree"] is True
+
+
+def test_a_record_the_runs_do_not_name_is_a_mismatch() -> None:
+    """Both runs read another company's name next to this ICE (a client's ICE, say): not
+    known, the runs do not agree on a matching name, and the score stays under the cap."""
+    signals = _record_signals("Papeterie Al Manar SARL", "Papeterie Al Manar SARL")
+    assert signals["supplier_name"]["supplier_known"] is False
+    assert signals["supplier_name"]["runs_agree"] is False
+    assert signals["supplier_ice"]["supplier_known"] is False
+    assert score("supplier_name", signals["supplier_name"]) <= confidence.MISMATCH_CAP
+    capped = {"runs_agree": True, "present": True, "in_text": True, "supplier_known": False}
+    assert confidence.MISMATCH_CAP == 0.85
+    assert score("supplier_name", capped) <= 0.85
+    assert "supplier_mismatch" in BLOCKING_FLAGS
 
 
 def test_runs_agree_and_kept_values() -> None:
