@@ -22,7 +22,6 @@ import hashlib
 import io
 import json
 import os
-import sys
 import time
 import uuid
 import zipfile
@@ -31,11 +30,8 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
-from urllib.parse import parse_qs, urlparse
 
 import httpx
-import pyotp
 import pytest
 from sqlalchemy import select
 
@@ -64,6 +60,10 @@ from sijil_worker.extract import _route
 from sijil_worker.runtime.base import ADMIN_USERNAME
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
+from tests.support.acceptance import Owner
+from tests.support.acceptance import cli as _cli
+from tests.support.acceptance import csrf as _csrf
+from tests.support.acceptance import post as _post
 from tests.support.polling import poll_get
 
 AttachRunner = Callable[[str], AbstractContextManager[None]]
@@ -87,51 +87,6 @@ CORRECTION_REASON = "Avoir reçu du fournisseur après le scellement (SAMPLE)"
 
 def _log(text: str) -> None:
     print(text, flush=True)  # noqa: T201 - the acceptance log (-s runs)
-
-
-def _csrf(http: httpx.AsyncClient) -> dict[str, str]:
-    return {"X-CSRF-Token": http.cookies["sijil_csrf"]}
-
-
-async def _post(http: httpx.AsyncClient, path: str, body: Any) -> httpx.Response:
-    return await http.post(path, json=body, headers=_csrf(http))
-
-
-class Owner:
-    """The signed-up Owner, with TOTP: each step-up spends a time step never used before."""
-
-    def __init__(self, http: httpx.AsyncClient) -> None:
-        self.http = http
-        self.totp: pyotp.TOTP | None = None
-        self.last_step = 0
-
-    async def sign_up(self, email: str) -> None:
-        (await self.http.get("/v1/auth/csrf")).raise_for_status()
-        body = {"email": email, "password": PASSWORD, "name": "SAMPLE M4 Owner"}
-        r = await _post(self.http, "/v1/auth/signup", body)
-        assert r.status_code == 201, r.text
-        r = await _post(self.http, "/v1/auth/totp/enrol", {"password": PASSWORD})
-        assert r.status_code == 200, r.text
-        self.totp = pyotp.TOTP(parse_qs(urlparse(r.json()["otpauth_uri"]).query)["secret"][0])
-        # As in M1: well inside a step, confirm with the previous step and verify with this one.
-        left = self.totp.interval - time.time() % self.totp.interval
-        if left < 10:
-            await asyncio.sleep(left + 0.5)
-        now = time.time()
-        r = await _post(self.http, "/v1/auth/totp/confirm", {"code": self.totp.at(now - 30)})
-        assert r.status_code == 200, r.text
-        r = await _post(self.http, "/v1/auth/totp/verify", {"code": self.totp.at(now)})
-        assert r.status_code == 200, r.text
-        self.last_step = int(now // 30)
-
-    async def step_up(self) -> None:
-        assert self.totp is not None
-        # A code is accepted once per step: wait for the next step if this one is spent.
-        await asyncio.sleep(max(0.0, (self.last_step + 1) * 30 - time.time() + 0.5))
-        now = time.time()
-        r = await _post(self.http, "/v1/auth/totp/verify", {"code": self.totp.at(now)})
-        assert r.status_code == 200, r.text
-        self.last_step = int(now // 30)
 
 
 async def _signed_in(email: str) -> httpx.AsyncClient:
@@ -171,17 +126,6 @@ def _fields(name: str, ledger_id: uuid.UUID, today: str, now: datetime) -> Field
     )
 
 
-async def _cli(*args: str) -> tuple[int, str]:
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "sijil_cp.cli", *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        # The runner carries the worker's environment; the CLI also wants the API's one flag.
-        env=os.environ | {"SIJIL_COOKIE_SECURE": "false"},
-    )  # fmt: skip
-    out, _ = await proc.communicate()
-    return proc.returncode or 0, out.decode()
-
-
 def _tampered(source: Path, target: Path, entry: str) -> None:
     """A copy of the ZIP with one byte of `entry` flipped."""
     with zipfile.ZipFile(source) as zin, zipfile.ZipFile(target, "w") as zout:
@@ -210,9 +154,9 @@ async def test_m4_acceptance(
     clients: list[httpx.AsyncClient] = []
     try:
         # 1. A fresh workspace, its Owner with TOTP.
-        owner = Owner(httpx.AsyncClient(base_url=CP_URL, timeout=60))
+        owner = Owner(httpx.AsyncClient(base_url=CP_URL, timeout=60), PASSWORD)
         clients.append(owner.http)
-        await owner.sign_up(f"m4-{run}@sijil.local")
+        await owner.sign_up(f"m4-{run}@sijil.local", "SAMPLE M4 Owner")
         http = owner.http
         r = await _post(
             http, "/v1/orgs", {"name": f"SAMPLE M4 Acceptance {run}", "type": "business",
