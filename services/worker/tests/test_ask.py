@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from sijil_core import ask_store, index
+from sijil_core import ask_store, index, suppliers
 from sijil_core.crypto import LocalKeyService, seal
 from sijil_core.db.models import (
     AuditEvent,
@@ -623,6 +623,40 @@ async def test_supplier_resolved_by_ice(
     intent = VAT_ATLAS_2026 | {"supplier": "٠٠١ ٩٠٥ ٨٣٧ ٠٠٠ ٠٤١"}
     record = await _answer(ask_id, ready, sessions, engines, FakeOllama(intent, says("x")))
     assert [f["value"] for f in record.figures] == ["429.80"]
+
+
+async def test_supplier_resolved_by_an_alias_of_its_record(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    """The workspace's supplier records (REC-5): a name a reviewer replaced stays an alias, and
+    a question using it means the record's ICE, though no document carries that name."""
+    await _samples(engine)
+    atlas = MANIFEST[0]["supplier_ice"]
+    async with engine.begin() as conn:
+        for name in ("ATS Maroc SAMPLE", "Atlas Télécom Services SARL"):
+            await suppliers.learn(conn, ice=atlas, name=name, source="seal", actor=None, now=NOW)
+    ask_id = await _ask(engine, "TVA payée à ATS Maroc en 2026 ?")
+    intent = VAT_ATLAS_2026 | {"supplier": "ats maroc"}
+    record = await _answer(ask_id, ready, sessions, engines, FakeOllama(intent, says("x")))
+    assert [f["value"] for f in record.figures] == [str(_manifest_sum("tva", atlas, 2026))]
+
+
+async def test_a_record_without_live_documents_is_no_match(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    await _samples(engine)
+    async with engine.begin() as conn:
+        await suppliers.learn(
+            conn, ice="009999999000001", name="Fournisseur Fantôme SAMPLE", source="seal",
+            actor=None, now=NOW,
+        )  # fmt: skip
+    for supplier in ("Fournisseur Fantome SAMPLE", "009999999000001"):
+        ask_id = await _ask(engine, f"TVA payée à {supplier} en 2026 ?")
+        intent = VAT_ATLAS_2026 | {"supplier": supplier}
+        record = await _answer(ask_id, ready, sessions, engines, FakeOllama(intent))
+        assert (record.answer_text, record.answer_code) == (None, ANSWER_NO_MATCH)
 
 
 async def test_malformed_intent_is_a_lookup_without_figures(

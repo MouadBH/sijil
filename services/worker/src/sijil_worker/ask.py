@@ -7,10 +7,13 @@ a question still `queued` or `answering` (`ask_store.claim_ask`); anything else 
 1. asks the model for the question's intent (`ask_intent`): one `chat_json` call with the
    question, its locale and today's region-local date; the output, whatever it is, goes
    through `validate_intent` (malformed output is a bare lookup, never a sum);
-2. resolves the supplier the intent names against the live `search_doc` rows: a 15-digit ICE
-   exactly, else the best `supplier_norm` at trigram similarity >= 0.4 (both sides
-   `search_normalise`d), taken by its ICE when it has one (so the French and the Arabic name
-   of one supplier are one supplier). None found: the answer is `ask.answer.no_match`;
+2. resolves the supplier the intent names: first against the workspace's supplier records
+   (`sijil_core.suppliers`, REC-5), by a 15-digit ICE exactly, else the best normalised name
+   or alias at trigram similarity >= 0.4, kept only when a live document has that ICE; else
+   against the live `search_doc` rows: an ICE exactly, else the best `supplier_norm` at
+   trigram similarity >= 0.4 (both sides `search_normalise`d), taken by its ICE when it has
+   one (so the French and the Arabic name of one supplier are one supplier). None found: the
+   answer is `ask.answer.no_match`;
 3. for a sum or a count, computes the figures in one aggregate over the `filed` and `sealed`
    rows matching the intent's supplier, document type and period (on `basis_date`, as
    exports): `sum(<measure>)` as numeric per currency (amounts in different currencies are
@@ -433,13 +436,47 @@ async def _facts(engine: AsyncEngine, intent: Intent, vector: list[float] | None
             )
 
 
+async def _recorded_supplier(conn: AsyncConnection, folded: str, ice: str | None) -> str | None:
+    """The ICE of the supplier record `folded` names (its ICE, else its most trigram-similar
+    normalised name or alias, >= SUPPLIER_SIMILARITY), when a live document has that ICE."""
+    live = f"EXISTS (SELECT 1 FROM search_doc d WHERE d.supplier_ice = s.ice AND d.{_LIVE})"  # noqa: S608
+    if ice is not None:
+        found = await conn.scalar(
+            text(f"SELECT s.ice FROM supplier s WHERE s.ice = :ice AND {live}"),  # noqa: S608
+            {"ice": ice},
+        )
+        return str(found) if found is not None else None
+    best = await conn.scalar(
+        text(
+            f"""
+            SELECT s.ice FROM supplier s
+            CROSS JOIN LATERAL (
+                SELECT max(similarity(search_normalise(n), :name)) AS score
+                FROM unnest(array_prepend(s.name, s.aliases)) AS n
+            ) m
+            WHERE m.score >= :t AND {live}
+            ORDER BY m.score DESC, s.ice
+            LIMIT 1
+            """  # noqa: S608
+        ),
+        {"name": folded, "t": SUPPLIER_SIMILARITY},
+    )
+    return str(best) if best is not None else None
+
+
 async def resolve_supplier(conn: AsyncConnection, name: str) -> _Supplier | None:
-    """The live supplier `name` means: a 15-digit ICE exactly, else the most trigram-similar
-    `supplier_norm` (>= SUPPLIER_SIMILARITY), by its ICE when it has one. None: no such
-    supplier among the live documents."""
+    """The live supplier `name` means: a supplier record's (`_recorded_supplier`), else, among
+    the live documents, a 15-digit ICE exactly, else the most trigram-similar `supplier_norm`
+    (>= SUPPLIER_SIMILARITY), by its ICE when it has one. None: no such supplier among the
+    live documents."""
     folded = search_normalise(name).strip()
     digits = re.sub(r"[\s.-]", "", folded)
-    if re.fullmatch(r"[0-9]{15}", digits):
+    is_ice = re.fullmatch(r"[0-9]{15}", digits) is not None
+    if folded:
+        recorded = await _recorded_supplier(conn, folded, digits if is_ice else None)
+        if recorded is not None:
+            return _Supplier(ice=recorded, norm="")
+    if is_ice:
         found = await conn.scalar(
             text(f"SELECT 1 FROM search_doc WHERE supplier_ice = :ice AND {_LIVE} LIMIT 1"),  # noqa: S608
             {"ice": digits},
