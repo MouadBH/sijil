@@ -40,6 +40,7 @@ from sijil_core.db.models import (
 from sijil_core.fields import FIELD_NAMES, fields_digest
 from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
+from sijil_core.search_index import SearchLedgerFacts, upsert_search_doc
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
 from sijil_worker.ingest import WorkspaceNotActive
@@ -552,3 +553,55 @@ async def test_a_correspondent_no_longer_ours_is_never_renamed(
     assert json.loads(create.calls.last.request.content)["name"] == RENAMED
     record = await _record(engines, ready)
     assert record is not None and record.paperless_correspondent_id == 99
+
+
+# Final review I2: the workspace's own ICE is never learnt -------------------------------------
+
+OWN = "002999888000011"  # SAMPLE: the workspace's own company (fictitious)
+OWN_VALUES = VALUES | {"supplier_name": "Entreprise Exemple SAMPLE SARL", "supplier_ice": OWN}
+
+
+async def _printed_on(engines: IndexEngines, ws: Workspace, ice: str, count: int) -> None:
+    """`count` live search rows whose text prints `ice` as the client's (SAMPLE text)."""
+    async with (await engines.engine(ws)).begin() as conn:
+        for n in range(count):
+            facts = SearchLedgerFacts(
+                ledger_id=uuid.uuid4(), state=DocumentState.filed, ingested_at=NOW,
+                region="ma-cas", now=NOW,
+            )  # fmt: skip
+            content = f"Facture SAMPLE F-{n}\nClient : Entreprise Exemple SARL, ICE {ice}\n"
+            await upsert_search_doc(conn, facts, None, [], content)
+
+
+@pytest.mark.db
+async def test_the_workspace_own_ice_is_never_learnt(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User,
+) -> None:  # fmt: skip
+    """A sales invoice sealed with the workspace as its supplier: its ICE is printed on most of
+    the workspace's documents, so it is not a supplier: no record, no correspondent."""
+    row = await _document(db, engines, ready, user, values=OWN_VALUES)
+    await _printed_on(engines, ready, OWN, 5)
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        assert not await _learn(row.id, sessions, keys, engines, workspace_id=ready.id)
+    assert not router.calls
+    async with (await engines.engine(ready)).connect() as conn:
+        assert await suppliers.get(conn, OWN) is None
+    assert await _events(db, ready) == []
+
+
+@pytest.mark.db
+async def test_an_ice_on_a_minority_of_documents_is_learnt(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User,
+) -> None:  # fmt: skip
+    """Below the guard's threshold (printed on 2 of 5 live documents) it is a supplier."""
+    row = await _document(db, engines, ready, user, values=OWN_VALUES)
+    await _printed_on(engines, ready, OWN, 2)
+    await _printed_on(engines, ready, ICE, 3)
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        assert await _learn(row.id, sessions, keys, engines, workspace_id=ready.id)
+    async with (await engines.engine(ready)).connect() as conn:
+        assert await suppliers.get(conn, OWN) is not None

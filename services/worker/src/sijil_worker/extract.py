@@ -11,12 +11,16 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
    the ICE of a workspace supplier record (`sijil_core.suppliers`, REC-5) adds a line
    `Known company in this workspace: <name> (ICE <ice>)` to both prompts (`hint_lines`: at
    most MAX_HINTS, each name stripped of control characters and cut at HINT_NAME_CHARS, since
-   a reviewer or a document wrote it). A company, not a supplier: the ICE may be the client's;
+   a reviewer or a document wrote it). A company, not a supplier: the ICE may be the client's.
+   Never the workspace's own ICE (`suppliers.own_ices`, final review I2): the client of
+   every purchase invoice;
 3. parses each run's values into canonical strings (`sijil_core.fields`), keeping run A's
    value, or run B's where run A has none. A kept ICE with a supplier record takes the
    record's name (source `supplier_record`); unless a run's own name matches the record's
    name or an alias (`confidence.names_match`), the row is flagged `supplier_mismatch` (to
-   review: the ICE may be another company's, such as the client's);
+   review: the ICE may be another company's, such as the client's). A kept ICE that is the
+   workspace's own takes no record or sealed name and is flagged `supplier_own_ice`, which
+   blocks filing as `supplier_mismatch` does;
 4. records per-field signals (`sijil_core.confidence.compute_signals`: the runs agreeing,
    Paperless's own regex match for the type, the value in the text, the supplier already
    known for the ICE (its record, else the last sealed name), the date, VAT and totals checks)
@@ -66,6 +70,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionm
 from sijil_core import audit, suppliers
 from sijil_core import index as index_db
 from sijil_core.confidence import (
+    OWN_ICE,
     SUPPLIER_MISMATCH,
     Decision,
     compute_signals,
@@ -268,14 +273,18 @@ def _with_hints(prompt: str, hints: Sequence[str]) -> str:
     return prompt + "\n" + "".join(f"{line}\n" for line in hints) if hints else prompt
 
 
-async def _known_in_text(index: IndexEngines, workspace: Workspace, content: str) -> list[Supplier]:
-    """The supplier records whose ICE the text carries, in the order the text gives them."""
+async def _known_in_text(
+    index: IndexEngines, workspace: Workspace, content: str
+) -> tuple[list[Supplier], frozenset[str]]:
+    """The supplier records whose ICE the text carries, in the order the text gives them, but
+    the workspace's own; and which of the text's ICEs are its own (`suppliers.own_ices`)."""
     ices = ice_tokens(content)
     if not ices:
-        return []
+        return [], frozenset()
     async with (await index.engine(workspace)).connect() as conn:
+        own = await suppliers.own_ices(conn, ices)
         found = {s.ice: s for s in await suppliers.find(conn, ices)}
-    return [found[ice] for ice in ices if ice in found]
+    return [found[ice] for ice in ices if ice in found and ice not in own], own
 
 
 @dataclass(frozen=True)
@@ -529,10 +538,12 @@ async def _compute(
         content = text_all[:MAX_CONTENT_CHARS]
         runs: list[tuple[RunName, _Run]] = []
         paperless_type: str | None = None
+        own: frozenset[str] = frozenset()  # the workspace's own ICEs, asked once per run
         if content.strip():
             # Paperless first: a failure there is retried before any model time is spent.
             paperless_type = await _paperless_type(client, job.doc_id)
-            hints = hint_lines(await _known_in_text(index, job.workspace, content))
+            printed, own = await _known_in_text(index, job.workspace, content)
+            hints = hint_lines(printed)
             prompt_a, prompt_b = _with_hints(PROMPT_A, hints), _with_hints(PROMPT_B, hints)
             runs.append(("a", await _ask(ollama, model, prompt_a, content, SEED_A)))
             runs.append(("b", await _ask(ollama, model, prompt_b, content, SEED_B)))
@@ -550,9 +561,14 @@ async def _compute(
     ice = values["supplier_ice"]
     if ice is not None:
         async with (await index.engine(job.workspace)).connect() as conn:
-            record = await suppliers.get(conn, ice)
-            if record is None:
-                known = await index_db.known_supplier(conn, ice)
+            if ice not in ice_tokens(content):  # not printed as such: not asked above
+                own = own | await suppliers.own_ices(conn, [ice])
+            if ice in own:
+                flags = (*flags, OWN_ICE)
+            else:
+                record = await suppliers.get(conn, ice)
+                if record is None:
+                    known = await index_db.known_supplier(conn, ice)
     source = dict.fromkeys(FIELD_NAMES, "extraction")
     if record is not None:
         values["supplier_name"] = record.name

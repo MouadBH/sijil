@@ -18,12 +18,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import index, suppliers
-from sijil_core.confidence import SUPPLIER_MISMATCH
+from sijil_core.confidence import OWN_ICE, SUPPLIER_MISMATCH
 from sijil_core.crypto import LocalKeyService
 from sijil_core.db.models import DocumentState, User, Workspace
 from sijil_core.fields import fields_digest
 from sijil_core.index import IndexEngines
 from sijil_core.paperless import PaperlessClient
+from sijil_core.search_index import SearchLedgerFacts, upsert_search_doc
 from sijil_worker.extract import MAX_HINTS, PROMPT_A, PROMPT_B, hint_lines
 from sijil_worker.learning import learn_from_document
 
@@ -368,3 +369,81 @@ async def test_an_unconfirmed_document_adds_no_alias(
     async with (await engines.engine(ready)).connect() as conn:
         record = await suppliers.get(conn, ICE)
     assert record is not None and record.aliases == ()
+
+
+# Final review I2: the workspace's own ICE (printed on at least half of 5+ live documents) ---
+
+OWN = "002999888000011"  # SAMPLE: the workspace's own company (fictitious)
+OWN_NAME = "Entreprise Exemple SARL"
+
+
+async def _printed_on(engines: IndexEngines, ws: Workspace, ice: str, count: int) -> None:
+    """`count` live search rows whose text prints `ice` as the client's (SAMPLE text)."""
+    async with (await engines.engine(ws)).begin() as conn:
+        for n in range(count):
+            facts = SearchLedgerFacts(
+                ledger_id=uuid.uuid4(), state=DocumentState.filed, ingested_at=NOW,
+                region="ma-cas", now=NOW,
+            )  # fmt: skip
+            content = f"Facture SAMPLE F-{n}\nClient : {OWN_NAME}, ICE {ice}\n"
+            await upsert_search_doc(conn, facts, None, [], content)
+
+
+async def _purchase(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ws: Workspace, picked_ice: str,
+) -> tuple[Any, Any, Any]:  # fmt: skip
+    """A purchase invoice printing the client's (the workspace's) ICE; both runs give
+    `picked_ice` with the real supplier's name. Returns the ledger, the row and the Ollama."""
+    content = CONTENT_01 + f"Client : {OWN_NAME}, ICE client : {OWN}\n"
+    ledger = await make_ledger(db, ws)
+    picked = RAW_01 | {"supplier_ice": picked_ice}
+    ollama = FakeOllama({1: picked, 2: picked})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, content=content)
+        await run(ledger, sessions, keys, engines, ollama)
+    return ledger, await fields_of(engines, ws, ledger.id), ollama
+
+
+async def test_the_workspace_own_ice_is_never_hinted(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace,
+) -> None:  # fmt: skip
+    """A record for it exists (learnt before the guard): still no hint, while the real
+    supplier's record is hinted as before."""
+    await _known(engines, ready, OWN, OWN_NAME)
+    await _known(engines, ready, ICE, LEARNT)
+    await _printed_on(engines, ready, OWN, 5)
+    _, row, ollama = await _purchase(db, sessions, keys, engines, ready, ICE)
+    for system in _systems(ollama):
+        assert system.endswith(f"\n{HINT}\n")
+        assert OWN not in system and OWN_NAME not in system
+    assert OWN_ICE not in row.flags
+
+
+async def test_the_workspace_own_ice_as_supplier_goes_to_review(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace,
+) -> None:  # fmt: skip
+    """Both runs read the client as the supplier: the kept ICE is the workspace's own, so the
+    record's name is not taken (it is no supplier) and the row is flagged, never filed."""
+    await _known(engines, ready, OWN, OWN_NAME)
+    await _printed_on(engines, ready, OWN, 5)
+    ledger, row, _ = await _purchase(db, sessions, keys, engines, ready, OWN)
+    assert row.values["supplier_ice"] == OWN
+    assert row.source["supplier_name"] == "extraction"
+    assert OWN_ICE in row.flags
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
+
+
+async def test_below_the_threshold_the_ice_is_a_supplier(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace,
+) -> None:  # fmt: skip
+    """Printed on 4 live documents only: not the workspace's own (the guard needs 5)."""
+    await _known(engines, ready, OWN, OWN_NAME)
+    await _printed_on(engines, ready, OWN, 4)
+    _, row, ollama = await _purchase(db, sessions, keys, engines, ready, OWN)
+    hint = f"Known company in this workspace: {OWN_NAME} (ICE {OWN})"
+    assert all(s.endswith(f"\n{hint}\n") for s in _systems(ollama))
+    assert OWN_ICE not in row.flags
