@@ -64,6 +64,7 @@ from sijil_worker.extract import _route
 from sijil_worker.runtime.base import ADMIN_USERNAME
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
+from tests.support.polling import poll_get
 
 AttachRunner = Callable[[str], AbstractContextManager[None]]
 
@@ -223,7 +224,7 @@ async def test_m4_acceptance(
         created_workspaces.append(workspace_id)
         base = f"/v1/workspaces/{workspace_id}"
         started = time.monotonic()
-        while (state := (await http.get(base)).json()["state"]) != WorkspaceState.active:
+        while (state := (await poll_get(http, base)).json()["state"]) != WorkspaceState.active:
             assert state != WorkspaceState.error
             assert time.monotonic() - started < PROVISION_BUDGET_S, state
             await asyncio.sleep(3)
@@ -399,7 +400,8 @@ async def test_m4_acceptance(
         assert r.status_code == 202, r.text
         export_id = r.json()["id"]
         started = time.monotonic()
-        while (job := (await http.get(f"{base}/exports/{export_id}")).json())["state"] != "ready":
+        job_url = f"{base}/exports/{export_id}"
+        while (job := (await poll_get(http, job_url)).json())["state"] != "ready":
             assert job["state"] in ("queued", "building"), job
             assert time.monotonic() - started < EXPORT_BUDGET_S, job
             await asyncio.sleep(2)

@@ -38,6 +38,7 @@ from sijil_core.index import FieldsRow, IndexEngines, read_fields, write_extract
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_worker.extract import _route
 from sijil_worker.settings import WorkerSettings
+from tests.support.polling import poll_get
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
@@ -109,7 +110,7 @@ def _fields(item: dict[str, Any], ledger_id: uuid.UUID, now: datetime) -> Fields
 async def _answered(http: httpx.AsyncClient, base: str, ask_id: str) -> dict[str, Any]:
     deadline = time.monotonic() + ANSWER_BUDGET_S
     while True:
-        r = await http.get(f"{base}/ask/{ask_id}")
+        r = await poll_get(http, f"{base}/ask/{ask_id}")
         assert r.status_code == 200, r.text
         body: dict[str, Any] = r.json()
         if body["state"] in ("answered", "failed"):
@@ -150,7 +151,7 @@ async def test_vat_question_answered_with_the_computed_figure(
             created_workspaces.append(workspace_id)
             base = f"/v1/workspaces/{workspace_id}"
             started = time.monotonic()
-            while (state := (await http.get(base)).json()["state"]) != "active":
+            while (state := (await poll_get(http, base)).json()["state"]) != "active":
                 assert state != "error"
                 assert time.monotonic() - started < PROVISION_BUDGET_S, state
                 await asyncio.sleep(3)

@@ -31,6 +31,7 @@ from sijil_core.tenancy import tenant_ref
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
 from sijil_worker.taxonomy import MATCH_LITERAL
+from tests.support.polling import poll_get
 
 pytestmark = pytest.mark.integration
 
@@ -70,9 +71,8 @@ async def _fresh_workspace(http: httpx.AsyncClient, created: list[uuid.UUID]) ->
     workspace_id = uuid.UUID(r.json()["workspace"]["id"])
     created.append(workspace_id)
     started = time.monotonic()
-    while (state := (await http.get(f"/v1/workspaces/{workspace_id}")).json()["state"]) != (
-        "active"
-    ):
+    path = f"/v1/workspaces/{workspace_id}"
+    while (state := (await poll_get(http, path)).json()["state"]) != "active":
         assert state != "error"
         assert time.monotonic() - started < PROVISION_BUDGET_S, state
         await asyncio.sleep(3)
