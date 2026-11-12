@@ -301,3 +301,34 @@ async def test_fields_of_a_removed_document_carry_no_corrections(
     r = await member.client.get(_url(ws, gone, "fields"))
     assert r.status_code == 200
     assert "corrections" not in r.json()
+
+
+async def test_a_supplier_correction_enqueues_learning(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Only a note on the supplier's name or ICE, and only once the note is written: the
+    learning reads it as the effective value."""
+    row = await _sealed(member, ws, db, memory_store, index_conn)
+    enqueuer.learns.clear()  # the seal's own
+    body = {"field": "total_ttc", "value": "1200.00", "reason": REASON}
+    r = await member.client.post(_url(ws, row, "corrections"), json=body)
+    assert r.status_code == 201, r.text
+    assert enqueuer.learns == []
+
+    for field, value in (("supplier_name", "Atlas SAMPLE Corrigé"), ("supplier_ice", None)):
+        r = await member.client.post(
+            _url(ws, row, "corrections"), json=body | {"field": field, "value": value}
+        )
+        assert r.status_code == 201, r.text
+    assert enqueuer.learns == [(row.id, ws.id)] * 2
+
+    async def boom(*_a: Any, **_k: Any) -> None:
+        raise OSError("index down")
+
+    monkeypatch.setattr(index, "add_correction", boom)
+    r = await member.client.post(
+        _url(ws, row, "corrections"), json=body | {"field": "supplier_name", "value": "Autre"}
+    )
+    assert (r.status_code, _code(r)) == (503, "field.update_failed")
+    assert enqueuer.learns == [(row.id, ws.id)] * 2

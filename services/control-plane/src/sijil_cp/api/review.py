@@ -15,8 +15,9 @@ completes exactly once when it is called again:
    final`, the later of its retention and the fiscal year of `retention_basis`, never lowered:
    ruling P1) and `document.sealed` audited, in one transaction;
 4. after the commit, `sijil.lock_sealed` to the seal worker (queue `seal`), which switches the
-   original to COMPLIANCE at the committed `retention_until`, `sijil.mirror_fields` and
-   `sijil.embed_document` (the extraction worker, queue `embedding`).
+   original to COMPLIANCE at the committed `retention_until`, `sijil.mirror_fields`,
+   `sijil.embed_document` (the extraction worker, queue `embedding`) and
+   `sijil.learn_from_document` (the supplier the seal confirms, REC-5).
 The search row (`sijil_core.search_index`) becomes `sealed` in step 2's transaction.
 
 Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
@@ -29,7 +30,8 @@ A field edit holds the same ledger lock; it commits its `document.fields_edited`
 its index write after (an applied edit is always audited; an index failure then answers 503
 `field.update_failed`). The index write includes the search row, so search shows the edit as
 soon as the request answers. A seal racing it either seals the values it locked, with their digest,
-or gets `seal.fields_changed`.
+or gets `seal.fields_changed`. An applied edit of the supplier's name or ICE then sends
+`sijil.learn_from_document` (`send_learning`).
 """
 
 import asyncio
@@ -92,6 +94,8 @@ DB_UNAVAILABLE: Final = "seal.db_unavailable"
 SEAL_FAILED: Final = "seal.failed"
 UPDATE_FAILED: Final = "field.update_failed"
 REVIEWABLE: Final = frozenset({DocumentState.filed, DocumentState.needs_review})
+# An edit or a correction of one of these teaches the workspace its supplier (REC-5).
+SUPPLIER_FIELDS: Final = frozenset({"supplier_name", "supplier_ice"})
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 SEAL_BATCH_LIMIT = 500
@@ -415,6 +419,8 @@ async def edit_fields(
             # A logged edit attempt that did not apply: acceptable, and said so.
             log.warning("field edit of document %s not applied: %s", doc_id, type(exc).__name__)
             raise ApiError(UPDATE_FAILED, 503) from None
+    if SUPPLIER_FIELDS & set(names):
+        await send_learning(request, ledger.id, workspace.id)
     return _full(ledger, row)
 
 
@@ -553,6 +559,17 @@ async def _after_commit(request: Request, ledger_id: UUID, workspace_id: UUID) -
     except Exception as exc:  # noqa: BLE001
         log.warning("mirror enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
     await send_embedding(request, ledger_id, workspace_id)
+    await send_learning(request, ledger_id, workspace_id)
+
+
+async def send_learning(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
+    """After a commit that confirmed or corrected the document's supplier (an edit, a seal, a
+    correction note): `sijil.learn_from_document`, which reads the effective values. Best
+    effort: a lost message leaves the supplier to be learnt at the document's next edit."""
+    try:
+        await asyncio.to_thread(get_enqueuer(request).send_learn, ledger_id, workspace_id)
+    except Exception as exc:  # noqa: BLE001 - the broker being down must not fail the request
+        log.warning("learning enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
 
 
 async def send_embedding(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:

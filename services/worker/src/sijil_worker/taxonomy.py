@@ -10,7 +10,10 @@ from typing import Final
 from sijil_core.fields import DOCUMENT_TYPES
 from sijil_core.paperless import PaperlessClient
 
+# Paperless 3.4.1's `MatchingModel.matching_algorithm` values (tests/integration pins them).
 MATCH_NONE: Final = 0
+# "Exact": the document's text contains the whole `match` string, as a word (a supplier's ICE).
+MATCH_LITERAL: Final = 3
 MATCH_REGEX: Final = 4
 
 RULES: Final[dict[str, str]] = {

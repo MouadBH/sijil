@@ -32,6 +32,8 @@ _ATTEMPTS = 3
 _BACKOFF_S = 0.5
 # Rows per page when a whole paginated list is read.
 PAGE_SIZE = 100
+# The longest name 3.4.1 accepts for a correspondent, document type or tag (`MatchingModel`).
+NAME_MAX = 128
 
 
 class PaperlessError(Exception):
@@ -485,10 +487,9 @@ class PaperlessClient:
             and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
         }
 
-    async def _document_type_id(self, name: str) -> int | None:
-        response = await self._request(
-            "GET", "/api/document_types/", params={"name__iexact": name, "page_size": 100}
-        )
+    async def _named_id(self, path: str, name: str) -> int | None:
+        """The lowest id among the rows of `path` called `name` (case-insensitive), or None."""
+        response = await self._request("GET", path, params={"name__iexact": name, "page_size": 100})
         try:
             ids = [
                 int(r["id"])
@@ -496,8 +497,11 @@ class PaperlessClient:
                 if str(r["name"]).casefold() == name.casefold()
             ]
         except (ValueError, KeyError, TypeError):
-            raise PaperlessBadResponse("GET /api/document_types/: unexpected body") from None
+            raise PaperlessBadResponse(f"GET {path}: unexpected body") from None
         return min(ids) if ids else None
+
+    async def _document_type_id(self, name: str) -> int | None:
+        return await self._named_id("/api/document_types/", name)
 
     async def ensure_document_type(self, name: str, match: str, algorithm: int) -> int:
         """The id of the document type called `name` (case-insensitive), created if missing.
@@ -527,18 +531,7 @@ class PaperlessClient:
             raise PaperlessBadResponse("POST /api/document_types/: unexpected body") from None
 
     async def _custom_field_id(self, name: str) -> int | None:
-        response = await self._request(
-            "GET", "/api/custom_fields/", params={"name__iexact": name, "page_size": 100}
-        )
-        try:
-            ids = [
-                int(r["id"])
-                for r in response.json()["results"]
-                if str(r["name"]).casefold() == name.casefold()
-            ]
-        except (ValueError, KeyError, TypeError):
-            raise PaperlessBadResponse("GET /api/custom_fields/: unexpected body") from None
-        return min(ids) if ids else None
+        return await self._named_id("/api/custom_fields/", name)
 
     async def ensure_custom_field(self, name: str, data_type: str) -> int:
         """The id of the custom field called `name` (case-insensitive), created with `data_type`
@@ -562,6 +555,40 @@ class PaperlessClient:
             return int(created.json()["id"])
         except (ValueError, KeyError, TypeError):
             raise PaperlessBadResponse("POST /api/custom_fields/: unexpected body") from None
+
+    async def _correspondent_id(self, name: str) -> int | None:
+        return await self._named_id("/api/correspondents/", name)
+
+    async def ensure_correspondent(self, name: str, match: str, algorithm: int) -> int:
+        """The id of the correspondent called `name` (case-insensitive; cut to the 128
+        characters 3.4.1 allows), created with this matching rule if missing. Like
+        `ensure_document_type`: an existing correspondent is reused as it is (its rule never
+        changed), and a lost create race returns the winner."""
+        name = name[:NAME_MAX]
+        existing = await self._correspondent_id(name)
+        if existing is not None:
+            return existing
+        rule = {"match": match, "matching_algorithm": algorithm, "is_insensitive": True}
+        try:
+            created = await self._request(
+                "POST", "/api/correspondents/", json={"name": name, **rule}
+            )
+        except PaperlessError as exc:
+            if isinstance(exc, PaperlessUnavailable):
+                raise
+            winner = await self._correspondent_id(name)
+            if winner is None:
+                raise
+            return winner
+        try:
+            return int(created.json()["id"])
+        except (ValueError, KeyError, TypeError):
+            raise PaperlessBadResponse("POST /api/correspondents/: unexpected body") from None
+
+    async def set_correspondent(self, doc_id: int, correspondent_id: int) -> None:
+        await self._request(
+            "PATCH", f"/api/documents/{doc_id}/", json={"correspondent": correspondent_id}
+        )
 
     async def set_custom_fields(
         self,

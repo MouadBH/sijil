@@ -536,3 +536,86 @@ async def test_set_custom_fields_without_type_sends_fields_only() -> None:
     assert json.loads(patch.calls.last.request.content) == {
         "custom_fields": [{"field": 5, "value": "2026-09-30"}]
     }
+
+
+@respx.mock
+async def test_ensure_correspondent_creates_with_the_given_rule_when_missing() -> None:
+    listing = respx.get(f"{BASE}/api/correspondents/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    post = respx.post(f"{BASE}/api/correspondents/").mock(
+        return_value=httpx.Response(201, json={"id": 31})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_correspondent("Atlas SAMPLE", "001905837000041", 3) == 31
+    assert listing.calls.last.request.url.params["name__iexact"] == "Atlas SAMPLE"
+    assert json.loads(post.calls.last.request.content) == {
+        "name": "Atlas SAMPLE",
+        "match": "001905837000041",
+        "matching_algorithm": 3,
+        "is_insensitive": True,
+    }
+
+
+@respx.mock
+async def test_ensure_correspondent_reuses_by_name_and_never_changes_its_rule() -> None:
+    respx.get(f"{BASE}/api/correspondents/").mock(
+        return_value=_type_row(id=5, name="ATLAS sample", match="", matching_algorithm=6)
+    )
+    patch = respx.patch(f"{BASE}/api/correspondents/5/")
+    post = respx.post(f"{BASE}/api/correspondents/")
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_correspondent("Atlas SAMPLE", "001905837000041", 3) == 5
+    assert not post.called
+    assert not patch.called
+
+
+@respx.mock
+async def test_ensure_correspondent_lost_create_race_returns_the_winner() -> None:
+    respx.get(f"{BASE}/api/correspondents/").mock(
+        side_effect=[
+            httpx.Response(200, json={"results": []}),
+            _type_row(id=8, name="Atlas SAMPLE", match="001905837000041", matching_algorithm=3),
+        ]
+    )
+    respx.post(f"{BASE}/api/correspondents/").mock(
+        return_value=httpx.Response(400, json={"name": ["already exists"]})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.ensure_correspondent("Atlas SAMPLE", "001905837000041", 3) == 8
+
+
+@respx.mock
+async def test_ensure_correspondent_create_unavailable_is_not_swallowed() -> None:
+    respx.get(f"{BASE}/api/correspondents/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    respx.post(f"{BASE}/api/correspondents/").mock(return_value=httpx.Response(500))
+    async with PaperlessClient(BASE, token="t") as client:
+        with pytest.raises(PaperlessUnavailable):
+            await client.ensure_correspondent("Atlas SAMPLE", "001905837000041", 3)
+
+
+@respx.mock
+async def test_ensure_correspondent_name_is_cut_to_paperless_length() -> None:
+    """3.4.1 names are at most 128 characters."""
+    listing = respx.get(f"{BASE}/api/correspondents/").mock(
+        return_value=httpx.Response(200, json={"results": []})
+    )
+    post = respx.post(f"{BASE}/api/correspondents/").mock(
+        return_value=httpx.Response(201, json={"id": 2})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.ensure_correspondent("S" * 200, "001905837000041", 3)
+    assert listing.calls.last.request.url.params["name__iexact"] == "S" * 128
+    assert json.loads(post.calls.last.request.content)["name"] == "S" * 128
+
+
+@respx.mock
+async def test_set_correspondent_patches_the_document() -> None:
+    patch = respx.patch(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.set_correspondent(7, 31)
+    assert json.loads(patch.calls.last.request.content) == {"correspondent": 31}

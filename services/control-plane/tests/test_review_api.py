@@ -996,3 +996,66 @@ async def test_batch_tells_a_database_failure_from_an_index_failure(
         {"id": str(db_broken), "code": "seal.db_unavailable"},
         {"id": str(index_broken), "code": "seal.index_unavailable"},
     ]
+
+
+async def test_patch_supplier_enqueues_learning(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    """Only an edit of the supplier's name or ICE, and only once the edit is committed: the
+    learning reads the edited values."""
+    row = await add_document(db, memory_store, index_conn, ws, state=DocumentState.needs_review)
+    url = _url(ws, f"/documents/{row.id}/fields")
+    r = await member.client.patch(url, json={"fields": {"total_ttc": "1600.00"}})
+    assert r.status_code == 200, r.text
+    assert enqueuer.learns == []
+
+    for fields in ({"supplier_name": "Atlas SAMPLE Corrigé"}, {"supplier_ice": "001905837000058"}):
+        r = await member.client.patch(url, json={"fields": fields})
+        assert r.status_code == 200, r.text
+    assert enqueuer.learns == [(row.id, ws.id)] * 2
+
+    async def fail(_trans: Any) -> None:
+        raise OSError("index down")
+
+    monkeypatch.setattr(review, "_commit_index", fail)
+    r = await member.client.patch(url, json={"fields": {"supplier_name": "SAMPLE Autre"}})
+    assert (r.status_code, _code(r)) == (503, "field.update_failed")
+    assert enqueuer.learns == [(row.id, ws.id)] * 2  # an edit that did not apply teaches nothing
+
+
+async def test_seal_enqueues_learning(
+    member: Actor, ws: Workspace, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    row = await add_document(db, memory_store, index_conn, ws)
+    r = await member.client.post(_url(ws, f"/documents/{row.id}/seal"))
+    assert r.status_code == 200, r.text
+    assert enqueuer.learns == [(row.id, ws.id)]
+
+    def broken(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        raise ConnectionRefusedError("broker down")
+
+    enqueuer.send_learn = broken
+    other = await add_document(db, memory_store, index_conn, ws)
+    r = await member.client.post(_url(ws, f"/documents/{other.id}/seal"))
+    assert r.status_code == 200, r.text  # the seal stands
+    assert (await _ledger(db, other)).state is DocumentState.sealed
+
+
+def test_learning_is_sent_to_the_main_workers_default_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sijil_cp.enqueue import CeleryEnqueuer
+
+    sent: list[tuple[str, dict[str, str], str]] = []
+    celery = CeleryEnqueuer("redis://127.0.0.1:1/0")
+    monkeypatch.setattr(
+        celery._app,  # noqa: SLF001
+        "send_task",
+        lambda name, kwargs, queue: sent.append((name, kwargs, queue)),
+    )
+    ledger_id, workspace_id = uuid.uuid4(), uuid.uuid4()
+    celery.send_learn(ledger_id, workspace_id)
+    kwargs = {"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)}
+    assert sent == [("sijil.learn_from_document", kwargs, "default")]

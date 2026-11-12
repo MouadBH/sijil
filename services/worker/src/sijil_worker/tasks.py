@@ -70,6 +70,7 @@ from sijil_worker.ingest import (
     is_transient_cause,
     requeue_stuck_ingest,
 )
+from sijil_worker.learning import learn_from_document
 from sijil_worker.lock import lock_sealed, requeue_unlocked
 from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
@@ -824,6 +825,54 @@ def mirror_fields_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str
     except Exception as exc:
         retries = int(self.request.retries or 0)
         if not is_mirror_transient(exc) or retries >= MIRROR_MAX_RETRIES:
+            raise
+        countdown = get_exponential_backoff_interval(
+            factor=MIRROR_BACKOFF_FACTOR_S,
+            retries=retries,
+            maximum=MIRROR_BACKOFF_MAX_S,
+            full_jitter=True,
+        )
+        raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+# Learning a supplier (REC-5): retried like the mirror (`is_mirror_transient`, its backoff),
+# LEARN_MAX_RETRIES times. The record is learnt before Paperless is asked, so a retry only
+# completes the correspondent.
+LEARN_MAX_RETRIES = MIRROR_MAX_RETRIES
+
+
+async def _learn(ledger_id: str, workspace_id: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        await learn_from_document(
+            UUID(ledger_id),
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True, name="sijil.learn_from_document", queue="default", max_retries=LEARN_MAX_RETRIES
+)
+def learn_from_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """The supplier a reviewer confirmed or corrected (see sijil_worker.learning)."""
+    try:
+        asyncio.run(_learn(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if not is_mirror_transient(exc) or retries >= LEARN_MAX_RETRIES:
             raise
         countdown = get_exponential_backoff_interval(
             factor=MIRROR_BACKOFF_FACTOR_S,

@@ -24,6 +24,8 @@ SEARCH_BACKFILL_TASK = ("sijil.search_backfill", "default")
 EMBED_TASK = ("sijil.embed_document", "embedding")
 # The Ask worker: the index databases and the in-region Ollama, one question at a time.
 ASK_TASK = ("sijil.answer_question", "ask")
+# The main worker: the index databases and the tenants' service tokens (the correspondent).
+LEARN_TASK = ("sijil.learn_from_document", "default")
 
 
 class Enqueuer(Protocol):
@@ -59,6 +61,10 @@ class Enqueuer(Protocol):
 
     def send_ask(self, ask_id: UUID, workspace_id: UUID) -> None:
         """Answer a question (Ask worker, queue `ask`)."""
+        ...
+
+    def send_learn(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        """Learn the supplier a reviewer confirmed or corrected (worker, queue `default`)."""
         ...
 
 
@@ -104,6 +110,9 @@ class CeleryEnqueuer:
         self._app.send_task(
             name, kwargs={"ask_id": str(ask_id), "workspace_id": str(workspace_id)}, queue=queue
         )
+
+    def send_learn(self, ledger_id: UUID, workspace_id: UUID) -> None:
+        self._send_document(LEARN_TASK, ledger_id, workspace_id)
 
     def _send_document(self, task: tuple[str, str], ledger_id: UUID, workspace_id: UUID) -> None:
         name, queue = task
