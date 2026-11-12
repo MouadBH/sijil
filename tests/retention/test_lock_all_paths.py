@@ -13,14 +13,20 @@ a document, for every role, on an unsealed and on a sealed document.
 | 7 index SQL without the purge GUC | none | refused | DELETE refused |
 | 8 API `PUT …/documents/{id}/tags` | each | fields unchanged | - |
 | 9 API search, saved view, Ask (and its worker) | each | nothing written | - |
-| 10 search and embedding SQL without the gate | none | refused | refused |
+| 10 search and embedding SQL without the gate | none | refused (see below) | refused |
 
 Paths 8 and 9 (M5) are the annotations and the reads: on a sealed document a tag is allowed
 (Owner, Admin, Member) and a search, a saved view or a question is every role's; none of them
 writes the ledger (its `fields_sha256` included), the fields row, a correction or the original.
-Path 10 is `search_doc` and `doc_chunk` (DELETE, UPDATE, TRUNCATE) and `document_tag`
-(TRUNCATE): a plain DELETE on `document_tag` is the removal of a tag, an annotation (ruling, M5
-Task 1; index schema v4), proven by tests/retention/test_tag_paths.py to touch nothing else.
+Path 10 is `search_doc` (DELETE, TRUNCATE), `doc_chunk` (DELETE, UPDATE, TRUNCATE) and
+`document_tag` (TRUNCATE): a plain DELETE on `document_tag` is the removal of a tag, an
+annotation (ruling, M5 Task 1; index schema v4), proven by tests/retention/test_tag_paths.py to
+touch nothing else. An UPDATE on `search_doc` is not refused: the row is a derived index, not
+the document (whose fields row, original and `fields_sha256` stay locked as above), and the
+index role may rewrite it. The daily `sijil.search_resync` compares each live row's values and
+tags with their sources, rewrites a row that differs and audits `search.repaired`
+(services/worker/tests/test_search_upkeep.py), so a row changed by hand skews Ask's sums or an
+export for at most a day.
 
 Paths 4 to 7 and 10 have no role: no Sijil role (the Owner's included) reaches them through any API,
 and each refuses whoever holds the credential. 4 and 6 run against the live tenant t1 and
