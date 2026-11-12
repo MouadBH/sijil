@@ -830,6 +830,15 @@ def effective_fields(
     return effective
 
 
+async def read_runs(conn: AsyncConnection, ledger_id: UUID) -> list[Mapping[str, Any]]:
+    """What each model run answered for the document (`extraction_run.raw`), oldest first."""
+    result = await conn.execute(
+        text("SELECT raw FROM extraction_run WHERE ledger_id = :id ORDER BY id"),
+        {"id": ledger_id},
+    )
+    return [r for r in (_loads(raw) for raw in result.scalars()) if isinstance(r, Mapping)]
+
+
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
     """Deletes the document's `document_fields`, `extraction_run`, `correction_note`,
     `search_doc`, `document_tag` and `doc_chunk` rows, the `ask_query` answers citing or

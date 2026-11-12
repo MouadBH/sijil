@@ -189,3 +189,26 @@ async def test_the_purge_keeps_a_record_another_live_document_carries(
     await mark_search_state(conn, kept, DocumentState.removed)
     await index.purge_document(conn, kept)
     assert await suppliers.get(conn, ice) is None
+
+
+async def test_learn_adds_confirmed_spellings_as_aliases(conn: AsyncConnection) -> None:
+    """Spellings a reviewer confirmed (the runs' names of a confirmed document): deduplicated
+    after `search_normalise`, never the record's own name, the 10 newest kept."""
+    ice = _ice()
+    await suppliers.learn(
+        conn, ice=ice, name="Atlas Télécom Services SARL", source="seal", actor=None, now=NOW,
+        aliases=["أطلس لخدمات الاتصالات", "Atlas Telecom", "ATLAS TELECOM", "atlas télécom "
+                 "services sarl", ""],
+    )  # fmt: skip
+    stored = await suppliers.get(conn, ice)
+    assert stored is not None
+    assert stored.name == "Atlas Télécom Services SARL"
+    assert stored.aliases == ("أطلس لخدمات الاتصالات", "ATLAS TELECOM")  # the newest spelling
+    again = await suppliers.learn(
+        conn, ice=ice, name="Atlas Télécom Services SARL", source="review", actor=None, now=NOW,
+        aliases=[f"SAMPLE Spelling {n}" for n in range(12)],
+    )  # fmt: skip
+    assert again.changed is False  # spellings are not a rename
+    stored = await suppliers.get(conn, ice)
+    assert stored is not None
+    assert stored.aliases == tuple(f"SAMPLE Spelling {n}" for n in range(2, 12))

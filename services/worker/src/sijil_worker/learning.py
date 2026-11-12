@@ -9,7 +9,11 @@ Only in this worker's region, and only for a document that a reviewer has seen (
 1. holds the ledger row FOR SHARE (a removal waits) while it reads the document's effective
    values (`index.effective_fields`: a correction note wins) and learns them
    (`suppliers.learn`: nothing without an ICE), in one index transaction; the source is
-   `correction` when a note corrects the supplier, else `seal` once sealed, else `review`;
+   `correction` when a note corrects the supplier, else `seal` once sealed, else `review`.
+   Once a reviewer confirmed the document (sealed it, or PATCHed its supplier), the names the
+   model read on it with the same ICE (`extraction_run`) join the record's aliases, sanitised
+   as hints are: so a supplier printed in another spelling (Arabic, abbreviated) is recognised
+   on its next document;
 2. audits `supplier.learned` `{source, new}` when the record is new or renamed (never a name or
    an ICE, ruling P5), so a retry audits nothing twice;
 3. then, best effort, in the workspace's Paperless with its service token: the correspondent of
@@ -18,7 +22,7 @@ Only in this worker's region, and only for a document that a reviewer has seen (
 
 Paperless unreachable (or the workspace paused) raises for the task to retry by the M3
 transient rules; any other Paperless failure is logged by its class only. Neither undoes the
-record. The record is workspace knowledge: `index.purge_document` leaves it.
+record. `index.purge_document` deletes a record with the last live document carrying its ICE.
 """
 
 import logging
@@ -28,7 +32,7 @@ from typing import Final
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
 from sijil_core import audit, suppliers
 from sijil_core import index as index_db
@@ -44,11 +48,12 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
+from sijil_core.fields import parse_field
 from sijil_core.index import IndexEngines
 from sijil_core.paperless import NAME_MAX, PaperlessClient, PaperlessError, PaperlessUnavailable
 from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.suppliers import Supplier, SupplierSource
-from sijil_worker.extract import _service_token
+from sijil_worker.extract import _hint_name, _service_token
 from sijil_worker.ingest import WorkspaceNotActive
 from sijil_worker.settings import ExtractionSettings
 from sijil_worker.taxonomy import MATCH_LITERAL
@@ -110,13 +115,19 @@ async def learn_from_document(
                 source, actor = "seal", ledger.sealed_by
             else:
                 source, actor = "review", row.updated_by
+            ice = effective.get("supplier_ice", (None, False))[0]
+            confirmed = ledger.sealed_at is not None or any(
+                row.source.get(f) == "user" for f in SUPPLIER_FIELDS
+            )
+            spellings = await _spellings(conn, ledger_id, ice) if confirmed else []
             change = await suppliers.learn(
                 conn,
-                ice=effective.get("supplier_ice", (None, False))[0],
+                ice=ice,
                 name=effective.get("supplier_name", (None, False))[0],
                 source=source,
                 actor=actor,
                 now=now,
+                aliases=spellings,
             )
         if change.supplier is None:
             return False
@@ -146,6 +157,22 @@ async def learn_from_document(
         index, workspace, paperless, token, change.supplier, ledger.paperless_doc_id, ledger_id
     )
     return True
+
+
+async def _spellings(conn: AsyncConnection, ledger_id: UUID, ice: str | None) -> list[str]:
+    """The supplier names the model runs read on the document next to its confirmed ICE,
+    sanitised as hints are (`extract._hint_name`)."""
+    found: list[str] = []
+    for raw in await index_db.read_runs(conn, ledger_id):
+        name, run_ice = raw.get("supplier_name"), raw.get("supplier_ice")
+        if not isinstance(name, str) or not isinstance(run_ice, str):
+            continue
+        if ice is None or parse_field("supplier_ice", run_ice) != ice:
+            continue
+        spelling = _hint_name(parse_field("supplier_name", name) or "")
+        if spelling:
+            found.append(spelling)
+    return found
 
 
 async def _correspond(

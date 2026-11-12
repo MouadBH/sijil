@@ -281,10 +281,10 @@ async def test_corrected_supplier_recognised_next_time(
             settings=SETTINGS, now=NOW, workspace_id=ready.id,
         )  # fmt: skip
 
-    # 4. Document 2, same ICE: the model now returns yet another spelling of the name (it
-    #    must match the record, trigram >= 0.6, to count as the known supplier).
+    # 4. Document 2, same ICE: the model repeats document 1's mistake, which the confirmation
+    #    taught as a spelling (an alias) of the record.
     second = await make_ledger(db, ready)
-    another = RAW_01 | {"supplier_name": "ATLAS TÉLÉCOM SERVICES", "number": "F-2026-01002"}
+    another = RAW_01 | {"supplier_name": "Atlas Telecom Groupe SAMPLE", "number": "F-2026-01002"}
     ollama = FakeOllama({1: another, 2: another})
     with respx.mock(assert_all_called=False) as router:
         mock_paperless(router)
@@ -296,4 +296,75 @@ async def test_corrected_supplier_recognised_next_time(
     assert after.values["supplier_name"] == LEARNT
     assert after.source["supplier_name"] == "supplier_record"
     assert after.signals["supplier_name"]["supplier_known"] is True
+    assert SUPPLIER_MISMATCH not in after.flags
     assert after.confidence["supplier_name"] > before.confidence["supplier_name"]
+
+
+async def _extracted(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ws: Workspace, run_a: str, run_b: str, number: str,
+) -> Any:  # fmt: skip
+    ledger = await make_ledger(db, ws, age=timedelta(minutes=5))
+    a = RAW_01 | {"supplier_name": run_a, "number": number}
+    b = RAW_01 | {"supplier_name": run_b, "number": number}
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: a, 2: b}))
+    return ledger
+
+
+async def _learnt(
+    sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService, engines: IndexEngines,
+    ws: Workspace, ledger_id: uuid.UUID,
+) -> None:  # fmt: skip
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        _correspondents(router)
+        assert await learn_from_document(
+            ledger_id, sessions=sessions, keys=keys, index=engines, paperless=PaperlessClient,
+            settings=SETTINGS, now=NOW, workspace_id=ws.id,
+        )  # fmt: skip
+
+
+async def test_confirmed_spellings_become_aliases_and_are_recognised(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User,
+) -> None:  # fmt: skip
+    """The Arabic name (trigram 0.0 against the record) and "Atlas Telecom" (0.519), as the
+    runs read them, become aliases once a reviewer confirms the document: the next document in
+    either spelling is the known supplier."""
+    arabic = SUPPLIER_01["name_ar"]
+    first = await _extracted(
+        db, sessions, keys, engines, ready, arabic, "Atlas Telecom", "F-2026-01011"
+    )
+    await _review_and_seal(db, engines, ready, first.id, user)
+    await _learnt(sessions, keys, engines, ready, first.id)
+    async with (await engines.engine(ready)).connect() as conn:
+        record = await suppliers.get(conn, ICE)
+    assert record is not None
+    assert record.name == LEARNT
+    assert set(record.aliases) == {arabic, "Atlas Telecom"}
+
+    for n, spelling in enumerate((arabic, "Atlas Telecom")):
+        nxt = await _extracted(
+            db, sessions, keys, engines, ready, spelling, spelling, f"F-2026-0102{n}"
+        )
+        row = await fields_of(engines, ready, nxt.id)
+        assert row.values["supplier_name"] == LEARNT
+        assert row.signals["supplier_name"]["supplier_known"] is True, spelling
+        assert SUPPLIER_MISMATCH not in row.flags, spelling
+
+
+async def test_an_unconfirmed_document_adds_no_alias(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace,
+) -> None:  # fmt: skip
+    """Routed but never PATCHed nor sealed: its runs' spellings teach nothing."""
+    ledger = await _extracted(
+        db, sessions, keys, engines, ready, LEARNT, "Atlas Telecom", "F-2026-01031"
+    )
+    assert (await reload(db, ledger)).state in (DocumentState.filed, DocumentState.needs_review)
+    await _learnt(sessions, keys, engines, ready, ledger.id)
+    async with (await engines.engine(ready)).connect() as conn:
+        record = await suppliers.get(conn, ICE)
+    assert record is not None and record.aliases == ()
