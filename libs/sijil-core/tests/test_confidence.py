@@ -105,6 +105,7 @@ def test_weights_table_is_the_design_one() -> None:
         "extraction_failed",
         "retention.extend_failed",
         "supplier_mismatch",
+        "supplier_own_ice",
     }
 
 
@@ -391,3 +392,12 @@ def test_min_confidence_pct_over_required_fields() -> None:
     assert min_confidence_pct(scores, "invoice") == 57
     assert min_confidence_pct(scores, "contract") == 100
     assert min_confidence_pct({}, "invoice") == 0
+
+
+def test_the_workspace_own_ice_as_supplier_blocks_filing() -> None:
+    """Final review I2: a supplier ICE that is the workspace's own (`suppliers.own_ices`) is
+    flagged and goes to review, however high every score."""
+    assert confidence.OWN_ICE == "supplier_own_ice"
+    perfect = dict.fromkeys(FIELD_NAMES, 1.0)
+    assert route(perfect, [], "invoice") == "filed"
+    assert route(perfect, [confidence.OWN_ICE], "invoice") == "needs_review"

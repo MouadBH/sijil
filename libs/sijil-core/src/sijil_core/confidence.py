@@ -28,6 +28,10 @@ HARD_CAP: Final = 0.5
 # record's, but it may be another company's ICE (a client's), so it goes to review.
 SUPPLIER_MISMATCH: Final = "supplier_mismatch"
 MISMATCH_CAP: Final = 0.85
+# The kept supplier ICE is the workspace's own (`suppliers.own_ices`): a purchase invoice whose
+# client was read as its supplier, so it goes to review (final review I2; interim until the
+# organisation's ICE is a setting).
+OWN_ICE: Final = "supplier_own_ice"
 # A run's name matches a record's name or alias at this trigram similarity, both folded.
 NAME_MATCH: Final = 0.6
 BLOCKING_FLAGS: Final = frozenset(
@@ -38,6 +42,7 @@ BLOCKING_FLAGS: Final = frozenset(
         "extraction_failed",
         "retention.extend_failed",  # the object lock could not be extended at filing
         SUPPLIER_MISMATCH,
+        OWN_ICE,
     }
 )
 VAT_RATES: Final = (Decimal(20), Decimal(14), Decimal(10), Decimal(7))

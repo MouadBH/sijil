@@ -12,7 +12,7 @@ last live one (index schema v8).
 """
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final, Literal
@@ -21,9 +21,11 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from sijil_core.db.models import TERMINAL_STATES
 from sijil_core.text import search_normalise
 
 MAX_ALIASES: Final = 10
+OWN_ICE_MIN_DOCUMENTS: Final = 5  # `own_ices`: below this, no ICE is the workspace's own
 SupplierSource = Literal["review", "seal", "correction"]
 
 _ICE: Final = re.compile(r"^[0-9]{15}$")
@@ -91,6 +93,48 @@ async def get(conn: AsyncConnection, ice: str) -> Supplier | None:
         .first()
     )
     return None if found is None else _supplier(found)
+
+
+_OWN_ICES: Final = text(
+    """
+    WITH live AS (
+        SELECT count(*) AS n FROM search_doc WHERE state <> ALL (CAST(:terminal AS text[]))
+    )
+    SELECT ice FROM unnest(CAST(:ices AS text[])) AS ice, live
+    WHERE live.n >= :min_documents
+      AND 2 * (
+          SELECT count(*) FROM search_doc
+          WHERE content_norm LIKE '%' || ice || '%'
+            AND state <> ALL (CAST(:terminal AS text[]))
+      ) >= live.n
+    """
+)
+
+
+def _own_params(ices: Sequence[str]) -> dict[str, Any]:
+    return {
+        "ices": list(ices),
+        "terminal": sorted(str(s) for s in TERMINAL_STATES),
+        "min_documents": OWN_ICE_MIN_DOCUMENTS,
+    }
+
+
+async def own_ices(conn: AsyncConnection, candidates: Iterable[str]) -> frozenset[str]:
+    """The candidates that are the workspace's own ICE: printed in the text of at least half of
+    its live documents, when it has at least OWN_ICE_MIN_DOCUMENTS (final review I2). Only its
+    own company is on most of what a company archives (the client of its purchases, the seller
+    of its sales), so such an ICE is never learnt, hinted or filed as a supplier. An interim
+    guard until the organisation's ICE is a setting; its cost: a supplier on at least half of
+    the documents counts too (its documents go to review).
+
+    One query: the live count, and per candidate (15 digits; others are ignored) a count
+    through the trigram index on `content_norm`. Callers ask once per run, never caching
+    across runs (the documents change)."""
+    ices = [ice for ice in dict.fromkeys(candidates) if _ICE.match(ice)]
+    if not ices:
+        return frozenset()
+    result = await conn.execute(_OWN_ICES, _own_params(ices))
+    return frozenset(result.scalars())
 
 
 async def find(conn: AsyncConnection, ices: Sequence[str]) -> list[Supplier]:
