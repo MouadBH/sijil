@@ -585,6 +585,30 @@ class PaperlessClient:
         except (ValueError, KeyError, TypeError):
             raise PaperlessBadResponse("POST /api/correspondents/: unexpected body") from None
 
+    async def correspondent(self, correspondent_id: int) -> dict[str, Any] | None:
+        """The correspondent (`name`, `match`, `matching_algorithm` ...), or None when Paperless
+        has none with this id (404)."""
+        try:
+            response = await self._request("GET", f"/api/correspondents/{correspondent_id}/")
+        except PaperlessError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        try:
+            body = response.json()
+        except ValueError:
+            raise PaperlessBadResponse("GET /api/correspondents/{id}/: not JSON") from None
+        if not isinstance(body, dict):
+            raise PaperlessBadResponse("GET /api/correspondents/{id}/: unexpected body")
+        return dict(body)
+
+    async def rename_correspondent(self, correspondent_id: int, name: str) -> None:
+        """Only the name (cut to NAME_MAX) changes; its matching rule stays as it is. Callers
+        rename only a correspondent they created (`sijil_worker.learning`)."""
+        await self._request(
+            "PATCH", f"/api/correspondents/{correspondent_id}/", json={"name": name[:NAME_MAX]}
+        )
+
     async def set_correspondent(self, doc_id: int, correspondent_id: int) -> None:
         await self._request(
             "PATCH", f"/api/documents/{doc_id}/", json={"correspondent": correspondent_id}

@@ -45,7 +45,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.index import IndexEngines
-from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
+from sijil_core.paperless import NAME_MAX, PaperlessClient, PaperlessError, PaperlessUnavailable
 from sijil_core.region import RegionMismatch, assert_region
 from sijil_core.suppliers import Supplier, SupplierSource
 from sijil_worker.extract import _service_token
@@ -161,9 +161,11 @@ async def _correspond(
     failures raise; any other is logged and dropped (the record stands)."""
     try:
         async with paperless(workspace.paperless_url, token=token) as client:
-            correspondent = await client.ensure_correspondent(
-                supplier.name, supplier.ice, MATCH_LITERAL
-            )
+            correspondent = await _ours(client, supplier)
+            if correspondent is None:
+                correspondent = await client.ensure_correspondent(
+                    supplier.name, supplier.ice, MATCH_LITERAL
+                )
             if correspondent != supplier.paperless_correspondent_id:
                 async with (await index.engine(workspace)).begin() as conn:
                     await suppliers.set_correspondent_id(conn, supplier.ice, correspondent)
@@ -175,3 +177,23 @@ async def _correspond(
         log.warning(
             "paperless correspondent of document %s failed: %s", ledger_id, type(exc).__name__
         )
+
+
+async def _ours(client: PaperlessClient, supplier: Supplier) -> int | None:
+    """The correspondent we created for this record (its stored id), renamed to the record's
+    name if needed, while its rule is still ours (literal, on the record's ICE). None when
+    there is none, or a tenant user changed its rule: a correspondent we did not make, or no
+    longer ours, is never touched."""
+    stored = supplier.paperless_correspondent_id
+    if stored is None:
+        return None
+    found = await client.correspondent(stored)
+    if (
+        found is None
+        or found.get("matching_algorithm") != MATCH_LITERAL
+        or found.get("match") != supplier.ice
+    ):
+        return None
+    if found.get("name") != supplier.name[:NAME_MAX]:
+        await client.rename_correspondent(stored, supplier.name)
+    return stored

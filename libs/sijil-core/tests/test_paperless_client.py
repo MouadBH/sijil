@@ -619,3 +619,28 @@ async def test_set_correspondent_patches_the_document() -> None:
     async with PaperlessClient(BASE, token="t") as client:
         await client.set_correspondent(7, 31)
     assert json.loads(patch.calls.last.request.content) == {"correspondent": 31}
+
+
+@respx.mock
+async def test_correspondent_reads_one_or_none() -> None:
+    respx.get(f"{BASE}/api/correspondents/31/").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": 31, "name": "Atlas", "match": "001905837000041", "matching_algorithm": 3},
+        )
+    )
+    respx.get(f"{BASE}/api/correspondents/32/").mock(return_value=httpx.Response(404))
+    async with PaperlessClient(BASE, token="t") as client:
+        found = await client.correspondent(31)
+        assert found is not None and found["matching_algorithm"] == 3
+        assert await client.correspondent(32) is None
+
+
+@respx.mock
+async def test_rename_correspondent_patches_only_its_name() -> None:
+    patch = respx.patch(f"{BASE}/api/correspondents/31/").mock(
+        return_value=httpx.Response(200, json={"id": 31})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        await client.rename_correspondent(31, "S" * 200)
+    assert json.loads(patch.calls.last.request.content) == {"name": "S" * 128}

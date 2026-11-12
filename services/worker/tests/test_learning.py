@@ -185,6 +185,9 @@ def _mock(router: respx.MockRouter) -> tuple[respx.Route, respx.Route]:
 
     router.get(f"{PAPERLESS}/api/correspondents/").mock(side_effect=_correspondents(created))
     post = router.post(f"{PAPERLESS}/api/correspondents/").mock(side_effect=create)
+    # The one an earlier learning created, as it left it (ours: literal, on the ICE).
+    router.get(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/").respond(200, json=_ours())
+    router.patch(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/").respond(200, json={})
     patch = router.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(200, json={"id": DOC_ID})
     return post, patch
 
@@ -231,7 +234,7 @@ async def test_learning_creates_paperless_correspondent_with_literal_ice_match(
     engines: IndexEngines, ready: Workspace, user: User,
 ) -> None:  # fmt: skip
     row = await _document(db, engines, ready, user)
-    with respx.mock(assert_all_called=True) as router:
+    with respx.mock(assert_all_called=False) as router:
         post, patch = _mock(router)
         assert await _learn(row.id, sessions, keys, engines, workspace_id=ready.id)
     assert MATCH_LITERAL == 3
@@ -372,7 +375,7 @@ async def test_paperless_down_keeps_the_record_and_raises_for_a_retry(
             await _learn(row.id, sessions, keys, engines)
     record = await _record(engines, ready)
     assert record is not None and record.paperless_correspondent_id is None
-    with respx.mock(assert_all_called=True) as router:
+    with respx.mock(assert_all_called=False) as router:
         _mock(router)
         assert await _learn(row.id, sessions, keys, engines)
     record = await _record(engines, ready)
@@ -465,3 +468,87 @@ def test_learning_task_retries_transient_errors_only(
     result = tasks.learn_from_document_task.apply(kwargs=ARGS)
     assert isinstance(result.result, type(error))
     assert len(calls) == attempts
+
+
+# Renaming the correspondent -----------------------------------------------------------------
+
+RENAMED = "Atlas Télécom SAMPLE"
+
+
+async def _learnt_then_renamed(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ws: Workspace, user: User,
+) -> DocumentLedger:  # fmt: skip
+    """Learnt (our correspondent CORRESPONDENT_ID created), then a note renames the supplier."""
+    row = await _document(db, engines, ws, user)
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        assert await _learn(row.id, sessions, keys, engines)
+    async with (await engines.engine(ws)).begin() as conn:
+        await index.add_correction(
+            conn, row.id, "supplier_name", RENAMED, "The legal name changed.",
+            created_by=user.id, now=NOW,
+        )  # fmt: skip
+    return row
+
+
+def _ours(**over: Any) -> dict[str, Any]:
+    return {
+        "id": CORRESPONDENT_ID, "name": NAME, "match": ICE,
+        "matching_algorithm": MATCH_LITERAL, "is_insensitive": True,
+    } | over  # fmt: skip
+
+
+@pytest.mark.db
+async def test_a_rename_renames_the_correspondent_we_created(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User,
+) -> None:  # fmt: skip
+    row = await _learnt_then_renamed(db, sessions, keys, engines, ready, user)
+    with respx.mock(assert_all_called=False) as router:
+        router.get(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/").respond(200, json=_ours())
+        rename = router.patch(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/").respond(
+            200, json=_ours(name=RENAMED)
+        )
+        create = router.post(f"{PAPERLESS}/api/correspondents/").respond(201, json={"id": 99})
+        assign = router.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(200, json={})
+        assert await _learn(row.id, sessions, keys, engines)
+    assert json.loads(rename.calls.last.request.content) == {"name": RENAMED}
+    assert not create.called
+    assert json.loads(assign.calls.last.request.content) == {"correspondent": CORRESPONDENT_ID}
+    record = await _record(engines, ready)
+    assert record is not None
+    assert (record.name, record.paperless_correspondent_id) == (RENAMED, CORRESPONDENT_ID)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize(
+    "stored",
+    [
+        _ours(matching_algorithm=6),  # the tenant made it automatic
+        _ours(match="Atlas"),  # the tenant changed its rule
+        None,  # deleted in Paperless
+    ],
+    ids=["algorithm", "match", "gone"],
+)
+async def test_a_correspondent_no_longer_ours_is_never_renamed(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User, stored: dict[str, Any] | None,
+) -> None:  # fmt: skip
+    row = await _learnt_then_renamed(db, sessions, keys, engines, ready, user)
+    with respx.mock(assert_all_called=False) as router:
+        if stored is None:
+            router.get(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/").respond(404)
+        else:
+            router.get(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/").respond(
+                200, json=stored
+            )
+        rename = router.patch(f"{PAPERLESS}/api/correspondents/{CORRESPONDENT_ID}/")
+        router.get(f"{PAPERLESS}/api/correspondents/").respond(200, json={"results": []})
+        create = router.post(f"{PAPERLESS}/api/correspondents/").respond(201, json={"id": 99})
+        router.patch(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(200, json={})
+        assert await _learn(row.id, sessions, keys, engines)
+    assert not rename.called
+    assert json.loads(create.calls.last.request.content)["name"] == RENAMED
+    record = await _record(engines, ready)
+    assert record is not None and record.paperless_correspondent_id == 99

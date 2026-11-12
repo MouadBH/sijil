@@ -4,9 +4,12 @@
 A correspondent made by `ensure_correspondent` with `matching_algorithm` 3 ("exact" in 3.4.1's
 `MatchingModel`: the text contains the `match` string as a word) and the supplier's ICE is
 assigned by Paperless to a newly consumed document whose text carries that ICE, and not one
-whose ICE is absent. The service token (view/add/change, no delete) can create it and set it on
-a document. The workspace is created for this test and marked `closing` at teardown: the shared
-SAMPLE workspace is never touched.
+whose ICE is absent. A decoy with the same algorithm whose two words are both in the text, but
+never side by side in that order, is not matched: so 3 is the literal phrase, never ANY (1) or
+ALL (2), which would match it. The service token (view/add/change, no delete) can create a
+correspondent, rename it (only its name changes, its rule stays) and set it on a document.
+The workspace is created for this test and marked `closing` at teardown: the shared SAMPLE
+workspace is never touched.
 """
 
 import asyncio
@@ -38,6 +41,8 @@ PASSWORD = "it-learning-Passw0rd"  # noqa: S105 - a throw-away SAMPLE account
 SAMPLE = Path(__file__).parents[2] / "fixtures" / "invoices" / "sample-01-fr.pdf"
 ICE = "001905837000041"  # SAMPLE: Atlas Télécom Services SARL (fictitious), printed in SAMPLE
 ABSENT_ICE = "009999999000099"  # SAMPLE: printed on no fixture
+# Both words are printed on sample-01-fr.pdf, never as this phrase (asserted below).
+DECOY = "Casablanca SAMPLE"
 PROVISION_BUDGET_S = 240
 CONSUME_BUDGET_S = 180
 
@@ -112,6 +117,7 @@ async def test_literal_ice_correspondent_is_assigned_at_consumption(
             stored = (await svc._request("GET", f"/api/correspondents/{atlas}/")).json()  # noqa: SLF001
             assert (stored["match"], stored["matching_algorithm"]) == (ICE, 3)
             assert stored["is_insensitive"] is True
+            decoy = await svc.ensure_correspondent("SAMPLE Decoy", DECOY, MATCH_LITERAL)
 
             # A trailing PDF comment makes the run's upload unique.
             content = SAMPLE.read_bytes() + f"\n%sijil-it-{uuid.uuid4()}\n".encode()
@@ -124,8 +130,23 @@ async def test_literal_ice_correspondent_is_assigned_at_consumption(
             assert task.status == "SUCCESS", task.status
             assert task.related_document is not None
             document = await svc.get_document(task.related_document)
-            assert ICE in (await svc.document_content(task.related_document))
+            text = await svc.document_content(task.related_document)
+            assert ICE in text
+            words = " ".join(text.casefold().split())
+            assert all(w.casefold() in words for w in DECOY.split())
+            assert DECOY.casefold() not in words
             assert document["correspondent"] == atlas
+            # Every correspondent whose rule matches the text: the ICE's, never the decoy's.
+            matched = (await svc.document_suggestions(task.related_document))["correspondents"]
+            assert matched == [atlas], (matched, decoy, absent)
+
+            # A rename (the learning's, of a correspondent it created): the name only.
+            await svc.rename_correspondent(atlas, "Atlas Télécom Services SAMPLE")
+            renamed = await svc.correspondent(atlas)
+            assert renamed is not None
+            assert renamed["name"] == "Atlas Télécom Services SAMPLE"
+            assert (renamed["match"], renamed["matching_algorithm"]) == (ICE, MATCH_LITERAL)
+            assert await svc.correspondent(10_000_000) is None
 
             # The learning sets it on a document as well (the change right is enough).
             await svc.set_correspondent(task.related_document, absent)
