@@ -564,6 +564,17 @@ async def read_fields(conn: AsyncConnection, ledger_id: UUID) -> FieldsRow | Non
     return None if found is None else _row(found)
 
 
+async def read_fields_many(
+    conn: AsyncConnection, ledger_ids: Sequence[UUID]
+) -> dict[UUID, FieldsRow]:
+    """`read_fields` for several documents in one query, by ledger id (absent: no row)."""
+    result = await conn.execute(
+        text(f"SELECT {_COLUMNS} FROM document_fields WHERE ledger_id = ANY(:ids)"),  # noqa: S608
+        {"ids": list(ledger_ids)},
+    )
+    return {row.ledger_id: row for row in map(_row, result.mappings())}
+
+
 async def write_extraction(conn: AsyncConnection, row: FieldsRow) -> None:
     """Upsert of an extraction result. Raises `RetentionLocked` once the row is sealed.
 
@@ -812,6 +823,24 @@ async def read_corrections(conn: AsyncConnection, ledger_id: UUID) -> list[Corre
         {"id": ledger_id},
     )
     return [Correction(**dict(m)) for m in result.mappings()]
+
+
+async def read_corrections_many(
+    conn: AsyncConnection, ledger_ids: Sequence[UUID]
+) -> dict[UUID, list[Correction]]:
+    """`read_corrections` for several documents in one query, by ledger id (absent: none)."""
+    result = await conn.execute(
+        text(
+            "SELECT id, ledger_id, field, value, reason, created_by, created_at "
+            "FROM correction_note WHERE ledger_id = ANY(:ids) "
+            "ORDER BY ledger_id, created_at DESC, id DESC"
+        ),
+        {"ids": list(ledger_ids)},
+    )
+    found: dict[UUID, list[Correction]] = {}
+    for m in result.mappings():
+        found.setdefault(m["ledger_id"], []).append(Correction(**dict(m)))
+    return found
 
 
 def effective_fields(

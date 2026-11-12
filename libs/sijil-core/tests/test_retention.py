@@ -93,6 +93,28 @@ def test_retention_basis_is_shared_by_routing_and_seal(doc_date: str | None, bas
     assert retention_basis(doc_date, ARRIVED, "ma-cas", NOW_R) == basis
 
 
+@pytest.mark.parametrize(
+    ("doc_date", "bases"),
+    [
+        # Dated after its arrival: the day before the date (cut to it), then the date itself.
+        ("2026-10-20", {date(2026, 10, 1), date(2026, 10, 19), date(2026, 10, 20)}),
+        ("2026-09-30", {date(2026, 9, 30)}),  # plausible on every day since the arrival
+        ("2026-11-03", {date(2026, 10, 1), date(2026, 11, 2)}),  # still ahead of today
+        # Plausible at the arrival, no longer today (over 15 years old): either judgement.
+        ("2011-10-15", {date(2011, 10, 15), date(2026, 10, 1)}),
+        (None, {date(2026, 10, 1)}),
+    ],
+)
+def test_retention_bases_are_every_judgement_since_the_arrival(
+    doc_date: str | None, bases: set[date]
+) -> None:
+    """A search row keeps the basis judged on the day it was written: `retention_bases` is
+    every value `retention_basis` gave on some day from the arrival to now."""
+    from sijil_core.retention import retention_bases
+
+    assert retention_bases(doc_date, ARRIVED, "ma-cas", NOW_R) == bases
+
+
 @pytest.mark.db
 async def test_policy_years_falls_back_to_other_and_country(
     db: AsyncSession, org: Organisation, workspace: Workspace

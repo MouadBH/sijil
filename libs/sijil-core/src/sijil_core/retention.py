@@ -2,7 +2,7 @@
 (see design §5.2)."""
 
 from collections.abc import Mapping
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -105,6 +105,26 @@ def retention_basis(doc_date: str | None, arrival: datetime, region: str, now: d
     date when plausible (`confidence.plausible_date` against the region-local today), else the
     region-local arrival date, and never after today. An object lock is never shortened, so a
     misread or mistyped year must never lock an original for longer."""
-    today = region_local_date(now, region)
-    dated = plausible_date(doc_date, today)
-    return min(dated or region_local_date(arrival, region), today)
+    return _basis_on(doc_date, region_local_date(arrival, region), region_local_date(now, region))
+
+
+def _basis_on(doc_date: str | None, arrival: date, today: date) -> date:
+    return min(plausible_date(doc_date, today) or arrival, today)
+
+
+def retention_bases(
+    doc_date: str | None, arrival: datetime, region: str, now: datetime
+) -> frozenset[date]:
+    """Every value `retention_basis` gave on some day from the arrival to `now`: its judgement
+    depends on the day (a date ahead of it is cut to it, one over 15 years old is no longer
+    plausible), so a value judged earlier may still be right. The result changes only on the
+    first and last days and around the date itself, so those are the days tried."""
+    first, last = region_local_date(arrival, region), region_local_date(now, region)
+    days = {first, last}
+    try:
+        day = date.fromisoformat(doc_date) if doc_date is not None else None
+    except ValueError:
+        day = None
+    if day is not None:
+        days |= {d for d in (day - timedelta(days=1), day) if first <= d <= last}
+    return frozenset(_basis_on(doc_date, first, today) for today in days)
