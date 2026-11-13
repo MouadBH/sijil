@@ -736,6 +736,20 @@ async def test_resync_revives_a_live_document_marked_terminal_by_sql(
     assert await _repaired(db, ready) == [(str(row.id), {"columns": "state"})]
 
 
+async def test_resync_does_not_repair_accented_tags_set_through_the_api(
+    db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """`set_tags` orders tags by code point, the index database by its collation: `à payer`
+    sorts after `achats` in one and before it in the other. A tag order is no drift."""
+    row = await _live(db, conn, ready, user, DocumentState.filed, 281)
+    await set_tags(conn, row.id, ["à payer", "achats", "Été"], by=user.id, now=NOW)
+    with respx.mock(assert_all_called=False) as router:
+        _paperless(router, {})
+        await _run(sessions, keys, engines)
+    assert await _repaired(db, ready) == []
+
+
 async def test_resync_does_not_audit_a_routine_state_fix_as_a_repair(
     db: AsyncSession, user: User, ready: Workspace, sessions: async_sessionmaker[AsyncSession],
     keys: LocalKeyService, engines: IndexEngines, conn: AsyncConnection,

@@ -218,8 +218,13 @@ async def search_drift(
             want, dated = _derived(
                 facts, fields.get(facts.ledger_id), notes.get(facts.ledger_id, [])
             )
-            want["tags"] = tagged.get(facts.ledger_id, [])
-            columns = [name for name in DERIVED if have[name] != want[name]]
+            # Tags are a set: `set_tags` orders them by code point, the database by collation.
+            want["tags"] = sorted(tagged.get(facts.ledger_id, []))
+            columns = [
+                name
+                for name in DERIVED
+                if (sorted(have[name] or []) if name == "tags" else have[name]) != want[name]
+            ]
             if "basis_date" in columns and have["basis_date"] in retention_bases(
                 dated, facts.ingested_at, facts.region, facts.now
             ):
