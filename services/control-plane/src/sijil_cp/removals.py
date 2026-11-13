@@ -9,6 +9,9 @@
   is audited too (`validation`) and tells an Admin nothing.
 - After the commit `remove:pending:<id>` is claimed, then `sijil.remove_original` is sent to the
   removal worker; a lost message is re-sent by the `requeue_unremoved` sweep.
+- Right after the commit too, the documents' search rows take the terminal state (`removed`,
+  `deleting`), so search stops returning them before the purge deletes the rows. Best effort:
+  the daily `sijil.search_resync` marks a row this step missed.
 """
 
 import asyncio
@@ -24,8 +27,10 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import audit
-from sijil_core.db.models import ActorType
+from sijil_core.db.models import ActorType, DocumentState, Workspace
+from sijil_core.index import IndexEngines
 from sijil_core.pending import PENDING_TTL_S, REMOVE_PREFIX, pending_key
+from sijil_core.search_index import mark_search_state
 from sijil_cp.enqueue import get_enqueuer
 
 log = logging.getLogger(__name__)
@@ -102,3 +107,18 @@ async def send_removal(request: Request, ledger_id: UUID, workspace_id: UUID) ->
                 "removal release of document %s failed: %s",
                 ledger_id, type(release_exc).__name__,
             )  # fmt: skip
+
+
+async def mark_search(
+    request: Request, workspace: Workspace, ids: Sequence[UUID], state: DocumentState
+) -> None:
+    """See the module docstring. Never raises: the change it reflects is committed."""
+    engines: IndexEngines = request.app.state.index
+    try:
+        async with (await engines.engine(workspace)).begin() as conn:
+            for ledger_id in ids:
+                await mark_search_state(conn, ledger_id, state)
+    except Exception as exc:
+        log.warning(
+            "search index of workspace %s not updated: %s", workspace.id, type(exc).__name__
+        )

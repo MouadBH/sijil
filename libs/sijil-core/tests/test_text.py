@@ -1,4 +1,4 @@
-from sijil_core.text import normalise
+from sijil_core.text import normalise, search_normalise, trigram_similarity
 
 
 def test_normalise_maps_presentation_forms() -> None:
@@ -16,3 +16,33 @@ def test_normalise_strips_bidi_controls() -> None:
     assert out == " ٦١٥٫٨٠درهم"
     assert not any("\u202a" <= c <= "\u202e" for c in out)
     assert normalise("\u200ea\u200f\u061cb\u2066c\u2069") == "abc"
+
+
+def test_search_normalise_arabic_variants() -> None:
+    assert search_normalise("فاتورة") == search_normalise("فاتوره")
+    assert search_normalise("ف\u0640\u0640\u0640اتورة") == search_normalise("فاتورة")  # tatweel
+    # harakat
+    assert search_normalise("ف\u064eات\u064fور\u064eة\u064c") == search_normalise("فاتورة")
+    assert search_normalise("أحمد") == search_normalise("احمد")
+    assert search_normalise("إسماعيل آمنة ٱلدار") == "اسماعيل امنه الدار"
+    assert search_normalise("مصطفى") == search_normalise("مصطفي")
+    assert search_normalise("٢٠٢٦") == "2026"
+    assert search_normalise("۲۰۲۶") == "2026"
+
+
+def test_search_normalise_french_accents() -> None:
+    assert search_normalise("Télécom") == "telecom"
+    assert search_normalise("ÉCHANTILLON Façade Œuvre") == "echantillon facade œuvre"
+
+
+def test_search_normalise_applies_normalise_first() -> None:
+    assert search_normalise("ﻓﺎﺗﻮﺭﺓ\u00a0\u00a0\u200fF-2026") == "فاتوره f-2026"
+
+
+def test_trigram_similarity_follows_pg_trgm() -> None:
+    """pg_trgm's `similarity`: words of letters and digits, lower-cased and padded, the
+    Jaccard index of their trigram sets (the review's reference value for near-namesakes)."""
+    assert trigram_similarity("atlas telecom", "Atlas, TELECOM!") == 1.0
+    assert trigram_similarity("atlas", "zenith") == 0.0
+    assert trigram_similarity("", "atlas") == 0.0
+    assert round(trigram_similarity("atlas telecom maroc", "atlas telecom services"), 3) == 0.483

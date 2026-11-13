@@ -107,3 +107,51 @@ async def test_database_unreachable_exits_2(capsys: pytest.CaptureFixture[str]) 
     captured = capsys.readouterr()
     assert "database" in captured.err
     assert "sijil:sijil" not in captured.err  # never the connection string
+
+
+# `sijil-cp search backfill` ----------------------------------------------------------------
+
+
+async def _backfill(workspace_id: uuid.UUID, settings: CpSettings, enqueuer: Any) -> int:
+    return await asyncio.to_thread(cli.search_backfill, workspace_id, settings, enqueuer)
+
+
+async def test_search_backfill_enqueues_the_workspace(
+    db: AsyncSession, workspace: Workspace, migrated_db: Any, enqueuer: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    assert await _backfill(workspace.id, _settings(migrated_db.app_url), enqueuer) == 0
+    assert enqueuer.backfills == [workspace.id]
+    assert capsys.readouterr().out.strip() == f"queued {workspace.id}"
+
+
+async def test_search_backfill_of_an_unknown_workspace_exits_2(
+    db: AsyncSession, migrated_db: Any, enqueuer: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert await _backfill(uuid.uuid4(), _settings(migrated_db.app_url), enqueuer) == 2
+    assert enqueuer.backfills == []
+    assert "unknown workspace" in capsys.readouterr().err
+
+
+async def test_search_backfill_of_another_region_exits_2(
+    db: AsyncSession, workspace: Workspace, migrated_db: Any, enqueuer: Any,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    elsewhere = _settings(migrated_db.app_url).model_copy(update={"region": "fr-par"})
+    assert await _backfill(workspace.id, elsewhere, enqueuer) == 2
+    assert enqueuer.backfills == []
+    assert "region" in capsys.readouterr().err
+
+
+def test_search_backfill_command_is_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[uuid.UUID] = []
+
+    def fake(workspace_id: uuid.UUID) -> int:
+        seen.append(workspace_id)
+        return 0
+
+    monkeypatch.setattr(cli, "search_backfill", fake)
+    target = uuid.uuid4()
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["search", "backfill", str(target)])
+    assert (exited.value.code, seen) == (0, [target])

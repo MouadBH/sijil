@@ -45,6 +45,7 @@ from sijil_core.index import FieldsRow, IndexEngines
 from sijil_core.ollama import OllamaClient, OllamaUnavailable
 from sijil_core.paperless import PaperlessClient, PaperlessError, PaperlessUnavailable
 from sijil_core.storage import ObjectRef
+from sijil_core.text import normalise
 from sijil_worker import extract as extract_module
 from sijil_worker import tasks
 from sijil_worker.app import make_celery
@@ -290,6 +291,7 @@ async def run(
     settings: WorkerSettings = SETTINGS,
     store: FakeStore | None = None,
     now: datetime = NOW,
+    enqueue_embed: Callable[[uuid.UUID, uuid.UUID], Awaitable[None]] | None = None,
 ) -> None:
     async with ollama.client() as client:
         await extract_document(
@@ -302,6 +304,7 @@ async def run(
             store=FakeStore() if store is None else store,
             settings=settings,
             now=now,
+            enqueue_embed=enqueue_embed,
         )
 
 
@@ -978,6 +981,82 @@ async def test_paperless_title_failure_does_not_change_routing(
     assert await actions(db, ready) == ["document.extracted", "document.needs_review"]
     assert "title" in caplog.text
     assert SUPPLIER_01["name"] not in caplog.text  # logged by code only
+
+
+@pytest.mark.parametrize("filed", [True, False])
+async def test_routing_sends_the_embedding_after_the_search_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    filed: bool,
+) -> None:
+    """Filed or sent to review, the document's embedding is sent once, after its search row
+    (which it reads) holds the routed state and the text."""
+    ledger = await make_ledger(db, ready)
+    sent: list[tuple[uuid.UUID, uuid.UUID, Any]] = []
+
+    async def enqueue(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        async with (await engines.engine(ready)).connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT state, content <> '' FROM search_doc WHERE ledger_id = :id"),
+                    {"id": ledger_id},
+                )
+            ).first()
+        sent.append((ledger_id, workspace_id, tuple(row) if row else None))
+
+    raw = RAW_01 if filed else {**RAW_01, "number": None}
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(
+            ledger, sessions, keys, engines, FakeOllama({1: raw, 2: raw}), enqueue_embed=enqueue
+        )
+    state = "filed" if filed else "needs_review"
+    assert sent == [(ledger.id, ready.id, (state, True))]
+
+
+async def test_embedding_enqueue_failure_does_not_change_routing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ledger = await make_ledger(db, ready)
+
+    async def broker_down(_l: uuid.UUID, _w: uuid.UUID) -> None:
+        raise ConnectionError("redis down")
+
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(
+            ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}),
+            enqueue_embed=broker_down,
+        )  # fmt: skip
+        assert _patches(router)  # the steps after it still ran
+    assert (await reload(db, ledger)).state is DocumentState.filed
+    assert "embedding enqueue" in caplog.text
+
+
+async def test_no_embedding_without_a_routing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """A document already routed (a redelivery) is not routed again, so nothing is sent."""
+    ledger = await make_ledger(db, ready, state=DocumentState.filed)
+    sent: list[uuid.UUID] = []
+
+    async def enqueue(ledger_id: uuid.UUID, _w: uuid.UUID) -> None:
+        sent.append(ledger_id)
+
+    await run(ledger, sessions, keys, engines, FakeOllama({}), enqueue_embed=enqueue)
+    assert sent == []
 
 
 async def test_totals_mismatch_routes_to_review(
@@ -1788,3 +1867,115 @@ async def test_a_document_removed_during_extraction_leaves_no_index_row(
     assert await runs_of(engines, ready, ledger.id) == []
     routed = {"document.filed", "document.needs_review"}
     assert routed.isdisjoint(await actions(db, ready))
+
+
+# The search index ------------------------------------------------------------------------
+
+
+async def search_of(engines: IndexEngines, workspace: Workspace, ledger_id: uuid.UUID) -> Any:
+    async with (await engines.engine(workspace)).connect() as conn:
+        found = await conn.execute(
+            text(
+                "SELECT state, content, supplier_name, number, total_ttc, basis_date "
+                "FROM search_doc WHERE ledger_id = :id"
+            ),
+            {"id": ledger_id},
+        )
+        return found.mappings().first()
+
+
+async def test_extraction_writes_content_and_state(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """After routing, the search row holds the routed state, the fields and the whole
+    normalised Paperless text (not only what the model was given)."""
+    ledger = await make_ledger(db, ready)
+    content = "\u202bﻓﺎﺗﻮﺭﺓ\u202c " + CONTENT_01 + "y" * 13_000
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, content=content)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    routed = (await reload(db, ledger)).state
+    assert routed in (DocumentState.filed, DocumentState.needs_review)
+    row = await search_of(engines, ready, ledger.id)
+    assert row is not None
+    assert row["state"] == routed.value
+    assert row["content"] == normalise(content)
+    assert (row["supplier_name"], row["number"]) == (SUPPLIER_01["name"], SAMPLE_01["number"])
+    assert str(row["total_ttc"]) == SAMPLE_01["ttc"]
+    assert row["basis_date"].isoformat() == SAMPLE_01["date"]
+
+
+async def test_unsupported_document_gets_an_empty_search_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready, ingest_state=IngestState.unsupported)
+    await run(ledger, sessions, keys, engines, FakeOllama({}))
+    row = await search_of(engines, ready, ledger.id)
+    assert row is not None
+    assert (row["state"], row["content"]) == ("needs_review", "")
+
+
+async def test_a_document_removed_during_extraction_gets_no_search_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    original_ask = extract_module._ask
+
+    async def ask_then_remove(*args: Any, **kwargs: Any) -> Any:
+        async with sessions() as session:
+            await session.execute(
+                text(
+                    "UPDATE document_ledger SET state = 'removed', removed_at = now(),"
+                    " removed_by = :u, removal_reason = 'Deposited by mistake (SAMPLE)'"
+                    " WHERE id = :id AND state = 'received'"
+                ),
+                {"id": ledger.id, "u": user.id},
+            )
+            await session.commit()
+        return await original_ask(*args, **kwargs)
+
+    monkeypatch.setattr(extract_module, "_ask", ask_then_remove)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert await search_of(engines, ready, ledger.id) is None
+
+
+async def test_a_search_index_failure_does_not_undo_the_routing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The routing is committed first; a failed search write is logged by class only and left
+    to the daily resync."""
+
+    async def broken(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("index down")
+
+    monkeypatch.setattr("sijil_worker.search.refresh_search_doc", broken)
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert (await reload(db, ledger)).state is not DocumentState.received
+    assert await search_of(engines, ready, ledger.id) is None
+    assert "OSError" in caplog.text
+    assert SUPPLIER_01["name"] not in caplog.text

@@ -23,6 +23,7 @@ from sijil_core.paperless import PaperlessClient, PaperlessForbidden
 from sijil_core.tenancy import tenant_ref
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import WorkerSettings
+from tests.support.polling import poll_get
 
 AttachRunner = Callable[[str], AbstractContextManager[None]]
 
@@ -109,7 +110,7 @@ async def test_m1_acceptance(
 
             job: dict[str, object] = {}
             while time.monotonic() - started < PROVISION_BUDGET_S:
-                r = await http.get(f"/v1/jobs/{created['job_id']}")
+                r = await poll_get(http, f"/v1/jobs/{created['job_id']}")
                 assert r.status_code == 200, r.text
                 job = r.json()
                 if job["status"] in ("succeeded", "failed"):

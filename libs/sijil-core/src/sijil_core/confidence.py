@@ -10,13 +10,13 @@ Every value here is a canonical string from `sijil_core.fields`. Amounts are com
 """
 
 import re
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Final, Literal
 
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE
-from sijil_core.text import normalise
+from sijil_core.text import normalise, search_normalise, trigram_similarity
 
 Signals = dict[str, bool | None]
 Values = Mapping[str, str | None]
@@ -24,6 +24,16 @@ Decision = Literal["filed", "needs_review"]
 
 THRESHOLD: Final = 0.90
 HARD_CAP: Final = 0.5
+# A supplier record for the kept ICE whose name (or alias) neither run gave: the name is the
+# record's, but it may be another company's ICE (a client's), so it goes to review.
+SUPPLIER_MISMATCH: Final = "supplier_mismatch"
+MISMATCH_CAP: Final = 0.85
+# The kept supplier ICE is the workspace's own (`suppliers.own_ices`): a purchase invoice whose
+# client was read as its supplier, so it goes to review (final review I2; interim until the
+# organisation's ICE is a setting).
+OWN_ICE: Final = "supplier_own_ice"
+# A run's name matches a record's name or alias at this trigram similarity, both folded.
+NAME_MATCH: Final = 0.6
 BLOCKING_FLAGS: Final = frozenset(
     {
         "possible_duplicate",
@@ -31,6 +41,8 @@ BLOCKING_FLAGS: Final = frozenset(
         "ingest.unsupported_format",
         "extraction_failed",
         "retention.extend_failed",  # the object lock could not be extended at filing
+        SUPPLIER_MISMATCH,
+        OWN_ICE,
     }
 )
 VAT_RATES: Final = (Decimal(20), Decimal(14), Decimal(10), Decimal(7))
@@ -146,12 +158,28 @@ def compute_signals(
     paperless_type: str | None,
     known_supplier: str | None,
     today: date,
+    supplier_record: Sequence[str] | None = None,
 ) -> dict[str, dict[str, bool | None]]:
     """Every field's signals, from the two runs' canonical values (None for a run that gave
     nothing usable), the normalised content, Paperless's suggested type, the supplier name
-    already sealed for the kept ICE, and the region-local date."""
+    already sealed for the kept ICE, and the region-local date.
+
+    `supplier_record` is the workspace's supplier record for the kept ICE (`sijil_core.
+    suppliers`, REC-5): its name, then its aliases. The name replaces the kept one. It is
+    known only when a run's own name matches the name or an alias (`names_match`), and the
+    runs agree on it only when both gave that ICE and a matching name; else `supplier_known`
+    is false, which caps the score at MISMATCH_CAP (the caller flags SUPPLIER_MISMATCH)."""
     a, b = values_a or {}, values_b or {}
     value = kept(values_a, values_b)
+    record_known: bool | None = None
+    record_agree = False
+    if supplier_record:
+        value["supplier_name"] = supplier_record[0]
+        known_supplier = None
+        matched = [names_match(r.get("supplier_name"), supplier_record) for r in (a, b)]
+        record_known = any(matched)
+        ice_a, ice_b = a.get("supplier_ice"), b.get("supplier_ice")
+        record_agree = all(matched) and ice_a is not None and ice_a == ice_b
     folded = _fold(content)
     signals: dict[str, Signals] = {}
     for name in FIELD_NAMES:
@@ -166,9 +194,11 @@ def compute_signals(
         return None if v is None else _fold(v) in folded
 
     supplier = value["supplier_name"]
-    known: bool | None = None
+    known: bool | None = record_known
     if known_supplier is not None:
         known = supplier is not None and _fold(supplier) == _fold(known_supplier)
+    if supplier_record:
+        signals["supplier_name"]["runs_agree"] = record_agree
     ht, vat, ttc = (_amount(value[n]) for n in ("total_ht", "vat", "total_ttc"))
     totals: bool | None = None
     if ht is not None and vat is not None and ttc is not None:
@@ -192,6 +222,17 @@ def compute_signals(
     return signals
 
 
+def names_match(name: str | None, names: Sequence[str]) -> bool:
+    """Whether `name` is one of `names` after `search_normalise`, at trigram similarity of at
+    least NAME_MATCH."""
+    if not name:
+        return False
+    folded = search_normalise(name).strip()
+    return any(
+        trigram_similarity(folded, search_normalise(other).strip()) >= NAME_MATCH for other in names
+    )
+
+
 def score(field: str, signals: Mapping[str, bool | None]) -> float:
     """The weighted share of applicable signals that hold, capped at 0.5 when a hard signal
     fails. Raises KeyError for an unknown field."""
@@ -211,6 +252,8 @@ def score(field: str, signals: Mapping[str, bool | None]) -> float:
         result = held / applicable
     if any(signals.get(signal) is False for signal in HARD[field]):
         result = min(result, HARD_CAP)
+    if field == "supplier_name" and signals.get("supplier_known") is False:
+        result = min(result, MISMATCH_CAP)
     return result
 
 

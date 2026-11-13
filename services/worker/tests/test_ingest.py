@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,8 +12,14 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import select, text
+from sqlalchemy.engine import URL as DbUrl
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from sijil_core import audit
 from sijil_core.crypto import LocalKeyService, seal
@@ -33,6 +39,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.filetypes import FileKind
+from sijil_core.index import IndexEngines
 from sijil_core.ingest import Enqueue
 from sijil_core.paperless import PaperlessClient, PaperlessUnavailable
 from sijil_core.settings import CoreSettings
@@ -43,6 +50,7 @@ from sijil_worker.ingest import (
     ingest_document,
     requeue_stuck_ingest,
 )
+from tests.support.index_db import throwaway_index_db
 from tests.support.memory_store import MemoryObjectStore
 
 pytestmark = pytest.mark.db
@@ -136,6 +144,7 @@ async def run(
     will_retry: bool = False,
     settings: CoreSettings = SETTINGS,
     enqueue_extract: Enqueue | None = None,
+    index: IndexEngines | None = None,
 ) -> None:
     await ingest_document(
         ledger.id,
@@ -148,6 +157,7 @@ async def run(
         settings=settings,
         will_retry=lambda _exc: will_retry,
         enqueue_extract=enqueue_extract,
+        index=index,
     )
 
 
@@ -1301,3 +1311,81 @@ async def test_requeue_skips_removed_rows(
 
     assert await requeue_stuck_ingest(sessions, enqueue, region="ma-cas") == 0
     assert sent == []
+
+
+# The search index ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def index_db_url() -> Iterator[str]:
+    yield from throwaway_index_db()
+
+
+@pytest.fixture
+async def engines(
+    db: AsyncSession,
+    ready: Workspace,
+    index_db_url: str,
+    keys: LocalKeyService,
+    sessions: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[IndexEngines]:
+    """The real engine cache over a throw-away index database, with the workspace's password."""
+    kind = CredentialKind.index_db_password
+    envelope = seal(b"pw", keys, ready.kms_key_id, f"{ready.id}:{kind}")
+    db.add(TenantCredential(workspace_id=ready.id, kind=kind, envelope=envelope.to_bytes()))
+    await db.commit()
+
+    def factory(_url: DbUrl) -> AsyncEngine:
+        return create_async_engine(index_db_url)
+
+    found = IndexEngines(SETTINGS, keys, sessions, engine_factory=factory)
+    yield found
+    await found.aclose()
+
+
+async def _search_row(engines: IndexEngines, ws: Workspace, ledger_id: uuid.UUID) -> Any:
+    async with (await engines.engine(ws)).connect() as conn:
+        found = await conn.execute(
+            text("SELECT state, ingested_at, content FROM search_doc WHERE ledger_id = :id"),
+            {"id": ledger_id},
+        )
+        return found.mappings().first()
+
+
+async def test_ingest_consumed_creates_the_search_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    engines: IndexEngines,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    with respx.mock(assert_all_called=False) as router:
+        mock_flow(router)
+        await run(ledger, sessions, keys, memory_store, index=engines)
+    row = await _search_row(engines, ready, ledger.id)
+    assert row is not None
+    assert (row["state"], row["ingested_at"], row["content"]) == (
+        "received",
+        ledger.ingested_at,
+        "",
+    )
+
+
+async def test_ingest_failure_creates_no_search_row(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    engines: IndexEngines,
+) -> None:
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    with respx.mock(assert_all_called=False) as router:
+        mock_flow(router, tasks=[httpx.Response(200, json=task_row("failure", result="boom"))])
+        with pytest.raises(Exception):  # noqa: B017, PT011 - any final failure
+            await run(ledger, sessions, keys, memory_store, index=engines)
+    assert await _search_row(engines, ready, ledger.id) is None

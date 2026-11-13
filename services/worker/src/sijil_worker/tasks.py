@@ -18,15 +18,29 @@ from sijil_core.crypto import LocalKeyService
 from sijil_core.db.base import utcnow
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.index import IndexEngines
-from sijil_core.ollama import OllamaClient, OllamaError, OllamaUnavailable
+from sijil_core.ollama import OllamaBadOutput, OllamaClient, OllamaError, OllamaUnavailable
 from sijil_core.paperless import (
     PaperlessClient,
     PaperlessError,
     PaperlessUnavailable,
 )
-from sijil_core.pending import EXPORT_PREFIX, PENDING_TTL_S, PURGE_PREFIX, REMOVE_PREFIX
+from sijil_core.pending import (
+    ASK_PREFIX,
+    EMBED_PREFIX,
+    EXPORT_PREFIX,
+    PENDING_TTL_S,
+    PURGE_PREFIX,
+    REMOVE_PREFIX,
+)
 from sijil_core.region import RegionMismatch
 from sijil_core.storage import RetentionActive, S3ExportStore, S3ObjectStore, StorageSettings
+from sijil_worker.ask import UNAVAILABLE as ASK_UNAVAILABLE
+from sijil_worker.ask import (
+    answer_question,
+    expire_questions,
+    record_ask_failed,
+    sweep_questions,
+)
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -34,6 +48,7 @@ from sijil_worker.drift import (
     record_check_failed,
 )
 from sijil_worker.eligibility import mark_eligible
+from sijil_worker.embed import embed_document, record_embedding_failed
 from sijil_worker.export import (
     EXPORT_FAILED,
     build_export,
@@ -55,6 +70,7 @@ from sijil_worker.ingest import (
     is_transient_cause,
     requeue_stuck_ingest,
 )
+from sijil_worker.learning import learn_from_document
 from sijil_worker.lock import lock_sealed, requeue_unlocked
 from sijil_worker.mirror import mirror_fields
 from sijil_worker.pending import PendingExtractions, PendingOp
@@ -68,7 +84,9 @@ from sijil_worker.purge import (
 from sijil_worker.reconcile import reconcile_tenants
 from sijil_worker.removal import record_removal_failed, remove_original, requeue_unremoved
 from sijil_worker.runtime.docker import DockerRuntime
+from sijil_worker.search import resync_search
 from sijil_worker.settings import (
+    AskSettings,
     ExportSettings,
     ExtractionSettings,
     RemovalSettings,
@@ -231,11 +249,14 @@ async def _ingest(
 ) -> None:
     settings = WorkerSettings()
     engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    keys = LocalKeyService(settings.master_key_bytes())
+    engines = IndexEngines(settings, keys, sessions)
     try:
         await ingest_document(
             UUID(ledger_id),
-            sessions=make_sessionmaker(engine),
-            keys=LocalKeyService(settings.master_key_bytes()),
+            sessions=sessions,
+            keys=keys,
             store=S3ObjectStore(StorageSettings()),
             paperless=PaperlessClient,
             settings=settings,
@@ -244,8 +265,10 @@ async def _ingest(
             retry_after_s=retry_after_s,
             enqueue_extract=_send_extract,
             enqueue_purge=_send_purge,
+            index=engines,
         )
     finally:
+        await engines.aclose()
         await engine.dispose()
 
 
@@ -386,6 +409,7 @@ async def _extract(ledger_id: str, workspace_id: str | None) -> None:
                 settings=settings,
                 now=utcnow(),
                 workspace_id=UUID(workspace_id) if workspace_id else None,
+                enqueue_embed=_send_embed,
             )
     finally:
         await engines.aclose()
@@ -407,6 +431,7 @@ async def _extract_failed(ledger_id: str, workspace_id: str | None, code: str) -
             settings=settings,
             now=utcnow(),
             workspace_id=UUID(workspace_id) if workspace_id else None,
+            enqueue_embed=_send_embed,
         )
     finally:
         await engines.aclose()
@@ -492,6 +517,136 @@ async def _requeue_extract() -> int:
 def requeue_unextracted_task() -> int:
     """Re-send extraction for consumed rows still `received` (a lost message)."""
     return asyncio.run(_requeue_extract())
+
+
+# Embeddings (sijil_worker.embed), on the extraction worker (the same Ollama, one at a time):
+# retried like extraction (`is_extract_transient`, `extract_countdown`, EXTRACT_MAX_RETRIES).
+# `embed:pending:<id>` is claimed by every sender and cleared when the run *starts*, not when
+# it ends: a message still queued reads the latest text when it runs, so a second one is
+# skipped, but a change committed while a run is reading must send a new one (it runs next,
+# concurrency 1), or the chunks would keep the older text.
+EMBED_TASK = ("sijil.embed_document", "embedding")
+
+
+async def _send_raw_embed(ledger_id: UUID, workspace_id: UUID) -> None:
+    name, queue = EMBED_TASK
+    current_app.send_task(
+        name,
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue=queue,
+    )
+
+
+async def _with_embed_pending(op: PendingOp) -> None:
+    redis = Redis.from_url(str(ExtractionSettings().redis_url))
+    try:
+        await op(PendingExtractions(redis, prefix=EMBED_PREFIX))
+    finally:
+        await redis.aclose()
+
+
+def _pending_embed_quietly(op: PendingOp) -> None:
+    """Best effort: a key that is not cleared or refreshed only expires (1 h)."""
+    try:
+        asyncio.run(_with_embed_pending(op))
+    except Exception as exc:
+        log.warning("embedding pending key update failed: %s", type(exc).__name__)
+
+
+async def _send_embed(ledger_id: UUID, workspace_id: UUID) -> None:
+    """Sends the embedding unless one is already queued for the document."""
+
+    async def op(pending: PendingExtractions) -> None:
+        await pending.send(_send_raw_embed, ledger_id, workspace_id)
+
+    await _with_embed_pending(op)
+
+
+def embedding_error_code(exc: BaseException) -> str:
+    """The machine code audited with `document.embedding_failed`."""
+    if isinstance(exc, OllamaUnavailable):
+        return "embedding.ai_unavailable"
+    if isinstance(exc, OllamaBadOutput):
+        return "embedding.ai_bad_output"
+    if isinstance(exc, OllamaError):
+        return "embedding.ai_error"
+    return "embedding.error"
+
+
+async def _embed(ledger_id: str, workspace_id: str) -> None:
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
+            await embed_document(
+                UUID(ledger_id),
+                sessions=sessions,
+                index=engines,
+                ollama=ollama,
+                settings=settings,
+                workspace_id=UUID(workspace_id),
+            )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _embed_failed(ledger_id: str, workspace_id: str, code: str) -> None:
+    settings = ExtractionSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        await record_embedding_failed(
+            UUID(ledger_id),
+            code,
+            sessions=make_sessionmaker(engine),
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True,
+    name="sijil.embed_document",
+    queue="embedding",
+    max_retries=EXTRACT_MAX_RETRIES,
+)
+def embed_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """A document's chunks embedded into its workspace's index (see sijil_worker.embed)."""
+    retries = int(self.request.retries or 0)
+    lid = UUID(ledger_id)
+
+    async def clear(pending: PendingExtractions) -> None:
+        await pending.clear(lid)
+
+    _pending_embed_quietly(clear)  # see EMBED_TASK
+    try:
+        asyncio.run(_embed(ledger_id, workspace_id))
+    except Exception as exc:
+        if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
+            countdown = extract_countdown(retries)
+
+            # The retry is queued for the document again: hold its key until it runs.
+            async def refresh(pending: PendingExtractions) -> None:
+                await pending.refresh(lid, int(countdown) + PENDING_MARGIN_S)
+
+            _pending_embed_quietly(refresh)
+            raise self.retry(exc=exc, countdown=countdown) from exc
+        code = embedding_error_code(exc)
+        try:
+            asyncio.run(_embed_failed(ledger_id, workspace_id, code))
+        except Exception as audit_exc:
+            log.error(
+                "embedding failure of document %s not recorded: %s",
+                ledger_id, type(audit_exc).__name__,
+            )  # fmt: skip
+        raise
 
 
 DRIFT_MAX_RETRIES = 5
@@ -590,6 +745,43 @@ def mark_eligible_task() -> int:
     return asyncio.run(_mark_eligible())
 
 
+async def _search_resync(workspace_id: str | None) -> int:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    keys = LocalKeyService(settings.master_key_bytes())
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        return await resync_search(
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id) if workspace_id else None,
+            full=workspace_id is not None,
+            enqueue_embed=_send_embed,
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.search_resync")
+def search_resync_task() -> int:
+    """Daily: bring every active workspace's search rows of this region in step with the
+    ledger (sijil_worker.search)."""
+    return asyncio.run(_search_resync(None))
+
+
+@shared_task(name="sijil.search_backfill")
+def search_backfill_task(workspace_id: str) -> int:
+    """Rebuild every live search row of one workspace, its text fetched from its Paperless
+    again (`sijil-cp search backfill`, `make seed`)."""
+    return asyncio.run(_search_resync(workspace_id))
+
+
 # Mirror of a sealed document's fields into its Paperless: 30 s, 1 min ... capped at 15 min,
 # MIRROR_MAX_RETRIES times. Paperless keeps a copy only; the sealed record is ours already.
 MIRROR_MAX_RETRIES = 8
@@ -633,6 +825,54 @@ def mirror_fields_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str
     except Exception as exc:
         retries = int(self.request.retries or 0)
         if not is_mirror_transient(exc) or retries >= MIRROR_MAX_RETRIES:
+            raise
+        countdown = get_exponential_backoff_interval(
+            factor=MIRROR_BACKOFF_FACTOR_S,
+            retries=retries,
+            maximum=MIRROR_BACKOFF_MAX_S,
+            full_jitter=True,
+        )
+        raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+# Learning a supplier (REC-5): retried like the mirror (`is_mirror_transient`, its backoff),
+# LEARN_MAX_RETRIES times. The record is learnt before Paperless is asked, so a retry only
+# completes the correspondent.
+LEARN_MAX_RETRIES = MIRROR_MAX_RETRIES
+
+
+async def _learn(ledger_id: str, workspace_id: str) -> None:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    keys = LocalKeyService(settings.master_key_bytes())
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, keys, sessions)
+    try:
+        await learn_from_document(
+            UUID(ledger_id),
+            sessions=sessions,
+            keys=keys,
+            index=engines,
+            paperless=PaperlessClient,
+            settings=settings,
+            now=utcnow(),
+            workspace_id=UUID(workspace_id),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(
+    bind=True, name="sijil.learn_from_document", queue="default", max_retries=LEARN_MAX_RETRIES
+)
+def learn_from_document_task(self: "Task[Any, Any]", ledger_id: str, workspace_id: str) -> None:
+    """The supplier a reviewer confirmed or corrected (see sijil_worker.learning)."""
+    try:
+        asyncio.run(_learn(ledger_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if not is_mirror_transient(exc) or retries >= LEARN_MAX_RETRIES:
             raise
         countdown = get_exponential_backoff_interval(
             factor=MIRROR_BACKOFF_FACTOR_S,
@@ -1179,3 +1419,123 @@ def sweep_exports_task() -> tuple[int, int]:
     """Every 300 s: re-send lost exports and fail abandoned builds (sijil_worker.export). Runs
     on the main worker: it reads and updates jobs and sends tasks, and holds no export key."""
     return asyncio.run(_sweep_exports())
+
+
+# Ask (sijil_worker.ask), on the Ask worker: retried like extraction while the model or a
+# database is down (`is_extract_transient`, `extract_countdown`, EXTRACT_MAX_RETRIES); then,
+# or on any final error, the question is `failed` with `ask.unavailable`.
+
+
+async def _answer_question(ask_id: str, workspace_id: str) -> None:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        async with OllamaClient(
+            settings.ollama_url, settings.ai_allowed_hosts, num_thread=settings.ollama_num_thread
+        ) as ollama:
+            await answer_question(
+                UUID(ask_id),
+                sessions=sessions,
+                index=engines,
+                ollama=ollama,
+                settings=settings,
+                workspace_id=UUID(workspace_id),
+                now=utcnow(),
+            )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+async def _ask_failed(ask_id: str, workspace_id: str, code: str) -> None:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        await record_ask_failed(
+            UUID(ask_id),
+            code,
+            sessions=sessions,
+            index=engines,
+            settings=settings,
+            workspace_id=UUID(workspace_id),
+            now=utcnow(),
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(bind=True, name="sijil.answer_question", queue="ask", max_retries=EXTRACT_MAX_RETRIES)
+def answer_question_task(self: "Task[Any, Any]", ask_id: str, workspace_id: str) -> None:
+    """A question about the workspace's archive answered (sijil_worker.ask)."""
+    try:
+        asyncio.run(_answer_question(ask_id, workspace_id))
+    except Exception as exc:
+        retries = int(self.request.retries or 0)
+        if is_extract_transient(exc) and retries < EXTRACT_MAX_RETRIES:
+            raise self.retry(exc=exc, countdown=extract_countdown(retries)) from exc
+        log.error("question %s failed: %s", ask_id, type(exc).__name__)
+        try:
+            asyncio.run(_ask_failed(ask_id, workspace_id, ASK_UNAVAILABLE))
+        except Exception as audit_exc:
+            log.error("question %s failure not recorded: %s", ask_id, type(audit_exc).__name__)
+
+
+async def _expire_asks() -> int:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    try:
+        return await expire_questions(
+            sessions=sessions, index=engines, settings=settings, now=utcnow()
+        )
+    finally:
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.expire_asks", queue="ask")
+def expire_asks_task() -> int:
+    """Daily, on the Ask worker: questions asked more than 90 days ago are deleted."""
+    return asyncio.run(_expire_asks())
+
+
+async def _sweep_asks() -> tuple[int, int]:
+    settings = AskSettings()
+    engine = make_engine(settings.database_url)
+    sessions = make_sessionmaker(engine)
+    engines = IndexEngines(settings, LocalKeyService(settings.master_key_bytes()), sessions)
+    redis = Redis.from_url(str(settings.redis_url))
+
+    async def send(ask_id: UUID, workspace_id: UUID) -> None:
+        current_app.send_task(
+            "sijil.answer_question",
+            kwargs={"ask_id": str(ask_id), "workspace_id": str(workspace_id)},
+            queue="ask",
+        )
+
+    try:
+        return await sweep_questions(
+            sessions=sessions,
+            index=engines,
+            settings=settings,
+            pending=PendingExtractions(redis, prefix=ASK_PREFIX),
+            send=send,
+            now=utcnow(),
+        )
+    finally:
+        await redis.aclose()
+        await engines.aclose()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.sweep_asks", queue="ask")
+def sweep_asks_task() -> tuple[int, int]:
+    """Every 300 s, on the Ask worker: re-send lost questions and fail abandoned ones
+    (sijil_worker.ask.sweep_questions)."""
+    return asyncio.run(_sweep_asks())

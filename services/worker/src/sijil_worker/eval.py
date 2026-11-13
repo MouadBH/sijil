@@ -269,7 +269,7 @@ async def evaluate(
                     if job is None:
                         reason = "not_received"
                     else:
-                        row, _ = await _compute(
+                        row, _, _ = await _compute(
                             job,
                             index=engines,
                             paperless=paperless,

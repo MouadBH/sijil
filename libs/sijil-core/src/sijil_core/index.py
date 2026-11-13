@@ -6,8 +6,16 @@ by a role of the same name. The control plane and the ledger never hold values, 
 A row of `document_fields` is frozen once sealed, at the database level (trigger
 `document_fields_frozen`): the error message carries the machine code `retention.locked`, which
 this module raises as `RetentionLocked` so callers can answer 409. `extraction_run` is evidence
-of what each model run said and is append-only, like `correction_note` (v2). The one DELETE
-the triggers allow is `purge_document`'s.
+of what each model run said and is append-only, like `correction_note` (v2). The search index
+(v3, `sijil_core.search_index`: `search_doc`, `document_tag`) may change but never be deleted
+from. The one DELETE the triggers allow is `purge_document`'s, but for removing a tag (v4: a tag
+is an annotation). Saved views (v4, `saved_view`) are the workspace's, not a document's. A
+document's chunks and their embeddings (v5, `doc_chunk`) are replaced as a whole by
+`replace_chunks` (gate `sijil.reembed`) and deleted by the purge; never updated. Embeddings,
+like every value here, stay in this database. Ask's questions and answers (v6, `ask_query`)
+are not document data: they expire, and the purge deletes those quoting the purged document.
+Supplier records (v7, `supplier`, `sijil_core.suppliers`) are the workspace's knowledge, learnt
+from reviewers; the purge of the last live document carrying an ICE deletes its record (v8).
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -16,7 +24,7 @@ import asyncio
 import json
 import logging
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal
@@ -39,7 +47,9 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 8
+# bge-m3's dimensions (SIJIL_EMBEDDING_MODEL): `doc_chunk.embedding` is vector(1024).
+EMBEDDING_DIM: Final = 1024
 MAX_ENGINES: Final = 32
 LOCKED_CODE: Final = "retention.locked"
 # SQLSTATE the triggers raise it with (custom class "SJ": Sijil).
@@ -169,6 +179,303 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         PERFORM set_config('sijil.purge_sealed', '', true);
     END $$""",
     ),
+    # v3: the search index (sijil_core.search_index). pg_trgm and unaccent are trusted, so the
+    # index role (the database's owner) creates them here; vector is not, and is already in
+    # every index database (infra/compose/postgres/init.sh, `template_index`), so IF NOT EXISTS
+    # skips it without asking for privileges.
+    3: (
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+        "CREATE EXTENSION IF NOT EXISTS unaccent",
+        "CREATE EXTENSION IF NOT EXISTS vector",
+        # Mirrors sijil_core.text.search_normalise (the tests check they agree), for the invoice
+        # number in `tsv`; the supplier name and the text are normalised in Python into
+        # `supplier_norm` and `content_norm`. NFKC, bidi controls dropped, horizontal space
+        # collapsed, lower case, NFKD with the Latin and Arabic combining marks dropped, tatweel
+        # dropped, alef/yeh/teh marbuta and digits folded. `ß` is the one casefold that `lower`
+        # does not do. `unaccent` is not used: this folding replaces it.
+        r"""CREATE FUNCTION search_normalise(s text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+        SELECT translate(
+            regexp_replace(
+                normalize(
+                    replace(lower(regexp_replace(regexp_replace(normalize(s, NFKC),
+                        '[\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069]', '', 'g'),
+                        '[ \t\u00a0\u202f\u2009]+', ' ', 'g')), U&'\00DF', 'ss'),
+                    NFKD),
+                '[\u0300-\u036f\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06dc\u06df-\u06e4'
+                '\u06e7\u06e8\u06ea-\u06ed]', '', 'g'),
+            'أإآٱىة٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹' || U&'\0640',
+            'اااايه01234567890123456789')
+    $$""",
+        """CREATE TABLE search_doc (
+        ledger_id uuid PRIMARY KEY,
+        state text NOT NULL,
+        ingested_at timestamptz NOT NULL,
+        basis_date date NOT NULL,
+        document_type text,
+        supplier_name text,
+        supplier_ice text,
+        number text,
+        total_ht numeric(14, 2),
+        vat numeric(14, 2),
+        total_ttc numeric(14, 2),
+        currency text,
+        corrected text[] NOT NULL DEFAULT '{}',
+        tags text[] NOT NULL DEFAULT '{}',
+        content text NOT NULL DEFAULT '',
+        supplier_norm text NOT NULL DEFAULT '',
+        content_norm text NOT NULL DEFAULT '',
+        tsv tsvector GENERATED ALWAYS AS (
+            setweight(to_tsvector('simple', supplier_norm), 'A')
+            || setweight(to_tsvector('simple', search_normalise(coalesce(number, ''))), 'A')
+            || setweight(to_tsvector('simple', content_norm), 'C')
+        ) STORED,
+        updated_at timestamptz NOT NULL
+    )""",
+        "CREATE INDEX search_doc_tsv ON search_doc USING gin (tsv)",
+        "CREATE INDEX search_doc_supplier_trgm ON search_doc "
+        "USING gin (supplier_norm gin_trgm_ops)",
+        "CREATE INDEX search_doc_content_trgm ON search_doc USING gin (content_norm gin_trgm_ops)",
+        "CREATE INDEX search_doc_basis ON search_doc (basis_date, ledger_id)",
+        "CREATE INDEX search_doc_ttc ON search_doc (total_ttc, ledger_id)",
+        "CREATE INDEX search_doc_state ON search_doc (state)",
+        "CREATE INDEX search_doc_type ON search_doc (document_type)",
+        "CREATE INDEX search_doc_ice ON search_doc (supplier_ice)",
+        "CREATE INDEX search_doc_tags ON search_doc USING gin (tags)",
+        """CREATE TABLE document_tag (
+        ledger_id uuid NOT NULL,
+        tag text NOT NULL CHECK (char_length(tag) BETWEEN 1 AND 50),
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL,
+        PRIMARY KEY (ledger_id, tag)
+    )""",
+        # Rows may change, but leave only through `purge_document`'s gate.
+        """CREATE FUNCTION index_purge_only() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'DELETE'
+           AND current_setting('sijil.purge', true) IS NOT DISTINCT FROM OLD.ledger_id::text THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+    END $$""",
+        *(
+            sql
+            for table in ("search_doc", "document_tag")
+            for sql in (
+                f"""CREATE TRIGGER {table}_purge_only BEFORE DELETE ON {table}
+        FOR EACH ROW EXECUTE FUNCTION index_purge_only()""",
+                f"""CREATE TRIGGER {table}_no_truncate BEFORE TRUNCATE ON {table}
+        FOR EACH STATEMENT EXECUTE FUNCTION index_purge_only()""",
+            )
+        ),
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
+    ),
+    # v4: saved views (`sijil_core.search_query`) and tag removal. A tag is an annotation, not
+    # document data: removing one is a plain DELETE (`search_index.set_tags`), so the purge-only
+    # trigger on `document_tag` goes; TRUNCATE is still refused, and `search_doc` keeps its
+    # gate. The invoice number gets an index for the exact match of a query token. The
+    # snippet's highlight (`ts_headline`, over the text as written) parses with
+    # `sijil_headline`, which drops Latin accents and case, so a query typed without them
+    # still marks its hits; matching itself uses the normalised columns.
+    4: (
+        "DROP TRIGGER document_tag_purge_only ON document_tag",
+        "CREATE TEXT SEARCH CONFIGURATION sijil_headline (COPY = simple)",
+        """ALTER TEXT SEARCH CONFIGURATION sijil_headline ALTER MAPPING FOR asciiword, asciihword,
+        hword_asciipart, word, hword, hword_part, numword, numhword, hword_numpart
+        WITH unaccent, simple""",
+        "CREATE INDEX search_doc_number ON search_doc (number)",
+        """CREATE TABLE saved_view (
+        id uuid PRIMARY KEY,
+        name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 80),
+        filters jsonb NOT NULL,
+        sort text NOT NULL,
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL,
+        updated_at timestamptz NOT NULL
+    )""",
+    ),
+    # v5: a document's chunks and their embeddings (`replace_chunks`, sijil_worker.embed), for
+    # Ask's retrieval by meaning. Never updated: a re-embedding replaces the whole set under the
+    # gate `sijil.reembed` (one ledger id), and the purge deletes them under `sijil.purge`.
+    # Every chunk carries `source_sha256`, the digest of the document's whole chunk input, so
+    # the daily resync can tell chunks made from another input (`chunks_source`).
+    5: (
+        f"""CREATE TABLE doc_chunk (
+        ledger_id uuid NOT NULL,
+        n int NOT NULL CHECK (n >= 0),
+        text text NOT NULL,
+        embedding vector({EMBEDDING_DIM}) NOT NULL,
+        model text NOT NULL,
+        source_sha256 text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (ledger_id, n)
+    )""",
+        "CREATE INDEX doc_chunk_embedding ON doc_chunk USING hnsw (embedding vector_cosine_ops)",
+        """CREATE FUNCTION doc_chunk_gated() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'DELETE'
+           AND (current_setting('sijil.purge', true) IS NOT DISTINCT FROM OLD.ledger_id::text
+                OR current_setting('sijil.reembed', true)
+                   IS NOT DISTINCT FROM OLD.ledger_id::text) THEN
+            RETURN OLD;
+        END IF;
+        RAISE EXCEPTION 'retention.locked' USING ERRCODE = 'SJ001';
+    END $$""",
+        """CREATE TRIGGER doc_chunk_gated BEFORE UPDATE OR DELETE ON doc_chunk
+        FOR EACH ROW EXECUTE FUNCTION doc_chunk_gated()""",
+        """CREATE TRIGGER doc_chunk_no_truncate BEFORE TRUNCATE ON doc_chunk
+        FOR EACH STATEMENT EXECUTE FUNCTION doc_chunk_gated()""",
+        # Writes only for a live search row, which it holds FOR SHARE until the transaction
+        # ends: a removal's mark or a purge then waits, and a document already marked terminal
+        # or purged never gets chunks again. True when the chunks were replaced.
+        """CREATE FUNCTION reembed_document(target uuid, model_name text, source text,
+        texts text[], embeddings text[]) RETURNS boolean
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        IF cardinality(texts) IS DISTINCT FROM cardinality(embeddings) THEN
+            RAISE EXCEPTION 'index.chunks_mismatch' USING ERRCODE = 'SJ003';
+        END IF;
+        PERFORM 1 FROM search_doc
+            WHERE ledger_id = target AND state NOT IN ('removed', 'deleting', 'deleted')
+            FOR SHARE;
+        IF NOT FOUND THEN
+            RETURN false;
+        END IF;
+        PERFORM set_config('sijil.reembed', target::text, true);
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        PERFORM set_config('sijil.reembed', '', true);
+        INSERT INTO doc_chunk (ledger_id, n, text, embedding, model, source_sha256)
+            SELECT target, i - 1, texts[i], CAST(embeddings[i] AS vector), model_name, source
+            FROM generate_subscripts(texts, 1) AS i;
+        RETURN true;
+    END $$""",
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
+    ),
+    # v6: Ask's questions and answers (`sijil_core.ask_store`). Not document data, so no lock
+    # trigger: a daily task deletes questions after 90 days. An answer quotes documents, so the
+    # purge also deletes every answer that cites (`citations`) or counted (`counted`) the
+    # purged document: only its tombstone remains.
+    6: (
+        """CREATE TABLE ask_query (
+        id uuid PRIMARY KEY,
+        question text NOT NULL CHECK (char_length(question) BETWEEN 1 AND 500),
+        locale text NOT NULL CHECK (locale IN ('fr', 'ar', 'en')),
+        state text NOT NULL DEFAULT 'queued'
+            CHECK (state IN ('queued', 'answering', 'answered', 'failed')),
+        intent jsonb,
+        answer_text text,
+        answer_code text,
+        figures jsonb NOT NULL DEFAULT '[]',
+        citations uuid[] NOT NULL DEFAULT '{}',
+        counted uuid[] NOT NULL DEFAULT '{}',
+        excluded jsonb NOT NULL DEFAULT '{}',
+        error_code text,
+        created_by uuid NOT NULL,
+        created_at timestamptz NOT NULL,
+        answered_at timestamptz
+    )""",
+        "CREATE INDEX ask_query_created ON ask_query (created_at)",
+        "CREATE INDEX ask_query_citations ON ask_query USING gin (citations)",
+        "CREATE INDEX ask_query_counted ON ask_query USING gin (counted)",
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM ask_query WHERE citations @> ARRAY[target] OR counted @> ARRAY[target];
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
+    ),
+    # v7: the workspace's supplier records (`sijil_core.suppliers`), one per ICE, learnt when a
+    # reviewer confirms or corrects a supplier. The trigram index is on the normalised name, as
+    # Ask's resolver compares it.
+    7: (
+        """CREATE TABLE supplier (
+        ice text PRIMARY KEY CHECK (ice ~ '^[0-9]{15}$'),
+        name text NOT NULL CHECK (char_length(name) > 0),
+        aliases text[] NOT NULL DEFAULT '{}' CHECK (cardinality(aliases) <= 10),
+        source text NOT NULL CHECK (source IN ('review', 'seal', 'correction')),
+        paperless_correspondent_id int,
+        updated_at timestamptz NOT NULL,
+        updated_by uuid
+    )""",
+        "CREATE INDEX supplier_name_trgm ON supplier "
+        "USING gin (search_normalise(name) gin_trgm_ops)",
+    ),
+    # v8: a record is the knowledge of the documents that carry its ICE, so it lives no longer
+    # than they do: the purge reads every ICE the purged document carried (its search row, its
+    # fields, its correction notes) and deletes the record of each that no other live search
+    # row carries. A mistaken upload leaves no supplier knowledge behind.
+    8: (
+        """CREATE OR REPLACE FUNCTION purge_document(target uuid, sealed boolean) RETURNS void
+    LANGUAGE plpgsql AS $$
+    DECLARE
+        carried text[];
+    BEGIN
+        SELECT array_agg(DISTINCT ice) INTO carried FROM (
+            SELECT supplier_ice AS ice FROM search_doc WHERE ledger_id = target
+            UNION SELECT "values" ->> 'supplier_ice' FROM document_fields WHERE ledger_id = target
+            UNION SELECT value FROM correction_note
+                WHERE ledger_id = target AND field = 'supplier_ice'
+        ) found WHERE ice IS NOT NULL;
+        PERFORM set_config('sijil.purge', target::text, true);
+        IF sealed THEN
+            PERFORM set_config('sijil.purge_sealed', target::text, true);
+        END IF;
+        DELETE FROM ask_query WHERE citations @> ARRAY[target] OR counted @> ARRAY[target];
+        DELETE FROM doc_chunk WHERE ledger_id = target;
+        DELETE FROM document_tag WHERE ledger_id = target;
+        DELETE FROM search_doc WHERE ledger_id = target;
+        DELETE FROM correction_note WHERE ledger_id = target;
+        DELETE FROM extraction_run WHERE ledger_id = target;
+        DELETE FROM document_fields WHERE ledger_id = target;
+        DELETE FROM supplier s WHERE s.ice = ANY(coalesce(carried, '{}'))
+            AND NOT EXISTS (
+                SELECT 1 FROM search_doc d WHERE d.supplier_ice = s.ice
+                  AND d.state NOT IN ('removed', 'deleting', 'deleted')
+            );
+        PERFORM set_config('sijil.purge', '', true);
+        PERFORM set_config('sijil.purge_sealed', '', true);
+    END $$""",
+    ),
 }
 
 
@@ -255,6 +562,17 @@ async def read_fields(conn: AsyncConnection, ledger_id: UUID) -> FieldsRow | Non
     )
     found = result.mappings().first()
     return None if found is None else _row(found)
+
+
+async def read_fields_many(
+    conn: AsyncConnection, ledger_ids: Sequence[UUID]
+) -> dict[UUID, FieldsRow]:
+    """`read_fields` for several documents in one query, by ledger id (absent: no row)."""
+    result = await conn.execute(
+        text(f"SELECT {_COLUMNS} FROM document_fields WHERE ledger_id = ANY(:ids)"),  # noqa: S608
+        {"ids": list(ledger_ids)},
+    )
+    return {row.ledger_id: row for row in map(_row, result.mappings())}
 
 
 async def write_extraction(conn: AsyncConnection, row: FieldsRow) -> None:
@@ -507,6 +825,24 @@ async def read_corrections(conn: AsyncConnection, ledger_id: UUID) -> list[Corre
     return [Correction(**dict(m)) for m in result.mappings()]
 
 
+async def read_corrections_many(
+    conn: AsyncConnection, ledger_ids: Sequence[UUID]
+) -> dict[UUID, list[Correction]]:
+    """`read_corrections` for several documents in one query, by ledger id (absent: none)."""
+    result = await conn.execute(
+        text(
+            "SELECT id, ledger_id, field, value, reason, created_by, created_at "
+            "FROM correction_note WHERE ledger_id = ANY(:ids) "
+            "ORDER BY ledger_id, created_at DESC, id DESC"
+        ),
+        {"ids": list(ledger_ids)},
+    )
+    found: dict[UUID, list[Correction]] = {}
+    for m in result.mappings():
+        found.setdefault(m["ledger_id"], []).append(Correction(**dict(m)))
+    return found
+
+
 def effective_fields(
     row: FieldsRow, corrections: list[Correction]
 ) -> dict[str, tuple[str | None, bool]]:
@@ -523,9 +859,20 @@ def effective_fields(
     return effective
 
 
+async def read_runs(conn: AsyncConnection, ledger_id: UUID) -> list[Mapping[str, Any]]:
+    """What each model run answered for the document (`extraction_run.raw`), oldest first."""
+    result = await conn.execute(
+        text("SELECT raw FROM extraction_run WHERE ledger_id = :id ORDER BY id"),
+        {"id": ledger_id},
+    )
+    return [r for r in (_loads(raw) for raw in result.scalars()) if isinstance(r, Mapping)]
+
+
 async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool = False) -> None:
-    """Deletes the document's `document_fields`, `extraction_run` and `correction_note` rows,
-    all or nothing, through the schema's `purge_document()` function. Idempotent.
+    """Deletes the document's `document_fields`, `extraction_run`, `correction_note`,
+    `search_doc`, `document_tag` and `doc_chunk` rows, the `ask_query` answers citing or
+    counting it, and the `supplier` record of each ICE it carried that no other live search row
+    carries, all or nothing, through the schema's `purge_document()` function. Idempotent.
 
     The index triggers refuse every DELETE but one whose ledger id the GUC `sijil.purge` names,
     which the function sets with `set_config(..., true)` (`SET LOCAL`) and clears again before
@@ -548,6 +895,55 @@ async def purge_document(conn: AsyncConnection, ledger_id: UUID, *, sealed: bool
         if _locked(exc):
             raise RetentionLocked from exc
         raise
+
+
+def _vector_literal(vector: Sequence[float]) -> str:
+    if len(vector) != EMBEDDING_DIM:
+        raise ValueError(f"an embedding has {len(vector)} dimensions, not {EMBEDDING_DIM}")
+    return "[" + ",".join(repr(float(x)) for x in vector) + "]"
+
+
+async def replace_chunks(
+    conn: AsyncConnection,
+    ledger_id: UUID,
+    model: str,
+    chunks: Sequence[tuple[str, Sequence[float]]],
+    *,
+    source_sha256: str,
+) -> bool:
+    """Replaces the document's chunks (text and embedding, numbered from 0 in order) with
+    `chunks`, each row carrying `source_sha256` (the digest of the chunk input they were made
+    from), all or nothing, through the schema's `reembed_document()`: it opens the gate
+    `sijil.reembed` for this ledger id only, deletes, closes it and inserts. One statement, so
+    this holds on an AUTOCOMMIT connection too.
+
+    Writes nothing and returns False unless the document has a live `search_doc` row (none, or
+    one marked removed, deleting or deleted): a removed or purged document never gets chunks
+    back. An embedding of other than EMBEDDING_DIM dimensions raises ValueError."""
+    literals = [_vector_literal(vector) for _, vector in chunks]
+    result = await conn.execute(
+        text(
+            "SELECT reembed_document(CAST(:id AS uuid), :model, :source, "
+            "CAST(:texts AS text[]), CAST(:embeddings AS text[]))"
+        ),
+        {
+            "id": ledger_id,
+            "model": model,
+            "source": source_sha256,
+            "texts": [t for t, _ in chunks],
+            "embeddings": literals,
+        },
+    )
+    return bool(result.scalar())
+
+
+async def chunks_source(conn: AsyncConnection, ledger_id: UUID) -> str | None:
+    """The `source_sha256` the document's chunks were made from; None when it has none."""
+    result = await conn.execute(
+        text("SELECT source_sha256 FROM doc_chunk WHERE ledger_id = :id ORDER BY n LIMIT 1"),
+        {"id": ledger_id},
+    )
+    return result.scalar()
 
 
 async def find_possible_duplicates(

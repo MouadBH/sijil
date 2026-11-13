@@ -38,6 +38,7 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
+from tests.support.polling import poll_get
 
 CP_URL = os.environ.get("SIJIL_IT_CP_URL", "http://control-plane:8000")
 SMTP_HOST = os.environ.get("SIJIL_IT_SMTP_HOST", "smtp")
@@ -166,7 +167,7 @@ async def seed(
 
             deadline = time.monotonic() + PROVISION_BUDGET_S
             while True:
-                r = await http.get(f"/v1/workspaces/{workspace_id}")
+                r = await poll_get(http, f"/v1/workspaces/{workspace_id}")
                 r.raise_for_status()
                 info = r.json()
                 if info["state"] == WorkspaceState.active:

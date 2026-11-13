@@ -1,4 +1,5 @@
-"""Client for the in-region Ollama: the only place document text is sent for AI.
+"""Client for the in-region Ollama: the only place document text is sent for AI (extraction's
+structured chat, and the embeddings of a document's chunks).
 
 The base URL's host must be on an allow-list (`SIJIL_AI_ALLOWED_HOSTS`, the compose `ollama`
 service by default), checked when the client is built, and proxies from the environment are
@@ -216,3 +217,31 @@ class OllamaClient:
         if missing:
             raise OllamaBadOutput("ai.bad_output: required key missing", raw=content)
         return parsed
+
+    async def embed(self, model: str, inputs: list[str]) -> list[list[float]]:
+        """One vector per input, in order (`/api/embed`; an input longer than the model's
+        context is truncated). No inputs, no request.
+
+        Raises OllamaUnavailable (transient), OllamaBadOutput (not one non-empty list of
+        numbers per input) or OllamaError (anything else), as `chat_json` does.
+        """
+        if not inputs:
+            return []
+        body: dict[str, Any] = {"model": model, "input": list(inputs), "truncate": True}
+        if self._num_thread is not None:
+            body["options"] = {"num_thread": self._num_thread}
+        response = await self._request("POST", "/api/embed", json=body)
+        try:
+            embeddings = response.json()["embeddings"]
+        except (ValueError, KeyError, TypeError):
+            raise OllamaBadOutput("ai.bad_output: no embeddings") from None
+        if not isinstance(embeddings, list) or len(embeddings) != len(inputs):
+            raise OllamaBadOutput("ai.bad_output: embeddings do not match the inputs")
+        vectors: list[list[float]] = []
+        for vector in embeddings:
+            if not isinstance(vector, list) or not vector:
+                raise OllamaBadOutput("ai.bad_output: not a vector")
+            if not all(isinstance(x, int | float) and not isinstance(x, bool) for x in vector):
+                raise OllamaBadOutput("ai.bad_output: not a vector")
+            vectors.append([float(x) for x in vector])
+        return vectors

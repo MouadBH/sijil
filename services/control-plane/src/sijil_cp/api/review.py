@@ -15,7 +15,10 @@ completes exactly once when it is called again:
    final`, the later of its retention and the fiscal year of `retention_basis`, never lowered:
    ruling P1) and `document.sealed` audited, in one transaction;
 4. after the commit, `sijil.lock_sealed` to the seal worker (queue `seal`), which switches the
-   original to COMPLIANCE at the committed `retention_until`, and `sijil.mirror_fields`.
+   original to COMPLIANCE at the committed `retention_until`, `sijil.mirror_fields`,
+   `sijil.embed_document` (the extraction worker, queue `embedding`) and
+   `sijil.learn_from_document` (the supplier the seal confirms, REC-5).
+The search row (`sijil_core.search_index`) becomes `sealed` in step 2's transaction.
 
 Until the seal worker has locked it, the original stays under its GOVERNANCE lock at the
 provisional date: the app key this service holds can neither delete nor shorten it (only the
@@ -25,8 +28,10 @@ bound that window.
 
 A field edit holds the same ledger lock; it commits its `document.fields_edited` event first and
 its index write after (an applied edit is always audited; an index failure then answers 503
-`field.update_failed`). A seal racing it either seals the values it locked, with their digest,
-or gets `seal.fields_changed`.
+`field.update_failed`). The index write includes the search row, so search shows the edit as
+soon as the request answers. A seal racing it either seals the values it locked, with their digest,
+or gets `seal.fields_changed`. An applied edit of the supplier's name or ICE then sends
+`sijil.learn_from_document` (`send_learning`).
 """
 
 import asyncio
@@ -59,8 +64,9 @@ from sijil_core.db.models import (
 )
 from sijil_core.fields import FIELD_NAMES, REQUIRED_BY_TYPE, fields_digest, parse_field
 from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLocked
-from sijil_core.pending import LOCK_PREFIX, PENDING_TTL_S, pending_key
+from sijil_core.pending import EMBED_PREFIX, LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
+from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
@@ -88,6 +94,8 @@ DB_UNAVAILABLE: Final = "seal.db_unavailable"
 SEAL_FAILED: Final = "seal.failed"
 UPDATE_FAILED: Final = "field.update_failed"
 REVIEWABLE: Final = frozenset({DocumentState.filed, DocumentState.needs_review})
+# An edit or a correction of one of these teaches the workspace its supplier (REC-5).
+SUPPLIER_FIELDS: Final = frozenset({"supplier_name", "supplier_ice"})
 DEFAULT_LIMIT: Final = 50
 MAX_LIMIT: Final = 100
 SEAL_BATCH_LIMIT = 500
@@ -382,6 +390,12 @@ async def edit_fields(
             raise ApiError(SEAL_UNFINISHED, 409) from None
         except LookupError:
             raise ApiError(NOT_REVIEWABLE, 409) from None
+        try:
+            await refresh_search_doc(conn, _search_facts(request, ledger, ledger.state, now))
+        except Exception as exc:
+            # Nothing applied: the index transaction rolls back with the edit.
+            log.warning("field edit of document %s not applied: %s", doc_id, type(exc).__name__)
+            raise ApiError(UPDATE_FAILED, 503) from None
         await audit.append(
             db,
             workspace_id=workspace.id,
@@ -405,7 +419,23 @@ async def edit_fields(
             # A logged edit attempt that did not apply: acceptable, and said so.
             log.warning("field edit of document %s not applied: %s", doc_id, type(exc).__name__)
             raise ApiError(UPDATE_FAILED, 503) from None
+    if SUPPLIER_FIELDS & set(names):
+        await send_learning(request, ledger.id, workspace.id)
     return _full(ledger, row)
+
+
+def _search_facts(
+    request: Request, ledger: DocumentLedger, state: DocumentState, now: datetime
+) -> SearchLedgerFacts:
+    """The ledger facts of the document's search row (the region is this service's, which
+    `require_workspace` checked against the workspace's)."""
+    return SearchLedgerFacts(
+        ledger_id=ledger.id,
+        state=state,
+        ingested_at=ledger.ingested_at,
+        region=request.app.state.settings.region,
+        now=now,
+    )
 
 
 async def _commit_index(trans: AsyncTransaction) -> None:
@@ -468,15 +498,23 @@ async def _seal_locked(db: AsyncSession, sealer: _Sealer, ledger: DocumentLedger
     if row.sealed_at is not None and row.fields_sha256 != digest:
         raise ApiError(LOCKED, 409)
     final = await _final_retention(db, ledger, row, sealer)
-    # The index row frozen, in its own committed transaction. The digest is recomputed from the
-    # row it locks, so values that changed since the read above are refused, never sealed
-    # under a stale hash. On a retry it is already sealed with this hash: its stored
-    # `sealed_at` is the one the ledger gets.
+    # The index row frozen and the search row `sealed`, in their own committed transaction. The
+    # digest is recomputed from the row it locks, so values that changed since the read above
+    # are refused, never sealed under a stale hash. On a retry it is already sealed with this
+    # hash: its stored `sealed_at` is the one the ledger gets.
     try:
         async with sealer.engine.begin() as conn:
             frozen = await index_db.seal_fields(
                 conn, ledger.id, fields_sha256=digest, sealed_at=sealer.now
             )
+            facts = SearchLedgerFacts(
+                ledger_id=ledger.id,
+                state=DocumentState.sealed,
+                ingested_at=ledger.ingested_at,
+                region=sealer.region,
+                now=sealer.now,
+            )
+            await refresh_search_doc(conn, facts)
     except FieldsChanged:
         raise ApiError(CHANGED, 409) from None
     except RetentionLocked:
@@ -510,37 +548,63 @@ async def _after_commit(request: Request, ledger_id: UUID, workspace_id: UUID) -
     `requeue_unlocked` sweep (and flagged by the drift check after an hour); a lost mirror
     only delays Paperless's copy."""
     enqueuer = get_enqueuer(request)
-    if await _claim_lock(request, ledger_id):
+    if await _claim(request, ledger_id, LOCK_PREFIX):
         try:
             await asyncio.to_thread(enqueuer.send_lock, ledger_id, workspace_id)
         except Exception as exc:  # noqa: BLE001 - the broker being down must not undo a seal
             log.warning("lock enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
-            await _release_lock(request, ledger_id)
+            await _release(request, ledger_id, LOCK_PREFIX)
     try:
         await asyncio.to_thread(enqueuer.send_mirror, ledger_id, workspace_id)
     except Exception as exc:  # noqa: BLE001
         log.warning("mirror enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+    await send_embedding(request, ledger_id, workspace_id)
+    await send_learning(request, ledger_id, workspace_id)
 
 
-async def _claim_lock(request: Request, ledger_id: UUID) -> bool:
-    """`lock:pending:<id>`, the key the seal worker clears and the sweep honours, so this
-    message and a sweep re-send never run together. False when one is already in flight. A
-    broker Redis that cannot answer does not stop the send (the worker is idempotent)."""
+async def send_learning(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
+    """After a commit that confirmed or corrected the document's supplier (an edit, a seal, a
+    correction note): `sijil.learn_from_document`, which reads the effective values. Best
+    effort: a lost message leaves the supplier to be learnt at the document's next edit."""
+    try:
+        await asyncio.to_thread(get_enqueuer(request).send_learn, ledger_id, workspace_id)
+    except Exception as exc:  # noqa: BLE001 - the broker being down must not fail the request
+        log.warning("learning enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+
+
+async def send_embedding(request: Request, ledger_id: UUID, workspace_id: UUID) -> None:
+    """After a commit that changed what the document's search row holds (seal, correction):
+    `sijil.embed_document`, unless one is still queued (`embed:pending:<id>`), which will read
+    the new row when it runs. Best effort: a lost message leaves the older chunks in place."""
+    if not await _claim(request, ledger_id, EMBED_PREFIX):
+        return
+    try:
+        await asyncio.to_thread(get_enqueuer(request).send_embed, ledger_id, workspace_id)
+    except Exception as exc:  # noqa: BLE001 - the broker being down must not fail the request
+        log.warning("embedding enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
+        await _release(request, ledger_id, EMBED_PREFIX)
+
+
+async def _claim(request: Request, ledger_id: UUID, prefix: str) -> bool:
+    """`<prefix>:pending:<id>`, the key the worker clears and the sweeps honour, so this
+    message and another send never run together (`lock`: the seal worker; `embed`: the
+    extraction worker). False when one is already in flight. A broker Redis that cannot answer
+    does not stop the send (the workers are idempotent)."""
     try:
         claimed = await request.app.state.redis.set(
-            pending_key(ledger_id, LOCK_PREFIX), "1", nx=True, ex=PENDING_TTL_S
+            pending_key(ledger_id, prefix), "1", nx=True, ex=PENDING_TTL_S
         )
     except Exception as exc:  # noqa: BLE001
-        log.warning("lock claim of document %s failed: %s", ledger_id, type(exc).__name__)
+        log.warning("%s claim of document %s failed: %s", prefix, ledger_id, type(exc).__name__)
         return True
     return bool(claimed)
 
 
-async def _release_lock(request: Request, ledger_id: UUID) -> None:
+async def _release(request: Request, ledger_id: UUID, prefix: str) -> None:
     try:
-        await request.app.state.redis.delete(pending_key(ledger_id, LOCK_PREFIX))
+        await request.app.state.redis.delete(pending_key(ledger_id, prefix))
     except Exception as exc:  # noqa: BLE001 - it expires anyway
-        log.warning("lock release of document %s failed: %s", ledger_id, type(exc).__name__)
+        log.warning("%s release of document %s failed: %s", prefix, ledger_id, type(exc).__name__)
 
 
 async def _sealer(

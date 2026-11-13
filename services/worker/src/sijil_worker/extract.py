@@ -7,12 +7,24 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
 1. reads the text Paperless extracted (never the PDF's own text layer, ruling P4), normalises
    it and keeps the first 12,000 characters; empty text is flagged `no_text`;
 2. asks Ollama twice (run A: PROMPT_A, seed 1; run B: PROMPT_B, seed 2) for the fields, as a
-   JSON object constrained by `extraction_schema()`;
+   JSON object constrained by `extraction_schema()`. Each 15-digit token of the text that is
+   the ICE of a workspace supplier record (`sijil_core.suppliers`, REC-5) adds a line
+   `Known company in this workspace: <name> (ICE <ice>)` to both prompts (`hint_lines`: at
+   most MAX_HINTS, each name stripped of control characters and cut at HINT_NAME_CHARS, since
+   a reviewer or a document wrote it). A company, not a supplier: the ICE may be the client's.
+   Never the workspace's own ICE (`suppliers.own_ices`, final review I2): the client of
+   every purchase invoice;
 3. parses each run's values into canonical strings (`sijil_core.fields`), keeping run A's
-   value, or run B's where run A has none;
+   value, or run B's where run A has none. A kept ICE with a supplier record takes the
+   record's name (source `supplier_record`); unless a run's own name matches the record's
+   name or an alias (`confidence.names_match`), the row is flagged `supplier_mismatch` (to
+   review: the ICE may be another company's, such as the client's). A kept ICE that is the
+   workspace's own takes no record or sealed name and is flagged `supplier_own_ice`, which
+   blocks filing as `supplier_mismatch` does;
 4. records per-field signals (`sijil_core.confidence.compute_signals`: the runs agreeing,
    Paperless's own regex match for the type, the value in the text, the supplier already
-   known for the ICE, the date, VAT and totals checks) and the scores they give;
+   known for the ICE (its record, else the last sealed name), the date, VAT and totals checks)
+   and the scores they give;
 5. writes both runs (`extraction_run`) and the result (`document_fields`) to the workspace's
    index database in one transaction, then audits `document.extracted` (field values never
    enter the audit log, ruling P5);
@@ -22,7 +34,10 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
    `retention_until` to the fiscal date (the object lock first, then the ledger; never lower,
    ruling P1); audit `document.filed` / `document.needs_review`. Only a row still `received`
    moves, so it is routed once;
-7. after the commit, best effort, names the document in its own Paperless (title and type).
+7. after the commit, best effort, writes its search row (`sijil_worker.search.index_document`:
+   the routed state, the fields and the whole normalised text, when this run read it), sends
+   its embedding (`sijil.embed_document`, sijil_worker.embed) and names the document in its
+   own Paperless (title and type).
 
 An `unsupported` row has no Paperless document: it gets an empty fields row flagged
 `ingest.unsupported_format` and goes straight to review, with no extraction.
@@ -40,7 +55,9 @@ run routes the stored row.
 """
 
 import logging
-from collections.abc import Callable, Mapping
+import re
+import unicodedata
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Final, Literal, Protocol
@@ -50,9 +67,11 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
-from sijil_core import audit
+from sijil_core import audit, suppliers
 from sijil_core import index as index_db
 from sijil_core.confidence import (
+    OWN_ICE,
+    SUPPLIER_MISMATCH,
     Decision,
     compute_signals,
     kept,
@@ -88,9 +107,11 @@ from sijil_core.retention import (
     retention_basis,
 )
 from sijil_core.storage import ObjectRef
-from sijil_core.text import normalise
+from sijil_core.suppliers import Supplier
+from sijil_core.text import normalise, search_normalise
 from sijil_worker.ingest import UNSUPPORTED, MissingCredential, WorkspaceNotActive
 from sijil_worker.pending import PendingExtractions
+from sijil_worker.search import index_document
 from sijil_worker.settings import ExtractionSettings
 from sijil_worker.taxonomy import ensure_taxonomy
 
@@ -105,6 +126,10 @@ BAD_OUTPUT: Final = "extraction.ai_bad_output"
 POSSIBLE_DUPLICATE: Final = "possible_duplicate"
 RETENTION_EXTEND_FAILED: Final = "retention.extend_failed"
 _RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
+SUPPLIER_RECORD: Final = "supplier_record"  # the source of a name taken from the record
+MAX_HINTS: Final = 5
+HINT_NAME_CHARS: Final = 120
+_ICE_TOKEN: Final = re.compile(r"(?<![0-9])[0-9]{15}(?![0-9])")
 REQUEUE_AFTER: Final = timedelta(minutes=15)
 REQUEUE_BATCH: Final = 50  # sends per sweep run
 REQUEUE_SCAN: Final = 500  # rows looked at per sweep run (in-flight ones are skipped)
@@ -212,6 +237,54 @@ Keys:
 
 def _user_message(content: str) -> str:
     return f"Document text:\n<<<\n{content}\n>>>"
+
+
+def ice_tokens(content: str) -> list[str]:
+    """The distinct 15-digit tokens of the text (Arabic-Indic digits folded), in order."""
+    return list(dict.fromkeys(_ICE_TOKEN.findall(search_normalise(content))))
+
+
+def _hint_name(name: str) -> str:
+    """Untrusted text inside the prompt: line and paragraph breaks become spaces, every other
+    control or format character (bidi overrides, escapes) goes, spaces collapse, and the name is
+    cut at HINT_NAME_CHARS."""
+    kept = []
+    for c in name:
+        category = unicodedata.category(c)
+        if c.isspace() or category in ("Zl", "Zp"):
+            kept.append(" ")
+        elif category[0] != "C":
+            kept.append(c)
+    return " ".join("".join(kept).split())[:HINT_NAME_CHARS].rstrip()
+
+
+def hint_lines(known: Sequence[Supplier]) -> list[str]:
+    """One line per supplier record (in the given order), at most MAX_HINTS; a name with
+    nothing left once sanitised gives none."""
+    lines = []
+    for supplier in known:
+        name = _hint_name(supplier.name)
+        if name:
+            lines.append(f"Known company in this workspace: {name} (ICE {supplier.ice})")
+    return lines[:MAX_HINTS]
+
+
+def _with_hints(prompt: str, hints: Sequence[str]) -> str:
+    return prompt + "\n" + "".join(f"{line}\n" for line in hints) if hints else prompt
+
+
+async def _known_in_text(
+    index: IndexEngines, workspace: Workspace, content: str
+) -> tuple[list[Supplier], frozenset[str]]:
+    """The supplier records whose ICE the text carries, in the order the text gives them, but
+    the workspace's own; and which of the text's ICEs are its own (`suppliers.own_ices`)."""
+    ices = ice_tokens(content)
+    if not ices:
+        return [], frozenset()
+    async with (await index.engine(workspace)).connect() as conn:
+        own = await suppliers.own_ices(conn, ices)
+        found = {s.ice: s for s in await suppliers.find(conn, ices)}
+    return [found[ice] for ice in ices if ice in found and ice not in own], own
 
 
 @dataclass(frozen=True)
@@ -453,20 +526,27 @@ async def _compute(
     ollama: OllamaClient,
     model: str,
     now: datetime,
-) -> tuple[FieldsRow, list[tuple[RunName, _Run]]]:
-    """Reads the content and runs the model twice; returns the row and the runs to record.
-    Writes nothing (the index is only read, for the known supplier): see `_write_once`."""
+) -> tuple[FieldsRow, list[tuple[RunName, _Run]], str]:
+    """Reads the content and runs the model twice; returns the row, the runs to record and the
+    whole normalised text (for search; the model gets its first MAX_CONTENT_CHARS).
+    Writes nothing (the index is only read, for the hints and the known supplier): see
+    `_write_once`."""
     if job.doc_id is None or job.paperless_url is None:
         raise ValueError("no Paperless document to extract")
     async with paperless(job.paperless_url, token=job.token) as client:
-        content = normalise(await client.document_content(job.doc_id))[:MAX_CONTENT_CHARS]
+        text_all = normalise(await client.document_content(job.doc_id))
+        content = text_all[:MAX_CONTENT_CHARS]
         runs: list[tuple[RunName, _Run]] = []
         paperless_type: str | None = None
+        own: frozenset[str] = frozenset()  # the workspace's own ICEs, asked once per run
         if content.strip():
             # Paperless first: a failure there is retried before any model time is spent.
             paperless_type = await _paperless_type(client, job.doc_id)
-            runs.append(("a", await _ask(ollama, model, PROMPT_A, content, SEED_A)))
-            runs.append(("b", await _ask(ollama, model, PROMPT_B, content, SEED_B)))
+            printed, own = await _known_in_text(index, job.workspace, content)
+            hints = hint_lines(printed)
+            prompt_a, prompt_b = _with_hints(PROMPT_A, hints), _with_hints(PROMPT_B, hints)
+            runs.append(("a", await _ask(ollama, model, prompt_a, content, SEED_A)))
+            runs.append(("b", await _ask(ollama, model, prompt_b, content, SEED_B)))
 
     values_a = runs[0][1].values if runs else None
     values_b = runs[1][1].values if runs else None
@@ -476,9 +556,23 @@ async def _compute(
         flags = (NO_TEXT,)
     elif values_a is None and values_b is None:
         flags = (EXTRACTION_FAILED, BAD_OUTPUT)
-    async with (await index.engine(job.workspace)).connect() as conn:
-        ice = values["supplier_ice"]
-        known = None if ice is None else await index_db.known_supplier(conn, ice)
+    known: str | None = None
+    record: Supplier | None = None
+    ice = values["supplier_ice"]
+    if ice is not None:
+        async with (await index.engine(job.workspace)).connect() as conn:
+            if ice not in ice_tokens(content):  # not printed as such: not asked above
+                own = own | await suppliers.own_ices(conn, [ice])
+            if ice in own:
+                flags = (*flags, OWN_ICE)
+            else:
+                record = await suppliers.get(conn, ice)
+                if record is None:
+                    known = await index_db.known_supplier(conn, ice)
+    source = dict.fromkeys(FIELD_NAMES, "extraction")
+    if record is not None:
+        values["supplier_name"] = record.name
+        source["supplier_name"] = SUPPLIER_RECORD
     signals = compute_signals(
         values_a,
         values_b,
@@ -486,7 +580,10 @@ async def _compute(
         paperless_type=paperless_type,
         known_supplier=known,
         today=region_local_date(now, job.region),
+        supplier_record=None if record is None else (record.name, *record.aliases),
     )
+    if record is not None and signals["supplier_name"]["supplier_known"] is False:
+        flags = (*flags, SUPPLIER_MISMATCH)
     row = FieldsRow(
         ledger_id=job.ledger_id,
         document_type=values["document_type"],
@@ -494,12 +591,12 @@ async def _compute(
         confidence=scores(signals),
         signals=signals,
         flags=flags,
-        source=dict.fromkeys(FIELD_NAMES, "extraction"),
+        source=source,
         model=model,
         extracted_at=now,
         updated_at=now,
     )
-    return row, runs
+    return row, runs, text_all
 
 
 async def _extract(
@@ -510,13 +607,13 @@ async def _extract(
     ollama: OllamaClient,
     model: str,
     now: datetime,
-) -> FieldsRow:
-    """Computes the row (`_compute`) and writes it; returns the stored row."""
-    row, runs = await _compute(
+) -> tuple[FieldsRow, str]:
+    """Computes the row (`_compute`) and writes it; returns the stored row and the text."""
+    row, runs, content = await _compute(
         job, index=index, paperless=paperless, ollama=ollama, model=model, now=now
     )
     async with (await index.engine(job.workspace)).begin() as conn:
-        return await _write_once(conn, row, runs)
+        return await _write_once(conn, row, runs), content
 
 
 async def _unsupported_row(index: IndexEngines, job: _Job, now: datetime) -> FieldsRow:
@@ -688,12 +785,14 @@ async def extract_document(
     settings: ExtractionSettings,
     now: datetime,
     workspace_id: UUID | None = None,
+    enqueue_embed: Enqueue | None = None,
 ) -> None:
     """See the module docstring. Raises OllamaUnavailable / PaperlessUnavailable (transient)
     for the caller to retry; any other exception is final for the caller."""
     job = await _load(sessions, keys, settings, ledger_id, workspace_id)
     if job is None:
         return
+    content: str | None = None
     if job.unsupported:
         row = await _unsupported_row(index, job, now)
     else:
@@ -702,19 +801,39 @@ async def extract_document(
         stored = await _stored_row(index, job.workspace, ledger_id)
         if stored is None and await _ingest_in_progress(sessions, job.workspace.id, ledger_id, now):
             raise IngestInProgress
-        row = stored or await _extract(
-            job,
-            index=index,
-            paperless=paperless,
-            ollama=ollama,
-            model=settings.extraction_model,
-            now=now,
-        )
+        if stored is not None:
+            row = stored
+        else:
+            row, content = await _extract(
+                job,
+                index=index,
+                paperless=paperless,
+                ollama=ollama,
+                model=settings.extraction_model,
+                now=now,
+            )
         # 2. Make sure it is audited, exactly once.
         await _ensure_audited(sessions, job.workspace.id, ledger_id, row, now)
     # 3. Score and route it, once.
     if await _route(sessions, index, store, job.workspace, row, now) is not None:
+        # The search row follows the routing, after its commit (`content` None, when this run
+        # did not read the text, keeps what the row holds), then its embedding, from that row.
+        await index_document(
+            sessions, index, ledger_id, settings=settings, now=now, content=content
+        )
+        await _send_embed(enqueue_embed, ledger_id, job.workspace.id)
         await _name_in_paperless(job, paperless, row)
+
+
+async def _send_embed(enqueue_embed: Enqueue | None, ledger_id: UUID, workspace_id: UUID) -> None:
+    """Best effort, after the routing commit: a lost message leaves the document without
+    chunks until its next seal or correction."""
+    if enqueue_embed is None:
+        return
+    try:
+        await enqueue_embed(ledger_id, workspace_id)
+    except Exception as exc:
+        log.warning("embedding enqueue of document %s failed: %s", ledger_id, type(exc).__name__)
 
 
 async def record_extraction_failed(
@@ -727,6 +846,7 @@ async def record_extraction_failed(
     settings: ExtractionSettings,
     now: datetime,
     workspace_id: UUID | None = None,
+    enqueue_embed: Enqueue | None = None,
 ) -> None:
     """Retries ran out (or a final error): flag `extraction_failed` (with `code`), audit it and
     route the document (to review), once.
@@ -771,7 +891,9 @@ async def record_extraction_failed(
     async with (await index.engine(workspace)).begin() as conn:
         row = await _write_once(conn, failed, [])
     await _ensure_audited(sessions, workspace.id, ledger_id, row, now)
-    await _route(sessions, index, store, workspace, row, now, final=True)
+    if await _route(sessions, index, store, workspace, row, now, final=True) is not None:
+        await index_document(sessions, index, ledger_id, settings=settings, now=now)
+        await _send_embed(enqueue_embed, ledger_id, workspace.id)
 
 
 async def requeue_unextracted(

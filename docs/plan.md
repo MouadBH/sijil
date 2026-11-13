@@ -417,6 +417,8 @@ Branch `m4-retention`. Covers **ARC-3, ARC-5**.
 
 Branch `m5-search`. Covers **ARC-1, ARC-2, REC-5**.
 
+**Status: done** (tasks 5.1–5.4 as six tasks; the detailed plan is [docs/superpowers/plans/2026-11-09-m5-search.md](superpowers/plans/2026-11-09-m5-search.md); `test_lock_all_paths` covers tags, search, saved views, Ask and the search and embedding tables; `test_m5_acceptance` in `make itest` with no model; Ask, embeddings and the 100k-row search perf test on the real models in `make acceptance`). **Product-owner decision (2026-11-09):** full-text search runs in our index database (`search_doc`: normalised text, `tsvector` and trigram indexes, one SQL query with the field filters), not in Paperless, which stays the OCR engine and the working copy; this amends SPEC's "Paperless for search" and 5.1's "full text through Paperless" below. Also amended: embeddings are made on `worker-extraction` (queue `embedding`, `bge-m3`) and Ask is answered by its own `worker-ask` (queue `ask`); a tag is an annotation (allowed on a sealed document, removed by a plain DELETE); a learnt supplier whose name a run did not read is the blocking flag `supplier_mismatch`.
+
 | Task | Deliverable | Acceptance tests |
 | --- | --- | --- |
 | 5.1 Search | `POST /v1/workspaces/{id}/search`: full text through Paperless plus field filters (type, supplier, period, amount range, tag, status) from the index DB; saved views CRUD | `test_filter_amount_range`; `test_saved_view_roundtrip`; `test_search_p95_under_500ms_10k_docs` (perf, nightly) |

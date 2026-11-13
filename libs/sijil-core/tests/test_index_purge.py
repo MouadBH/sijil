@@ -187,7 +187,7 @@ async def test_v1_database_upgrades_to_v2(
             await index.append_run(c, ledger_id, "a", "m", {}, NOW)
             await index.ensure_schema(c)
             versions = (await c.execute(text("SELECT version FROM index_schema"))).scalars()
-            assert sorted(versions) == [1, 2] == list(range(1, index.SCHEMA_VERSION + 1))
+            assert sorted(versions) == list(range(1, index.SCHEMA_VERSION + 1))
             await _note(c, ledger_id)
             await index.purge_document(c, ledger_id)
             assert await _counts(c, ledger_id) == EMPTY

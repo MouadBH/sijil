@@ -14,8 +14,13 @@ LOCK_PREFIX: Final = "lock"
 EXTRACT_PREFIX: Final = "extract"
 REMOVE_PREFIX: Final = "remove"
 PURGE_PREFIX: Final = "purge"
+# The control plane claims it before sending `sijil.embed_document` (seal, correction); the
+# worker does after routing.
+EMBED_PREFIX: Final = "embed"
 # Keyed by export job id, not a document: `export:pending:<job_id>`.
 EXPORT_PREFIX: Final = "export"
+# Keyed by question id: `ask:pending:<ask_id>`, claimed by the Ask sweep before a re-send.
+ASK_PREFIX: Final = "ask"
 
 
 def pending_key(ledger_id: UUID, prefix: str = EXTRACT_PREFIX) -> str:
