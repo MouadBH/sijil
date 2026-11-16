@@ -389,6 +389,7 @@ GB = 1024**3
 async def _over_quota(db: AsyncSession, workspace: Workspace) -> None:
     """The org at 150% of the trial's documents (3 000 of 2 000) and storage (7.5 of 5 GB):
     SAMPLE ledger rows ingested now, the first one 7.5 GB."""
+    now = utcnow()
     await db.execute(
         text(
             """
@@ -397,14 +398,14 @@ async def _over_quota(db: AsyncSession, workspace: Workspace) -> None:
                 retention_until, ingested_at)
             SELECT gen_random_uuid(), :ws, md5(n::text || 'a') || md5(n::text || 'b'),
                 md5(n::text), CASE WHEN n = 1 THEN CAST(:big AS bigint) ELSE 10 END, 'pdf',
-                'upload', 'k/' || n, 'v1', 'filed', 'consumed', 0, DATE '2036-12-31', now()
+                'upload', 'k/' || n, 'v1', 'filed', 'consumed', 0, DATE '2036-12-31', :at
             FROM generate_series(1, 3000) AS n
             """
         ),
-        {"ws": workspace.id, "big": 15 * GB // 2},
+        {"ws": workspace.id, "big": 15 * GB // 2, "at": now},
     )
     await db.commit()
-    meter = await billing.meter(db, workspace.org_id, utcnow())
+    meter = await billing.meter(db, workspace.org_id, now)
     assert (meter.quotas["documents"].percent, meter.quotas["storage"].percent) == (150, 150)
 
 

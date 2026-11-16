@@ -1,7 +1,7 @@
 """Plans, the subscription, the usage meter, the user quota and the organisation's ICE (ADM-3)."""
 
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -234,8 +234,11 @@ async def test_active_upgrade_applies_now_and_downgrade_at_renewal(
     assert (r.json()["plan_code"], r.json()["pending_plan_code"]) == ("entreprise", None)
 
 
-async def _fill(db: AsyncSession, workspace_id: UUID, documents: int, big_bytes: int) -> None:
-    """`documents` SAMPLE ledger rows, ingested now, one of them `big_bytes` long."""
+async def _fill(
+    db: AsyncSession, workspace_id: UUID, documents: int, big_bytes: int, at: datetime
+) -> None:
+    """`documents` SAMPLE ledger rows ingested `at` (the request clock: the trial starts on
+    it, and the database's own now() may fall before it), one of them `big_bytes` long."""
     await db.execute(
         text(
             """
@@ -245,18 +248,18 @@ async def _fill(db: AsyncSession, workspace_id: UUID, documents: int, big_bytes:
             SELECT gen_random_uuid(), :ws, md5(n::text || 'a') || md5(n::text || 'b'),
                 md5(n::text), CASE WHEN n = 1 THEN CAST(:big AS bigint) ELSE 10 END, 'pdf',
                 'upload',
-                'k/' || n, 'v1', 'filed', 'consumed', 0, DATE '2036-12-31', now()
+                'k/' || n, 'v1', 'filed', 'consumed', 0, DATE '2036-12-31', :at
             FROM generate_series(1, :count) AS n
             """
         ),
-        {"ws": workspace_id, "big": big_bytes, "count": documents},
+        {"ws": workspace_id, "big": big_bytes, "count": documents, "at": at},
     )
     await db.commit()
 
 
 async def _over_quota(alice: Any, db: AsyncSession, org_id: str, workspace: Workspace) -> None:
     """150% of the trial's documents and storage."""
-    await _fill(db, workspace.id, 3_000, 15 * GB // 2)
+    await _fill(db, workspace.id, 3_000, 15 * GB // 2, alice.clock.now)
     usage = (await alice.client.get(f"/v1/orgs/{org_id}/usage")).json()["quotas"]
     assert (usage["documents"]["percent"], usage["documents"]["level"]) == (150, "over_100")
     assert (usage["storage"]["percent"], usage["storage"]["level"]) == (150, "over_100")
