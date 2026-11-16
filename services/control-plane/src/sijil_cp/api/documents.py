@@ -10,7 +10,7 @@ import asyncio
 import base64
 import binascii
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Annotated, Literal
 from uuid import UUID
@@ -21,7 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 from python_multipart.exceptions import MultipartParseError
 from python_multipart.multipart import MultipartParser, parse_options_header
-from sqlalchemy import select, tuple_
+from sqlalchemy import Select, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import audit, ingest
@@ -44,7 +44,13 @@ from sijil_core.paperless import PaperlessClient, PaperlessDoc, PaperlessError
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, require_workspace
+from sijil_cp.permissions import (
+    Action,
+    WorkspaceContext,
+    ensure_visible,
+    hidden_ids,
+    require_workspace,
+)
 
 if TYPE_CHECKING:
     from python_multipart.multipart import MultipartCallbacks
@@ -222,6 +228,8 @@ PAPERLESS_TIMEOUT_S = 3.0
 PAPERLESS_DEADLINE_S = 6.0
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
+# Rows read per round when a grant hides some (`visible_rows`).
+VISIBLE_BATCH = 200
 # Gone from every list; the document itself answers with its tombstone.
 TOMBSTONES = (DocumentState.removed, DocumentState.deleted)
 
@@ -340,6 +348,31 @@ def _ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+async def visible_rows(
+    request: Request,
+    ctx: WorkspaceContext,
+    db: AsyncSession,
+    page: Callable[[DocumentLedger | None], Select[DocumentLedger]],
+    want: int,
+) -> list[DocumentLedger]:
+    """Up to `want` rows the caller's grant shows, in the order of `page(after)`: the ordered
+    query of the rows after `after` (None: from the start). Hidden rows are skipped, reading
+    further batches until `want` are found or the rows run out."""
+    if ctx.document_types is None:
+        return list((await db.scalars(page(None).limit(want))).all())
+    batch = max(want, VISIBLE_BATCH)
+    found: list[DocumentLedger] = []
+    last: DocumentLedger | None = None
+    while len(found) < want:
+        rows = list((await db.scalars(page(last).limit(batch))).all())
+        hidden = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in rows])
+        found += [r for r in rows if r.id not in hidden]
+        if len(rows) < batch:
+            break
+        last = rows[-1]
+    return found[:want]
+
+
 @router.get("/workspaces/{workspace_id}/documents", response_model=DocumentPage)
 async def list_documents(
     request: Request,
@@ -351,16 +384,18 @@ async def list_documents(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> DocumentPage:
     workspace = ctx.workspace
-    query = select(DocumentLedger).where(
-        DocumentLedger.workspace_id == workspace.id, DocumentLedger.state.not_in(TOMBSTONES)
-    )
-    if cursor is not None:
-        at, last_id = _decode_cursor(cursor)
-        query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) < (at, last_id))
-    query = query.order_by(DocumentLedger.ingested_at.desc(), DocumentLedger.id.desc()).limit(
-        limit + 1
-    )
-    rows = list((await db.scalars(query)).all())
+    start = _decode_cursor(cursor) if cursor is not None else None
+
+    def page(after: DocumentLedger | None) -> Select[DocumentLedger]:
+        query = select(DocumentLedger).where(
+            DocumentLedger.workspace_id == workspace.id, DocumentLedger.state.not_in(TOMBSTONES)
+        )
+        key = (after.ingested_at, after.id) if after is not None else start
+        if key is not None:
+            query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) < key)
+        return query.order_by(DocumentLedger.ingested_at.desc(), DocumentLedger.id.desc())
+
+    rows = await visible_rows(request, ctx, db, page, limit + 1)
     more = len(rows) > limit
     rows = rows[:limit]
     ids = [r.paperless_doc_id for r in rows if r.paperless_doc_id is not None]
@@ -412,6 +447,7 @@ async def get_document(
     )
     if row is None:
         raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, row)
     dead = row.state in TOMBSTONES
     # A tombstone has nothing left in Paperless to ask about.
     ids = [row.paperless_doc_id] if row.paperless_doc_id is not None and not dead else []

@@ -20,7 +20,7 @@ from sqlalchemy import (
     false,
     text,
 )
-from sqlalchemy.dialects.postgresql import CITEXT, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from sijil_core.db.base import Base, utcnow
@@ -244,6 +244,12 @@ class Membership(Base):
         ),
         UniqueConstraint("user_id", "org_id", name="uq_membership_user_org"),
         UniqueConstraint("user_id", "workspace_id", name="uq_membership_user_workspace"),
+        # A grant restricts a Member or a Read-only user only, and names at least one type.
+        CheckConstraint(
+            "document_types IS NULL OR (role IN ('member', 'readonly')"
+            " AND cardinality(document_types) >= 1)",
+            name="document_types_restricted",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -252,6 +258,8 @@ class Membership(Base):
     org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organisation.id"), index=True)
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("workspace.id"), index=True)
     role: Mapped[Role] = mapped_column(_enum(Role))
+    # 0014 (ADM-1): the document types a Member or Read-only user may see; NULL means all.
+    document_types: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
 
 
 class UserSession(Base):

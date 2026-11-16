@@ -5,6 +5,8 @@ and never returns a document in `removed`, `deleting` or `deleted`. Each search 
 `search.performed` `{result_count, filters}`: the names of the filters used, never their values
 or the query text (ruling P5). A body that does not parse, an unknown filter, a terminal status
 or a cursor this API did not make answers 422 `search.query_invalid` with the fields at fault.
+A caller limited to some document types (ADM-1) is searched within them (`granted`): a filter or
+a saved view naming another type finds nothing, and a hidden document's tags answer 404.
 
 Saved views live in the index database too (`saved_view`: their filters are document content).
 Every member who reads documents lists them and saves their own; changing or deleting one
@@ -59,6 +61,7 @@ from sijil_cp.api.review import (
 )
 from sijil_cp.deps import require_totp_compliance
 from sijil_cp.errors import ApiError
+from sijil_cp.permissions import WorkspaceContext, ensure_visible
 
 log = logging.getLogger(__name__)
 
@@ -142,13 +145,28 @@ def _parse[M: BaseModel](model: type[M], raw: bytes, code: str) -> M:
 # Search ---------------------------------------------------------------------------------------
 
 
+async def granted(db: AsyncSession, ctx: WorkspaceContext, filters: SearchFilters) -> SearchFilters:
+    """`filters` limited to the caller's grant: its types, and their own unclassified uploads."""
+    if ctx.document_types is None:
+        return filters
+    own = await db.scalars(
+        select(DocumentLedger.id).where(
+            DocumentLedger.workspace_id == ctx.workspace.id,
+            DocumentLedger.uploaded_by == ctx.user_id,
+            DocumentLedger.state.not_in(TERMINAL_STATES),
+        )
+    )
+    return filters.within(ctx.document_types, frozenset(own))
+
+
 @router.post("/workspaces/{workspace_id}/search", response_model=SearchOut)
 async def search(request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now) -> SearchOut:
     workspace = ctx.workspace
     body = _parse(SearchIn, await request.body(), QUERY_INVALID)
+    filters = await granted(db, ctx, body.filters)
     try:
         async with (await _engines(request).engine(workspace)).connect() as conn:
-            page = await run_search(conn, body.filters, body.sort, body.cursor, body.limit)
+            page = await run_search(conn, filters, body.sort, body.cursor, body.limit)
     except QueryInvalid:
         raise ApiError(QUERY_INVALID, 422, {"fields": ["body.cursor"]}) from None
     await audit.append(
@@ -279,9 +297,11 @@ async def remove_view(
 # Tags -----------------------------------------------------------------------------------------
 
 
-async def _shared_ledger(db: AsyncSession, workspace: Workspace, doc_id: UUID) -> DocumentLedger:
-    """The ledger row, locked FOR SHARE until the caller's transaction ends, and refused 409
-    `document.not_reviewable` when terminal."""
+async def _shared_ledger(
+    db: AsyncSession, workspace: Workspace, doc_id: UUID, request: Request, ctx: WorkspaceContext
+) -> DocumentLedger:
+    """The ledger row, locked FOR SHARE until the caller's transaction ends; 404 when the
+    caller's grant hides it, and refused 409 `document.not_reviewable` when terminal."""
     ledger = await db.scalar(
         select(DocumentLedger)
         .where(DocumentLedger.id == doc_id, DocumentLedger.workspace_id == workspace.id)
@@ -290,6 +310,7 @@ async def _shared_ledger(db: AsyncSession, workspace: Workspace, doc_id: UUID) -
     )
     if ledger is None:
         raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, ledger)
     if ledger.state in TERMINAL_STATES:
         raise ApiError(NOT_REVIEWABLE, 409)
     return ledger
@@ -305,7 +326,7 @@ async def put_tags(
         tags = clean_tags(body.tags)
     except ValueError:
         raise ApiError(TAG_INVALID, 422) from None
-    ledger = await _shared_ledger(db, workspace, doc_id)
+    ledger = await _shared_ledger(db, workspace, doc_id, request, ctx)
     await audit.append(
         db,
         workspace_id=workspace.id,
@@ -320,7 +341,7 @@ async def put_tags(
     )
     await db.commit()
     # Locked again for the index write: a removal committed meanwhile is seen here.
-    ledger = await _shared_ledger(db, workspace, doc_id)
+    ledger = await _shared_ledger(db, workspace, doc_id, request, ctx)
     try:
         async with (await _engines(request).engine(workspace)).begin() as conn:
             await set_tags(conn, ledger.id, tags, by=user.id, now=now)

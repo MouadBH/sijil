@@ -1,16 +1,25 @@
-"""Organisation members. Every change is a step-up action; owners are protected."""
+"""Organisation members. Every change is a step-up action; owners are protected.
+
+A Member or Read-only user may be limited to some document types (`document_types`, ADM-1; null
+for every type): at least one, each from the taxonomy (`sijil_core.fields.DOCUMENT_TYPES`), no
+duplicates, else 422 `members.types_invalid`. An Owner or Admin sees every type: a grant for
+one is 422 `members.types_not_allowed_for_role`, and a change of role to either clears it. A
+change of grant is audited `member.types_changed` `{count}` (null: every type), never the
+types themselves.
+"""
 
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Final
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.models import Membership, Role, User, UserSession
+from sijil_core.fields import DOCUMENT_TYPES
 from sijil_cp.deps import (
     current_session,
     ensure_step_up,
@@ -29,17 +38,24 @@ CurrentUser = Annotated[User, Depends(require_totp_compliance)]
 Session = Annotated[UserSession, Depends(current_session())]
 Now = Annotated[datetime, Depends(get_now)]
 
+TYPES_INVALID: Final = "members.types_invalid"
+TYPES_NOT_ALLOWED: Final = "members.types_not_allowed_for_role"
+# The roles a grant may restrict; any other sees every type.
+RESTRICTABLE: Final = frozenset({Role.member, Role.readonly})
+
 
 class MemberOut(BaseModel):
     user_id: UUID
     email: str
     name: str
     role: Role
+    document_types: list[str] | None
 
 
 class MemberIn(BaseModel):
     email: str = Field(max_length=320)
     role: Role
+    document_types: list[str] | None = None
 
     @field_validator("email")
     @classmethod
@@ -48,11 +64,51 @@ class MemberIn(BaseModel):
 
 
 class RoleIn(BaseModel):
-    role: Role
+    """A new role, a new grant, or both. A grant left out is kept (cleared for an Owner or
+    Admin); null means every type."""
+
+    role: Role | None = None
+    document_types: list[str] | None = None
+
+    @model_validator(mode="after")
+    def _role_or_types(self) -> "RoleIn":
+        if self.role is None and "document_types" not in self.model_fields_set:
+            raise ValueError("a role or document_types is required")
+        return self
 
 
-def _member_out(user: User, role: Role) -> MemberOut:
-    return MemberOut(user_id=user.id, email=user.email, name=user.name, role=role)
+def _member_out(user: User, role: Role, types: list[str] | None) -> MemberOut:
+    return MemberOut(
+        user_id=user.id, email=user.email, name=user.name, role=role, document_types=types
+    )
+
+
+def _grant(role: Role, types: list[str] | None) -> list[str] | None:
+    """The grant to store, sorted; ApiError 422 when `types` is not one for `role`."""
+    if types is None:
+        return None
+    if not types or len(set(types)) != len(types) or not set(types) <= set(DOCUMENT_TYPES):
+        raise ApiError(TYPES_INVALID, 422)
+    if role not in RESTRICTABLE:
+        raise ApiError(TYPES_NOT_ALLOWED, 422)
+    return sorted(types)
+
+
+async def _audit_grant(
+    db: AsyncSession, request: Request, org_id: UUID, actor: User, target: UUID,
+    types: list[str] | None, now: datetime,
+) -> None:  # fmt: skip
+    await audit_org_event(
+        db,
+        request,
+        org_id=org_id,
+        actor=actor,
+        action="member.types_changed",
+        target_type="user",
+        target_id=str(target),
+        data={"count": None if types is None else len(types)},
+        now=now,
+    )
 
 
 async def _lock_owners(db: AsyncSession, org_id: UUID) -> list[Membership]:
@@ -83,12 +139,12 @@ async def list_members(
 ) -> list[MemberOut]:
     await authorize_org(db, user.id, org_id, Action.org_manage_members, request.app.state.settings)
     rows = await db.execute(
-        select(User, Membership.role)
+        select(User, Membership.role, Membership.document_types)
         .join(Membership, Membership.user_id == User.id)
         .where(Membership.org_id == org_id)
         .order_by(User.email)
     )
-    return [_member_out(u, role) for u, role in rows]
+    return [_member_out(u, role, types) for u, role, types in rows]
 
 
 @router.post("/orgs/{org_id}/members", status_code=201)
@@ -106,11 +162,12 @@ async def add_member(
     )
     if body.role == Role.owner and caller_role != Role.owner:
         raise ApiError("member.forbidden_role", 403)
+    types = _grant(body.role, body.document_types)
     ensure_step_up(session, user, now)
     target = await db.scalar(select(User).where(User.email == body.email))
     if target is None:
         raise ApiError("member.user_not_found", 404)
-    db.add(Membership(user_id=target.id, org_id=org_id, role=body.role))
+    db.add(Membership(user_id=target.id, org_id=org_id, role=body.role, document_types=types))
     try:
         await db.flush()
     except IntegrityError:
@@ -127,12 +184,14 @@ async def add_member(
         data={"role": body.role.value},
         now=now,
     )
+    if types is not None:
+        await _audit_grant(db, request, org_id, user, target.id, types, now)
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
         raise ApiError("member.exists", 409) from None
-    return _member_out(target, body.role)
+    return _member_out(target, body.role, types)
 
 
 @router.patch("/orgs/{org_id}/members/{user_id}")
@@ -150,32 +209,41 @@ async def change_role(
         db, user.id, org_id, Action.org_manage_members, request.app.state.settings
     )
     membership = await _target(db, org_id, user_id)
+    role = body.role or membership.role
     # Only owners may create owners or change one: an admin can never escalate or demote them.
-    if caller_role != Role.owner and Role.owner in (body.role, membership.role):
+    if caller_role != Role.owner and Role.owner in (role, membership.role):
         raise ApiError("member.forbidden_role", 403)
+    if "document_types" in body.model_fields_set:
+        types = _grant(role, body.document_types)
+    else:  # kept, unless the new role sees every type
+        types = membership.document_types if role in RESTRICTABLE else None
     ensure_step_up(session, user, now)
-    if membership.role == Role.owner and body.role != Role.owner:
+    if membership.role == Role.owner and role != Role.owner:
         owners = await _lock_owners(db, org_id)
         if len(owners) <= 1:
             raise ApiError("org.last_owner", 409)
-    previous = membership.role
-    membership.role = body.role
-    await audit_org_event(
-        db,
-        request,
-        org_id=org_id,
-        actor=user,
-        action="member.role_changed",
-        target_type="user",
-        target_id=str(user_id),
-        data={"from": previous.value, "to": body.role.value},
-        now=now,
-    )
+    previous, previous_types = membership.role, membership.document_types
+    membership.role = role
+    membership.document_types = types
+    if body.role is not None:
+        await audit_org_event(
+            db,
+            request,
+            org_id=org_id,
+            actor=user,
+            action="member.role_changed",
+            target_type="user",
+            target_id=str(user_id),
+            data={"from": previous.value, "to": role.value},
+            now=now,
+        )
+    if types != previous_types:
+        await _audit_grant(db, request, org_id, user, user_id, types, now)
     await db.commit()
     target = await db.get(User, user_id)
     if target is None:  # unreachable: the membership's foreign key guarantees the user
         raise ApiError("not_found", 404)
-    return _member_out(target, body.role)
+    return _member_out(target, role, types)
 
 
 @router.delete("/orgs/{org_id}/members/{user_id}", status_code=204)

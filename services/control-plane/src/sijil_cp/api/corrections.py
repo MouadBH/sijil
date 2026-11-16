@@ -43,6 +43,7 @@ from sijil_cp.api.review import (
 )
 from sijil_cp.deps import require_totp_compliance
 from sijil_cp.errors import ApiError
+from sijil_cp.permissions import ensure_visible
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +84,7 @@ async def add_correction(
     if not REASON_MIN <= len(reason) <= REASON_MAX:
         raise ApiError(REASON_REQUIRED, 422)
     ledger = await _locked_ledger(db, workspace, doc_id)
+    await ensure_visible(request, ctx, ledger)
     if ledger.state in TERMINAL_STATES:
         raise ApiError(NOT_REVIEWABLE, 409)
     if ledger.sealed_at is None:

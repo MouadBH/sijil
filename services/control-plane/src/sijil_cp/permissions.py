@@ -1,6 +1,15 @@
-"""Who may do what. Roles come from memberships; the matrix maps roles to actions."""
+"""Who may do what. Roles come from memberships; the matrix maps roles to actions.
 
-from collections.abc import Callable, Coroutine
+Document-type grants (ADM-1): a Member or Read-only membership may name the document types it
+sees (`Membership.document_types`, NULL for all). A user's set in a workspace is the union over
+their org-level and workspace-level memberships; any unrestricted one, or a role of Admin or
+higher, means every type (`visible_types`). A restricted user sees a document only when its
+search row's type is in the set, or when it is unclassified and they uploaded it
+(`search_query.grant_allows`). A hidden document answers exactly as one that does not exist
+(`ensure_visible`), after the role check (ruling R3), and lists leave it out (`hidden_ids`).
+"""
+
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Any
@@ -10,8 +19,10 @@ from fastapi import Depends, Request
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sijil_core.db.models import Membership, Organisation, Role, User, Workspace
+from sijil_core.db.models import DocumentLedger, Membership, Organisation, Role, User, Workspace
+from sijil_core.index import IndexEngines
 from sijil_core.region import assert_region
+from sijil_core.search_query import document_types, grant_allows
 from sijil_core.settings import CoreSettings
 from sijil_cp.deps import current_user, get_db
 from sijil_cp.errors import ApiError
@@ -81,6 +92,28 @@ async def effective_role(db: AsyncSession, user_id: UUID, workspace: Workspace) 
     return highest(list(roles))
 
 
+async def visible_types(
+    db: AsyncSession, user_id: UUID, workspace: Workspace
+) -> frozenset[str] | None:
+    """The document types the user sees in the workspace; None for every type. The union over
+    their memberships: an unrestricted one, or a role of Admin or higher, means every type. No
+    membership: none."""
+    rows = (
+        await db.execute(
+            select(Membership.role, Membership.document_types).where(
+                Membership.user_id == user_id,
+                or_(Membership.org_id == workspace.org_id, Membership.workspace_id == workspace.id),
+            )
+        )
+    ).all()
+    types: set[str] = set()
+    for role, granted in rows:
+        if granted is None or role.rank >= Role.admin.rank:
+            return None
+        types.update(granted)
+    return frozenset(types)
+
+
 async def authorize(
     db: AsyncSession,
     user_id: UUID,
@@ -109,6 +142,9 @@ async def authorize(
 class WorkspaceContext:
     workspace: Workspace
     role: Role
+    # The caller's document-type grant (`visible_types`); None: every type.
+    document_types: frozenset[str] | None = None
+    user_id: UUID | None = None
 
 
 def require_workspace(action: Action) -> Callable[..., Coroutine[Any, Any, WorkspaceContext]]:
@@ -124,9 +160,34 @@ def require_workspace(action: Action) -> Callable[..., Coroutine[Any, Any, Works
         if workspace is None:
             raise ApiError("not_found", 404)
         role = await authorize(db, user.id, workspace, action, request.app.state.settings)
-        return WorkspaceContext(workspace, role)
+        types = await visible_types(db, user.id, workspace)
+        return WorkspaceContext(workspace, role, types, user.id)
 
     return dependency
+
+
+async def hidden_ids(
+    request: Request, ctx: WorkspaceContext, docs: Sequence[tuple[UUID, UUID | None]]
+) -> set[UUID]:
+    """The documents of `docs` (ledger id, uploader) the caller's grant hides. Unrestricted
+    callers never touch the index database."""
+    if ctx.document_types is None or not docs:
+        return set()
+    engines: IndexEngines = request.app.state.index
+    async with (await engines.engine(ctx.workspace)).connect() as conn:
+        found = await document_types(conn, [doc_id for doc_id, _ in docs])
+    return {
+        doc_id
+        for doc_id, uploaded_by in docs
+        if not grant_allows(found.get(doc_id), uploaded_by, ctx.user_id, ctx.document_types)
+    }
+
+
+async def ensure_visible(request: Request, ctx: WorkspaceContext, ledger: DocumentLedger) -> None:
+    """404 `document.not_found`, as for a document that does not exist, when the caller's grant
+    hides it."""
+    if await hidden_ids(request, ctx, [(ledger.id, ledger.uploaded_by)]):
+        raise ApiError("document.not_found", 404)
 
 
 async def authorize_org(

@@ -15,7 +15,8 @@ document's chunks and their embeddings (v5, `doc_chunk`) are replaced as a whole
 like every value here, stay in this database. Ask's questions and answers (v6, `ask_query`)
 are not document data: they expire, and the purge deletes those quoting the purged document.
 Supplier records (v7, `supplier`, `sijil_core.suppliers`) are the workspace's knowledge, learnt
-from reviewers; the purge of the last live document carrying an ICE deletes its record (v8).
+from reviewers; the purge of the last live document carrying an ICE deletes its record (v8). A
+question keeps its asker's document-type grant (v9, `ask_query.document_types`).
 
 The DDL is plain SQL, versioned by `SCHEMA_VERSION` and recorded in `index_schema`.
 """
@@ -47,7 +48,7 @@ from sijil_core.settings import CoreSettings
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION: Final = 8
+SCHEMA_VERSION: Final = 9
 # bge-m3's dimensions (SIJIL_EMBEDDING_MODEL): `doc_chunk.embedding` is vector(1024).
 EMBEDDING_DIM: Final = 1024
 MAX_ENGINES: Final = 32
@@ -476,6 +477,9 @@ _DDL: Final[dict[int, tuple[str, ...]]] = {
         PERFORM set_config('sijil.purge_sealed', '', true);
     END $$""",
     ),
+    # v9: the asker's document-type grant (ADM-1), NULL for every type. The Ask worker answers
+    # from those types only: figures, the left-out count, retrieval and citations.
+    9: ("ALTER TABLE ask_query ADD COLUMN document_types text[]",),
 }
 
 

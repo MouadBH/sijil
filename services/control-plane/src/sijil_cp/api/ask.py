@@ -90,6 +90,14 @@ class AskOut(BaseModel):
     error_code: str | None
 
 
+def _covered(record: ask_store.AskRecord, types: frozenset[str] | None) -> bool:
+    """Whether the reader's grant covers the one the answer was computed under (a grant
+    narrowed since the question was asked hides the answer, as an unknown id)."""
+    if types is None:
+        return True
+    return record.document_types is not None and set(record.document_types) <= types
+
+
 @router.post("/workspaces/{workspace_id}/ask", response_model=AskQueued, status_code=202)
 async def ask(request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now) -> AskQueued:
     workspace = ctx.workspace
@@ -105,6 +113,7 @@ async def ask(request: Request, ctx: Reading, user: CurrentUser, db: Db, now: No
             await ask_store.create_ask(
                 conn, ask_id, question=body.question, locale=body.locale, created_by=user.id,
                 now=now,
+                document_types=None if ctx.document_types is None else sorted(ctx.document_types),
             )  # fmt: skip
     except (SQLAlchemyError, OSError) as exc:
         log.warning("question not queued in workspace %s: %s", workspace.id, type(exc).__name__)
@@ -132,6 +141,8 @@ async def answer(ask_id: UUID, request: Request, ctx: Reading, user: CurrentUser
         async with (await _engines(request).engine(ctx.workspace)).connect() as conn:
             record = await ask_store.read_ask(conn, ask_id)
             if record is None or (record.created_by != user.id and ctx.role not in READERS):
+                raise ApiError(NOT_FOUND, 404)
+            if not _covered(record, ctx.document_types):
                 raise ApiError(NOT_FOUND, 404)
             if not await ask_store.answer_is_live(conn, record):
                 raise ApiError(NOT_FOUND, 404)

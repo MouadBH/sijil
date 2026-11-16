@@ -48,7 +48,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import Select, func, select, tuple_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, AsyncTransaction
 
@@ -67,11 +67,17 @@ from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLo
 from sijil_core.pending import EMBED_PREFIX, LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
-from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
+from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone, visible_rows
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, require_workspace
+from sijil_cp.permissions import (
+    Action,
+    WorkspaceContext,
+    ensure_visible,
+    hidden_ids,
+    require_workspace,
+)
 
 log = logging.getLogger(__name__)
 
@@ -274,15 +280,19 @@ async def review_queue(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> ReviewPage:
     workspace = ctx.workspace
-    query = select(DocumentLedger).where(
-        DocumentLedger.workspace_id == workspace.id,
-        DocumentLedger.state == DocumentState.needs_review,
-    )
-    if cursor is not None:
-        at, last_id = _decode_cursor(cursor)
-        query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (at, last_id))
-    query = query.order_by(DocumentLedger.ingested_at, DocumentLedger.id).limit(limit + 1)
-    rows = list((await db.scalars(query)).all())
+    start = _decode_cursor(cursor) if cursor is not None else None
+
+    def page(after: DocumentLedger | None) -> Select[DocumentLedger]:
+        query = select(DocumentLedger).where(
+            DocumentLedger.workspace_id == workspace.id,
+            DocumentLedger.state == DocumentState.needs_review,
+        )
+        key = (after.ingested_at, after.id) if after is not None else start
+        if key is not None:
+            query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > key)
+        return query.order_by(DocumentLedger.ingested_at, DocumentLedger.id)
+
+    rows = await visible_rows(request, ctx, db, page, limit + 1)
     more = len(rows) > limit
     rows = rows[:limit]
     async with (await _engines(request).engine(workspace)).connect() as conn:
@@ -322,6 +332,7 @@ async def get_fields(
     )
     if ledger is None:
         raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, ledger)
     dead = ledger.state in TOMBSTONES
     row: FieldsRow | None = None
     notes: list[index_db.Correction] = []
@@ -375,6 +386,7 @@ async def edit_fields(
 ) -> FieldsOut:
     workspace = ctx.workspace
     ledger = await _locked_ledger(db, workspace, doc_id)
+    await ensure_visible(request, ctx, ledger)
     _refuse_unless_reviewable(ledger)
     values = _parsed(body.fields)
     names = sorted(values)
@@ -635,6 +647,7 @@ async def seal_document(
 ) -> FieldsOut:
     sealer = await _sealer(request, db, ctx.workspace, user, now)
     ledger = await _locked_ledger(db, ctx.workspace, doc_id)
+    await ensure_visible(request, ctx, ledger)
     out = await _seal_locked(db, sealer, ledger)
     await _after_commit(request, ledger.id, sealer.workspace_id)
     return out
@@ -692,7 +705,7 @@ async def seal_batch(
     rows = list(
         (
             await db.execute(
-                select(DocumentLedger.id, DocumentLedger.ingested_at)
+                select(DocumentLedger.id, DocumentLedger.ingested_at, DocumentLedger.uploaded_by)
                 .where(*in_month)
                 .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
                 .limit(SEAL_BATCH_LIMIT)
@@ -700,9 +713,13 @@ async def seal_batch(
         ).all()
     )
     await db.commit()
+    # A document the caller's grant hides is neither sealed, reported nor counted.
+    hidden = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in rows])
     sealed = 0
     skipped: list[Skipped] = []
-    for doc_id, _ in rows:
+    for doc_id, _, _ in rows:
+        if doc_id in hidden:
+            continue
         try:
             ledger = await _locked_ledger(db, workspace, doc_id)
             await _seal_locked(db, sealer, ledger)
@@ -718,9 +735,18 @@ async def seal_batch(
     remaining = 0
     next_cursor: str | None = None
     if rows:
-        last_id, last_at = rows[-1]
+        last_id, last_at, _ = rows[-1]
         after = tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (last_at, last_id)
-        remaining = int(await db.scalar(select(func.count()).where(*in_month, after)) or 0)
+        if ctx.document_types is None:
+            remaining = int(await db.scalar(select(func.count()).where(*in_month, after)) or 0)
+        else:
+            rest = (
+                await db.execute(
+                    select(DocumentLedger.id, DocumentLedger.uploaded_by).where(*in_month, after)
+                )
+            ).all()
+            unseen = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in rest])
+            remaining = len(rest) - len(unseen)
         if remaining:
             next_cursor = _batch_cursor(last_at, last_id)
     return SealBatchOut(
