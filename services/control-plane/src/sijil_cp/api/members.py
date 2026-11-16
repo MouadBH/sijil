@@ -6,6 +6,11 @@ duplicates, else 422 `members.types_invalid`. An Owner or Admin sees every type:
 one is 422 `members.types_not_allowed_for_role`, and a change of role to either clears it. A
 change of grant is audited `member.types_changed` `{count}` (null: every type), never the
 types themselves.
+
+A new user (one with no membership in the org or its workspaces yet) is refused with 409
+`quota.users_exceeded` when the org's standing allows no new user (`sijil_core.billing`: the
+user quota is full, or a quota is exceeded). The org row is locked first, so concurrent
+additions cannot both take the last seat. An addition that reaches a quota warning audits it.
 """
 
 from datetime import datetime
@@ -14,11 +19,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sijil_core.db.models import Membership, Role, User, UserSession
+from sijil_core import billing
+from sijil_core.db.models import Membership, Organisation, Role, User, UserSession, Workspace
 from sijil_core.fields import DOCUMENT_TYPES
 from sijil_cp.deps import (
     current_session,
@@ -111,6 +117,23 @@ async def _audit_grant(
     )
 
 
+async def _ensure_seat(db: AsyncSession, org_id: UUID, user_id: UUID, now: datetime) -> None:
+    """409 `quota.users_exceeded` when `user_id` would be a new user the standing refuses.
+    Locks the org row, so the check holds until the caller's commit."""
+    await db.execute(select(Organisation.id).where(Organisation.id == org_id).with_for_update())
+    workspaces = select(Workspace.id).where(Workspace.org_id == org_id)
+    counted = await db.scalar(
+        select(Membership.id)
+        .where(
+            Membership.user_id == user_id,
+            or_(Membership.org_id == org_id, Membership.workspace_id.in_(workspaces)),
+        )
+        .limit(1)
+    )
+    if counted is None and not (await billing.standing(db, org_id, now)).new_users_allowed:
+        raise ApiError("quota.users_exceeded", 409)
+
+
 async def _lock_owners(db: AsyncSession, org_id: UUID) -> list[Membership]:
     """The org's owner memberships, row-locked so concurrent demotions are serialised."""
     rows = await db.scalars(
@@ -167,12 +190,14 @@ async def add_member(
     target = await db.scalar(select(User).where(User.email == body.email))
     if target is None:
         raise ApiError("member.user_not_found", 404)
+    await _ensure_seat(db, org_id, target.id, now)
     db.add(Membership(user_id=target.id, org_id=org_id, role=body.role, document_types=types))
     try:
         await db.flush()
     except IntegrityError:
         await db.rollback()
         raise ApiError("member.exists", 409) from None
+    await billing.check(db, org_id, now)
     await audit_org_event(
         db,
         request,

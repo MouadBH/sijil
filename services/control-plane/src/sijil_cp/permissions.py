@@ -46,12 +46,21 @@ class Action(StrEnum):
     # Approving the deletion of documents past retention (design §5.4): the Owner's only.
     retention_approve_deletion = "retention_approve_deletion"
     audit_read = "audit_read"
+    # The plan, the subscription and the usage meter (ADM-3): Owners and Admins read them, and
+    # only the Owner chooses the plan.
+    billing_read = "billing_read"
+    billing_manage = "billing_manage"
 
 
 MATRIX: dict[Role, frozenset[Action]] = {
     Role.owner: frozenset(Action),
     Role.admin: frozenset(Action)
-    - {Action.org_update, Action.documents_remove, Action.retention_approve_deletion},
+    - {
+        Action.org_update,
+        Action.documents_remove,
+        Action.retention_approve_deletion,
+        Action.billing_manage,
+    },
     Role.member: frozenset(
         {
             Action.workspace_read,

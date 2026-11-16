@@ -1,9 +1,16 @@
-"""Organisations. Creating one also creates its workspace and queues its provisioning."""
+"""Organisations. Creating one also creates its workspace, starts its trial (`billing.new_trial`)
+and queues its provisioning.
+
+`PATCH /orgs/{id}` accepts the organisation's `ice`: 15 ASCII digits, else 422
+`org.ice_invalid` (it cannot be cleared). It is required to choose a plan, and it is the first
+own-ICE guard of extraction and learning. A change is audited `org.ice_changed` `{ice}`.
+"""
 
 import asyncio
 import logging
+import re
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Final
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request
@@ -12,6 +19,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sijil_core import billing
 from sijil_core.db.models import (
     Job,
     JobKind,
@@ -46,6 +54,7 @@ router = APIRouter(tags=["orgs"], dependencies=[Depends(require_totp_compliance)
 
 # Country → region. A resource's region is fixed when it is created.
 COUNTRY_REGIONS: dict[str, str] = {"MA": "ma-cas"}
+ICE_RE: Final = re.compile(r"^[0-9]{15}$")  # ASCII digits only (no Arabic-Indic, no spaces)
 
 Db = Annotated[AsyncSession, Depends(get_db)]
 CurrentUser = Annotated[User, Depends(require_totp_compliance)]
@@ -59,6 +68,7 @@ class OrgOut(BaseModel):
     region: str
     status: OrgStatus
     require_totp: bool
+    ice: str | None
     role: Role
 
 
@@ -84,6 +94,8 @@ class OrgIn(BaseModel):
 class OrgPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     require_totp: bool | None = None
+    # Checked by the route, so a bad value answers `org.ice_invalid` rather than `validation`.
+    ice: Any = None
     # Accepted only to be refused: the region never changes after creation.
     region: Any = None
 
@@ -112,6 +124,7 @@ def org_out(org: Organisation, role: Role) -> OrgOut:
         region=org.region,
         status=org.status,
         require_totp=org.require_totp,
+        ice=org.ice,
         role=role,
     )
 
@@ -124,6 +137,7 @@ async def create_org(
     db: Db,
     enqueuer: Annotated[Enqueuer, Depends(get_enqueuer)],
     redis: Annotated[Redis, Depends(get_redis)],
+    now: Annotated[datetime, Depends(get_now)],
 ) -> OrgCreated:
     ip = request.client.host if request.client else ""
     key = ratelimit.ip_key("org_create", ip)
@@ -157,6 +171,7 @@ async def create_org(
     db.add(org)
     await db.flush()
     db.add(Membership(user_id=user.id, org_id=org.id, role=Role.owner))
+    db.add(billing.new_trial(org.id, now))
     workspace = new_workspace(org.id, body.name)
     db.add(workspace)
     await db.flush()
@@ -200,6 +215,10 @@ async def patch_org(
     )
     if "region" in body.model_fields_set:
         raise ApiError("org.region_immutable", 409)
+    if "ice" in body.model_fields_set and not (
+        isinstance(body.ice, str) and ICE_RE.fullmatch(body.ice)
+    ):
+        raise ApiError("org.ice_invalid", 422)
     if body.require_totp is not None:
         ensure_step_up(session, user, now)
         if org.require_totp != body.require_totp:
@@ -215,6 +234,19 @@ async def patch_org(
                 data={"require_totp": body.require_totp},
                 now=now,
             )
+    if isinstance(body.ice, str) and body.ice != org.ice:
+        org.ice = body.ice
+        await audit_org_event(
+            db,
+            request,
+            org_id=org_id,
+            actor=user,
+            action="org.ice_changed",
+            target_type="org",
+            target_id=str(org_id),
+            data={"ice": body.ice},
+            now=now,
+        )
     if body.name is not None:
         org.name = body.name
     await db.commit()

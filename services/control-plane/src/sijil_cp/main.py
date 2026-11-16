@@ -11,6 +11,7 @@ from sijil_cp import __version__
 from sijil_cp.api import (
     ask,
     auth,
+    billing,
     corrections,
     documents,
     exports,
@@ -84,6 +85,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(orgs.router)
     v1.include_router(workspaces.router)
     v1.include_router(members.router)
+    v1.include_router(billing.router)
     v1.include_router(jobs.router)
     v1.include_router(documents.router)
     v1.include_router(review.router)
