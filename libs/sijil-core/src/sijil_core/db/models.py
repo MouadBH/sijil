@@ -1,5 +1,6 @@
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final
 
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -132,6 +134,16 @@ class DocumentSource(StrEnum):
     email = "email"
 
 
+class SubscriptionStatus(StrEnum):
+    # 0015 (ADM-3, ADM-4): every status is defined now so the column migrates once; Task 3
+    # gives `overdue` and `read_only` their behaviour (ruling R1).
+    trial = "trial"
+    active = "active"
+    overdue = "overdue"
+    read_only = "read_only"
+    closed = "closed"
+
+
 class ActorType(StrEnum):
     user = "user"
     system = "system"
@@ -163,6 +175,7 @@ def _tstz() -> Mapped[datetime | None]:
 
 class Organisation(Base):
     __tablename__ = "organisation"
+    __table_args__ = (CheckConstraint("ice ~ '^[0-9]{15}$'", name="ice_format"),)
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     created_at: Mapped[datetime] = _created_at()
@@ -173,6 +186,9 @@ class Organisation(Base):
     region: Mapped[str] = mapped_column(String)
     status: Mapped[OrgStatus] = mapped_column(_enum(OrgStatus), default=OrgStatus.active)
     require_totp: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # 0015 (ADM-3): the organisation's ICE, 15 digits; required to choose a plan, and the first
+    # own-ICE guard of extraction and learning (`sijil_core.suppliers.own_ices`).
+    ice: Mapped[str | None] = mapped_column(String(15))
 
 
 class Workspace(Base):
@@ -482,3 +498,94 @@ class ExportJob(Base):
     error_code: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = _created_at()
     ready_at: Mapped[datetime | None] = _tstz()
+
+
+class Plan(Base):
+    """A plan of the catalogue (0015, seeded; edited only by migration). Users and storage are
+    current totals; documents and AI pages are counted per billing year."""
+
+    __tablename__ = "plan"
+    __table_args__ = (
+        CheckConstraint("price_ht >= 0", name="price_non_negative"),
+        CheckConstraint(
+            "max_users > 0 AND max_documents_year > 0 AND max_storage_bytes > 0"
+            " AND max_ai_pages_year > 0",
+            name="quotas_positive",
+        ),
+    )
+
+    code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # MAD, excluding VAT.
+    price_ht: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    max_users: Mapped[int] = mapped_column(Integer)
+    max_documents_year: Mapped[int] = mapped_column(Integer)
+    max_storage_bytes: Mapped[int] = mapped_column(BigInteger)
+    max_ai_pages_year: Mapped[int] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(default=True)
+
+
+class Subscription(Base):
+    """One per organisation (0015). The billing year is `[period_start, period_end)`; during
+    the trial it is the trial itself, and the first year starts at `trial_ends_at`."""
+
+    __tablename__ = "subscription"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('trial', 'active', 'overdue', 'read_only', 'closed')", name="status_known"
+        ),
+        CheckConstraint("period_end > period_start", name="period_ordered"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    created_at: Mapped[datetime] = _created_at()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"), unique=True)
+    plan_code: Mapped[str] = mapped_column(ForeignKey("plan.code"))
+    status: Mapped[SubscriptionStatus] = mapped_column(
+        _enum(SubscriptionStatus), default=SubscriptionStatus.trial
+    )
+    trial_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # A downgrade waits for the renewal (Task 3 applies it).
+    pending_plan_code: Mapped[str | None] = mapped_column(ForeignKey("plan.code"))
+
+
+class UsageRecord(Base):
+    """Metered usage (0015): the AI pages of one document, written once by the extraction
+    worker when it calls the model. The app role may not UPDATE or DELETE it."""
+
+    __tablename__ = "usage_record"
+    __table_args__ = (
+        UniqueConstraint("ledger_id", "kind", name="uq_usage_record_ledger_kind"),
+        CheckConstraint("kind IN ('ai_pages')", name="kind_known"),
+        CheckConstraint("quantity > 0", name="quantity_positive"),
+        Index("ix_usage_record_org_at", "org_id", "at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("document_ledger.id"))
+    kind: Mapped[str] = mapped_column(String(32))
+    quantity: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class QuotaWarning(Base):
+    """A quota warning already given (0015): once per org, quota, threshold and billing year
+    (`period_start`), whoever notices it first; the unique key makes concurrent ones one."""
+
+    __tablename__ = "quota_warning"
+    __table_args__ = (
+        UniqueConstraint(
+            "org_id", "kind", "threshold", "period_start", name="uq_quota_warning_once"
+        ),
+        CheckConstraint("threshold IN (80, 100)", name="threshold_known"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    kind: Mapped[str] = mapped_column(String(32))
+    threshold: Mapped[int] = mapped_column(Integer)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
