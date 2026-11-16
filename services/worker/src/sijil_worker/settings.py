@@ -6,7 +6,7 @@ from pydantic_settings import NoDecode
 
 from sijil_core.crypto import KeySettings
 from sijil_core.export_report import decode_key
-from sijil_core.settings import CoreSettings
+from sijil_core.settings import CoreSettings, SellerSettings
 from sijil_core.storage import StorageSettings
 
 
@@ -52,6 +52,15 @@ class ExportSettings(KeySettings, StorageSettings, BrokerSettings):
 
     def signing_seed(self) -> bytes:
         return decode_key(self.export_signing_key.get_secret_value())
+
+
+class BillingSettings(SellerSettings, BrokerSettings):
+    """The daily billing transitions (`sijil.billing_daily`, on the main worker): the
+    control-plane database as the app role, the broker and the seller who issues the invoices
+    (SIJIL_SELLER_*, all required: ruling R2). The main worker checks them at boot
+    (`sijil_worker.main`)."""
+
+    database_url: str
 
 
 class AiSettings(CoreSettings):

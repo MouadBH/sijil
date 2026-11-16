@@ -36,6 +36,7 @@ from sijil_core.db.models import (
     IngestState,
     Organisation,
     OrgType,
+    SubscriptionStatus,
     TenantCredential,
     UsageRecord,
     User,
@@ -64,6 +65,7 @@ from sijil_worker.extract import (
 )
 from sijil_worker.settings import WorkerSettings
 from sijil_worker.taxonomy import RULES, ensure_taxonomy
+from tests.support.billing_states import make_late, make_paid_up
 from tests.support.index_db import throwaway_index_db
 
 pytestmark = pytest.mark.db
@@ -1166,6 +1168,7 @@ async def test_filing_extends_retention_and_object_lock(
     ready: Workspace,
 ) -> None:
     arrival = datetime(2026, 1, 5, 10, 0, tzinfo=UTC)
+    await make_paid_up(db, ready.org_id, arrival)  # the run's clock is past any trial's end
     ledger = await make_ledger(db, ready, ingested_at=arrival, retention_until=date(2036, 12, 31))
     raw = {**RAW_01, "date": "2027-01-02"}
 
@@ -1318,6 +1321,7 @@ async def test_date_one_day_ahead_never_adds_a_year_of_lock(
     """On 31 December (local), a document dated 1 January next year is plausible (a time zone
     apart) but its retention counts from today's year."""
     eve = datetime(2026, 12, 31, 12, 0, tzinfo=UTC)
+    await make_paid_up(db, ready.org_id, eve - timedelta(days=1))  # past any trial's end
     ledger = await make_ledger(db, ready, ingested_at=eve)
     raw = {**RAW_01, "date": "2027-01-01"}
     store = FakeStore()
@@ -2037,6 +2041,33 @@ async def test_ai_stops_over_quota_documents_go_to_review(
         ("document.extraction_skipped", {"code": "quota_exceeded"}),
         ("document.needs_review", {"min_confidence_pct": 0, "flags": "quota_exceeded"}),
     ]
+
+
+@pytest.mark.parametrize("status", [SubscriptionStatus.overdue, SubscriptionStatus.read_only])
+async def test_ai_stops_when_overdue_documents_go_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    status: SubscriptionStatus,
+) -> None:
+    """An unpaid invoice past due stops AI as a quota does, with the flag `billing_overdue`."""
+    await make_late(db, ready.org_id, NOW, status)
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, pages=2)
+        await run(ledger, sessions, keys, engines, ollama)
+    assert ollama.requests == []
+    assert await usage_of(db, ledger.id) == []
+    row = await fields_of(engines, ready, ledger.id)
+    assert (row.flags, row.values) == (("billing_overdue",), dict.fromkeys(FIELD_NAMES))
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
+    skipped = [
+        e.data for e in await events(db, ready) if e.action == "document.extraction_skipped"
+    ]
+    assert skipped == [{"code": "billing_overdue"}]
 
 
 async def test_usage_record_written_once_per_document_on_retry(

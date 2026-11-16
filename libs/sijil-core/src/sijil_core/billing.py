@@ -15,11 +15,26 @@ Billing is per organisation, in the control-plane database of its region.
     duplicate never makes a row);
   - `storage`: the bytes of its originals not yet purged (`original_removed_at IS NULL`);
   - `ai_pages`: the `UsageRecord` pages of the billing year.
+- **Phase** (`phase`): the subscription's status by the clock and the invoices, never by a
+  stored status alone, so the daily job and every request agree even before the job has run:
+  - `trial` until `trial_ends_at` (a trial whose end has passed counts as ended everywhere);
+  - a trial that ended with no ICE to invoice: `overdue`, reason `org.ice_required`, and
+    `read_only` OVERDUE_GRACE after the trial's end;
+  - an invoice unpaid past its `due_at`: `overdue`, and `read_only` OVERDUE_GRACE after it;
+  - otherwise `active`.
+- **Advance** (`advance`: the daily job `sijil.billing_daily`, and the request paths that need
+  the stored state current): issues the first annual invoice once the trial has ended (with an
+  ICE), the renewal RENEWAL_NOTICE before `period_end` (on `pending_plan_code` when there is
+  one), rolls the billing year on at `period_end` (the renewal's plan then applies), marks
+  unpaid invoices past due `overdue`, and stores the phase. Each transition is audited once:
+  `billing.invoice_issued`, `billing.overdue` (`{number}` for an invoice, `{reason}` for the
+  missing ICE) and `billing.read_only`.
 - **Standing** (`standing`): what the organisation may do. Over quota (any of users,
   documents and storage beyond its limit, or no AI page left) AI extraction stops and no user
-  may be added; at the user limit only new users stop. Capture and reads are never gated
-  here or anywhere (§5.7a). This task covers `trial` and `active` only (ruling R1): Task 3
-  maps `overdue` and `read_only`.
+  may be added; at the user limit only new users stop. `overdue` also stops exports
+  (`billing.overdue`), and `read_only` every state-changing workspace route but capture
+  (`billing.read_only`); a document that skips AI for either is flagged `billing_overdue`.
+  Capture and reads are never gated here or anywhere (§5.7a).
 - **Warnings** (`check`): the first time a quota reaches 80% or 100% in a billing year,
   `quota.warning_80` / `quota.warning_100` `{kind}` is audited on every workspace of the org.
   A `quota_warning` row, unique per (org, kind, threshold, period start), makes it once
@@ -40,10 +55,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sijil_core import audit
+from sijil_core import invoicing
 from sijil_core.db.models import (
-    ActorType,
     DocumentLedger,
+    Invoice,
+    InvoiceKind,
+    InvoiceState,
     Membership,
     Organisation,
     Plan,
@@ -53,6 +70,7 @@ from sijil_core.db.models import (
     UsageRecord,
     Workspace,
 )
+from sijil_core.settings import SellerSettings
 
 TRIAL_DAYS: Final = 30
 TRIAL_PLAN: Final = "essentiel"
@@ -60,8 +78,19 @@ AI_PAGES: Final = "ai_pages"  # the one `UsageRecord.kind`
 QUOTA_KINDS: Final = ("users", "documents", "storage", "ai_pages")
 WARN_PERCENT: Final = 80
 # The `reason_code` of a standing refused by a quota, and the flag of a document that skipped
-# AI for it (Task 3 adds `billing_overdue`).
+# AI for it; `billing_overdue` when it was an unpaid invoice (or the missing ICE).
 QUOTA_EXCEEDED: Final = "quota_exceeded"
+BILLING_OVERDUE: Final = "billing_overdue"
+# The API codes (402) of a standing refused by non-payment.
+OVERDUE_CODE: Final = "billing.overdue"
+READ_ONLY_CODE: Final = "billing.read_only"
+# Why a trial that ended is overdue with no invoice (`Subscription.status_reason`).
+ICE_REQUIRED: Final = "org.ice_required"
+# Overdue for this long, the organisation becomes read-only (plus capture).
+OVERDUE_GRACE: Final = timedelta(days=30)
+# The renewal invoice is issued this long before the billing year ends.
+RENEWAL_NOTICE: Final = timedelta(days=30)
+UNPAID: Final = (InvoiceState.issued, InvoiceState.overdue)
 
 
 class QuotaLevel(StrEnum):
@@ -80,13 +109,21 @@ class Quota:
 
 
 @dataclass(frozen=True)
+class Phase:
+    status: SubscriptionStatus
+    reason: str | None = None  # ICE_REQUIRED
+    invoice: str | None = None  # the number of the oldest invoice unpaid past due
+
+
+@dataclass(frozen=True)
 class Meter:
     org_id: UUID
     plan_code: str  # the plan whose quotas apply now (the trial's during the trial)
-    status: SubscriptionStatus
+    status: SubscriptionStatus  # by the clock (`phase`)
     period_start: datetime
     period_end: datetime
     quotas: dict[str, Quota]
+    status_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +133,8 @@ class Standing:
     export_allowed: bool
     writes_allowed: bool
     reason_code: str | None
+    # OVERDUE_CODE or READ_ONLY_CODE when non-payment refuses something (402).
+    billing_code: str | None = None
 
 
 def quota(kind: str, used: int, limit: int) -> Quota:
@@ -159,6 +198,52 @@ async def subscription_of(db: AsyncSession, org_id: UUID) -> Subscription:
     return new_trial(org_id, org.created_at)
 
 
+def phase(
+    sub: Subscription,
+    *,
+    has_ice: bool,
+    unpaid: tuple[str, datetime] | None,
+    now: datetime,
+) -> Phase:
+    """The status by the clock (see the module docstring). `unpaid` is the number and due date
+    of the org's oldest unpaid invoice."""
+    if sub.status is SubscriptionStatus.closed:
+        return Phase(SubscriptionStatus.closed)
+    if sub.status is SubscriptionStatus.trial and now < sub.trial_ends_at:
+        return Phase(SubscriptionStatus.trial)
+
+    def late(since: datetime) -> SubscriptionStatus:
+        if now >= since + OVERDUE_GRACE:
+            return SubscriptionStatus.read_only
+        return SubscriptionStatus.overdue
+
+    first_year_due = sub.period_end <= sub.trial_ends_at <= now
+    if first_year_due and not has_ice:
+        return Phase(late(sub.trial_ends_at), reason=ICE_REQUIRED)
+    if unpaid is not None and now >= unpaid[1]:
+        return Phase(late(unpaid[1]), invoice=unpaid[0])
+    return Phase(SubscriptionStatus.active)
+
+
+async def _oldest_unpaid(db: AsyncSession, org_id: UUID) -> tuple[str, datetime] | None:
+    row = (
+        await db.execute(
+            select(Invoice.number, Invoice.due_at)
+            .where(Invoice.org_id == org_id, Invoice.state.in_(UNPAID))
+            .order_by(Invoice.due_at, Invoice.number)
+            .limit(1)
+        )
+    ).first()
+    return None if row is None else (row.number, row.due_at)
+
+
+async def phase_of(db: AsyncSession, sub: Subscription, now: datetime) -> Phase:
+    """`phase` with the org's ICE and oldest unpaid invoice read from the database."""
+    ice = await db.scalar(select(Organisation.ice).where(Organisation.id == sub.org_id))
+    unpaid = await _oldest_unpaid(db, sub.org_id)
+    return phase(sub, has_ice=ice is not None, unpaid=unpaid, now=now)
+
+
 async def _plan(db: AsyncSession, code: str) -> Plan:
     plan = await db.get(Plan, code)
     if plan is None:
@@ -169,6 +254,7 @@ async def _plan(db: AsyncSession, code: str) -> Plan:
 async def meter(db: AsyncSession, org_id: UUID, now: datetime) -> Meter:
     """The usage of every quota in the billing year holding `now`. Reads only."""
     sub = await subscription_of(db, org_id)
+    current = await phase_of(db, sub, now)
     start, end = billing_window(sub, now)
     plan = await _plan(db, quota_plan(sub, now))
     workspaces = select(Workspace.id).where(Workspace.org_id == org_id)
@@ -207,10 +293,11 @@ async def meter(db: AsyncSession, org_id: UUID, now: datetime) -> Meter:
     return Meter(
         org_id=org_id,
         plan_code=plan.code,
-        status=sub.status,
+        status=current.status,
         period_start=start,
         period_end=end,
         quotas={q.kind: q for q in quotas},
+        status_reason=current.reason,
     )
 
 
@@ -225,6 +312,16 @@ def exceeded(m: Meter) -> list[str]:
 
 
 def standing_of(m: Meter) -> Standing:
+    if m.status in (SubscriptionStatus.overdue, SubscriptionStatus.read_only):
+        read_only = m.status is SubscriptionStatus.read_only
+        return Standing(
+            ai_allowed=False,
+            new_users_allowed=False,
+            export_allowed=False,
+            writes_allowed=not read_only,
+            reason_code=BILLING_OVERDUE,
+            billing_code=READ_ONLY_CODE if read_only else OVERDUE_CODE,
+        )
     over = bool(exceeded(m))
     users = m.quotas["users"]
     new_users = not over and users.used < users.limit
@@ -245,21 +342,7 @@ async def standing(db: AsyncSession, org_id: UUID, now: datetime) -> Standing:
 async def _audit_org(
     db: AsyncSession, org_id: UUID, action: str, data: dict[str, str], now: datetime
 ) -> None:
-    ids = await db.scalars(
-        select(Workspace.id).where(Workspace.org_id == org_id).order_by(Workspace.id)
-    )
-    for workspace_id in list(ids):
-        await audit.append(
-            db,
-            workspace_id=workspace_id,
-            action=action,
-            actor_type=ActorType.system,
-            actor_id=None,
-            target_type="org",
-            target_id=str(org_id),
-            data=data,
-            now=now,
-        )
+    await invoicing.audit_org(db, org_id, action, data, now)
 
 
 async def record_warnings(db: AsyncSession, m: Meter, now: datetime) -> list[tuple[str, int]]:
@@ -329,3 +412,102 @@ async def record_ai_pages(
         .returning(UsageRecord.id)
     )
     return won is not None
+
+
+# Transitions ----------------------------------------------------------------------------------
+
+
+async def locked_subscription(db: AsyncSession, org_id: UUID) -> tuple[Organisation, Subscription]:
+    """The org and its subscription, both FOR UPDATE until the caller's commit; the implied
+    trial is stored if the org had no row yet."""
+    org = await db.scalar(
+        select(Organisation)
+        .where(Organisation.id == org_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if org is None:
+        raise LookupError("organisation not found")
+    sub = await db.scalar(
+        select(Subscription)
+        .where(Subscription.org_id == org_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if sub is None:
+        sub = new_trial(org.id, org.created_at)
+        db.add(sub)
+        await db.flush()
+    return org, sub
+
+
+async def _annual_for(db: AsyncSession, org_id: UUID, start: datetime) -> Invoice | None:
+    """The annual invoice of the billing year starting at `start`, if issued."""
+    found: Invoice | None = await db.scalar(
+        select(Invoice).where(
+            Invoice.org_id == org_id,
+            Invoice.kind == InvoiceKind.annual,
+            Invoice.period_start == start,
+        )
+    )
+    return found
+
+
+async def advance(
+    db: AsyncSession, org_id: UUID, now: datetime, *, seller: SellerSettings
+) -> Phase:
+    """Brings the org's stored billing state up to `now` (see the module docstring), in the
+    caller's transaction (the caller commits). Idempotent: a second run at the same time
+    issues, marks and audits nothing more. Returns the phase it stored."""
+    org, sub = await locked_subscription(db, org_id)
+    if sub.status is SubscriptionStatus.closed:
+        return Phase(SubscriptionStatus.closed)
+    if org.ice is not None and sub.period_end <= sub.trial_ends_at <= now:
+        start, end = sub.trial_ends_at, add_year(sub.trial_ends_at)
+        if await _annual_for(db, org.id, start) is None:
+            plan = await _plan(db, sub.plan_code)
+            await invoicing.issue(
+                db, org, InvoiceKind.annual, plan, (start, end), now, seller=seller
+            )
+        sub.period_start, sub.period_end = start, end
+    while sub.period_end > sub.trial_ends_at:  # the first billing year has started
+        renewal = await _annual_for(db, org.id, sub.period_end)
+        if renewal is None and org.ice is not None and now >= sub.period_end - RENEWAL_NOTICE:
+            plan = await _plan(db, sub.pending_plan_code or sub.plan_code)
+            period = (sub.period_end, add_year(sub.period_end))
+            renewal = await invoicing.issue(
+                db, org, InvoiceKind.annual, plan, period, now, seller=seller
+            )
+        if now < sub.period_end:
+            break
+        if renewal is not None:
+            sub.plan_code = renewal.plan_code
+        elif sub.pending_plan_code is not None:
+            sub.plan_code = sub.pending_plan_code
+        sub.pending_plan_code = None
+        sub.period_start, sub.period_end = sub.period_end, add_year(sub.period_end)
+    late = await db.scalars(
+        select(Invoice)
+        .where(
+            Invoice.org_id == org.id,
+            Invoice.state == InvoiceState.issued,
+            Invoice.due_at <= now,
+        )
+        .order_by(Invoice.due_at, Invoice.number)
+        .with_for_update()
+    )
+    for invoice in list(late):
+        invoice.state = InvoiceState.overdue
+        await _audit_org(db, org.id, "billing.overdue", {"number": invoice.number}, now)
+    await db.flush()
+    current = await phase_of(db, sub, now)
+    if current.status is not sub.status:
+        why = {"reason": current.reason} if current.reason else {"number": current.invoice or ""}
+        if current.status is SubscriptionStatus.read_only:
+            await _audit_org(db, org.id, "billing.read_only", why, now)
+        elif current.status is SubscriptionStatus.overdue and current.reason is not None:
+            await _audit_org(db, org.id, "billing.overdue", why, now)
+        sub.status = current.status
+    sub.status_reason = current.reason
+    await db.flush()
+    return current

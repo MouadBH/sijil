@@ -7,8 +7,9 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
 1. reads the text Paperless extracted (never the PDF's own text layer, ruling P4), normalises
    it and keeps the first 12,000 characters; empty text is flagged `no_text`;
 1a. asks the org's billing standing (`sijil_core.billing`, ADM-3) before any model call. When
-   AI is not allowed (over quota), the model is not called and no usage is recorded: the row
-   is empty, flagged with the standing's reason (`quota_exceeded`), audited
+   AI is not allowed (over quota, or an invoice unpaid past due), the model is not called and
+   no usage is recorded: the row is empty, flagged with the standing's reason
+   (`quota_exceeded` or `billing_overdue`), audited
    `document.extraction_skipped` `{code}`, and goes to review. Otherwise the document's AI
    pages (the page count Paperless reports, at least 1) are recorded once, before the model
    runs, and any quota warning they reach is audited; a document whose pages are already
@@ -137,8 +138,8 @@ _RESULT_ACTIONS: Final = (
     "document.extraction_failed",
     "document.extraction_skipped",
 )
-# The flags of a document that skipped AI on its org's standing (Task 3 adds the overdue one).
-SKIPPED_FLAGS: Final = frozenset({billing.QUOTA_EXCEEDED})
+# The flags of a document that skipped AI on its org's standing: a quota, or non-payment.
+SKIPPED_FLAGS: Final = frozenset({billing.QUOTA_EXCEEDED, billing.BILLING_OVERDUE})
 SUPPLIER_RECORD: Final = "supplier_record"  # the source of a name taken from the record
 MAX_HINTS: Final = 5
 HINT_NAME_CHARS: Final = 120

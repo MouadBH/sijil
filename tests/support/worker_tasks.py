@@ -21,6 +21,7 @@ from sijil_worker.app import make_celery
 from sijil_worker.settings import BrokerSettings
 from tests.support.export_keys import TEST_SEED_B64
 from tests.support.memory_store import MemoryExportStore, MemoryObjectStore
+from tests.support.seller import SAMPLE_SELLER
 
 # Deterministic test-only master key (32 bytes); never contacted endpoints.
 _ENV = {
@@ -37,6 +38,8 @@ _ENV = {
     "SIJIL_OBJECTSTORE_BUCKET": "sijil-originals-test",
     # Deterministic test-only export signing seed (32 bytes).
     "SIJIL_EXPORT_SIGNING_KEY": TEST_SEED_B64,
+    # The SAMPLE seller the daily billing job issues invoices as.
+    **{f"SIJIL_{name.upper()}": value for name, value in SAMPLE_SELLER.items()},
 }
 
 

@@ -107,6 +107,7 @@ def test_weights_table_is_the_design_one() -> None:
         "supplier_mismatch",
         "supplier_own_ice",
         "quota_exceeded",
+        "billing_overdue",
     }
 
 

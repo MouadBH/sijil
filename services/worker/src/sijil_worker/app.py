@@ -79,6 +79,12 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "task": "sijil.drift_check_all",
                 "schedule": crontab(hour=2, minute=30),
             },
+            # Invoices, renewals, overdue and read-only (sijil_worker.billing), on the main
+            # worker: the seller's settings are its own.
+            "billing-daily": {
+                "task": "sijil.billing_daily",
+                "schedule": crontab(hour=1, minute=0),
+            },
             # Mends search rows a best-effort step missed (sijil_worker.search).
             "search-resync-daily": {
                 "task": "sijil.search_resync",

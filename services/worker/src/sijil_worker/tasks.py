@@ -41,6 +41,7 @@ from sijil_worker.ask import (
     record_ask_failed,
     sweep_questions,
 )
+from sijil_worker.billing import billing_daily
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -87,6 +88,7 @@ from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.search import resync_search
 from sijil_worker.settings import (
     AskSettings,
+    BillingSettings,
     ExportSettings,
     ExtractionSettings,
     RemovalSettings,
@@ -743,6 +745,21 @@ def mark_eligible_task() -> int:
     """Nightly: mark this region's documents past retention eligible for deletion. It deletes
     nothing (sijil_worker.eligibility)."""
     return asyncio.run(_mark_eligible())
+
+
+async def _billing_daily() -> int:
+    settings = BillingSettings()
+    engine = make_engine(settings.database_url)
+    try:
+        return await billing_daily(make_sessionmaker(engine), settings=settings, now=utcnow())
+    finally:
+        await engine.dispose()
+
+
+@shared_task(name="sijil.billing_daily")
+def billing_daily_task() -> int:
+    """Daily: this region's invoices, renewals, overdue and read-only (sijil_worker.billing)."""
+    return asyncio.run(_billing_daily())
 
 
 async def _search_resync(workspace_id: str | None) -> int:

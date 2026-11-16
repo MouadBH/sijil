@@ -42,6 +42,7 @@ BLOCKING_FLAGS: Final = frozenset(
         "extraction_failed",
         "retention.extend_failed",  # the object lock could not be extended at filing
         "quota_exceeded",  # AI skipped over quota (`sijil_core.billing.QUOTA_EXCEEDED`)
+        "billing_overdue",  # AI skipped for non-payment (`sijil_core.billing.BILLING_OVERDUE`)
         SUPPLIER_MISMATCH,
         OWN_ICE,
     }
