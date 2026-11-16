@@ -119,18 +119,25 @@ def _own_params(ices: Sequence[str]) -> dict[str, Any]:
     }
 
 
-async def own_ices(conn: AsyncConnection, candidates: Iterable[str]) -> frozenset[str]:
-    """The candidates that are the workspace's own ICE: printed in the text of at least half of
-    its live documents, when it has at least OWN_ICE_MIN_DOCUMENTS (final review I2). Only its
-    own company is on most of what a company archives (the client of its purchases, the seller
-    of its sales), so such an ICE is never learnt, hinted or filed as a supplier. An interim
-    guard until the organisation's ICE is a setting; its cost: a supplier on at least half of
-    the documents counts too (its documents go to review).
+async def own_ices(
+    conn: AsyncConnection, candidates: Iterable[str], *, org_ice: str | None = None
+) -> frozenset[str]:
+    """The candidates that are the workspace's own ICE, never learnt, hinted or filed as a
+    supplier.
 
-    One query: the live count, and per candidate (15 digits; others are ignored) a count
-    through the trigram index on `content_norm`. Callers ask once per run, never caching
-    across runs (the documents change)."""
+    With the organisation's ICE stored (`Organisation.ice`, ADM-3), it alone is the own ICE,
+    and no query runs. Without one, the fallback is the frequency guard (final review I2): an
+    ICE printed in the text of at least half of the workspace's live documents, when it has at
+    least OWN_ICE_MIN_DOCUMENTS. Only its own company is on most of what a company archives
+    (the client of its purchases, the seller of its sales); its cost: a supplier on at least
+    half of the documents counts too (its documents go to review).
+
+    The fallback is one query: the live count, and per candidate (15 digits; others are
+    ignored) a count through the trigram index on `content_norm`. Callers ask once per run,
+    never caching across runs (the documents and the org's ICE change)."""
     ices = [ice for ice in dict.fromkeys(candidates) if _ICE.match(ice)]
+    if org_ice is not None:
+        return frozenset(ice for ice in ices if ice == org_ice)
     if not ices:
         return frozenset()
     result = await conn.execute(_OWN_ICES, _own_params(ices))

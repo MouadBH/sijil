@@ -32,6 +32,7 @@ from sijil_core.db.models import (
     DocumentSource,
     DocumentState,
     IngestState,
+    Organisation,
     TenantCredential,
     User,
     Workspace,
@@ -605,3 +606,24 @@ async def test_an_ice_on_a_minority_of_documents_is_learnt(
         assert await _learn(row.id, sessions, keys, engines, workspace_id=ready.id)
     async with (await engines.engine(ready)).connect() as conn:
         assert await suppliers.get(conn, OWN) is not None
+
+
+@pytest.mark.db
+async def test_the_org_ice_is_never_learnt(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], keys: LocalKeyService,
+    engines: IndexEngines, ready: Workspace, user: User,
+) -> None:  # fmt: skip
+    """With the organisation's ICE stored (ADM-3), a document naming it as its supplier is
+    never learnt, even on the workspace's first document (the frequency guard needs 5)."""
+    org = await db.get(Organisation, ready.org_id)
+    assert org is not None
+    org.ice = OWN
+    await db.commit()
+    row = await _document(db, engines, ready, user, values=OWN_VALUES)
+    with respx.mock(assert_all_called=False) as router:
+        _mock(router)
+        assert not await _learn(row.id, sessions, keys, engines, workspace_id=ready.id)
+    assert not router.calls
+    async with (await engines.engine(ready)).connect() as conn:
+        assert await suppliers.get(conn, OWN) is None
+    assert await _events(db, ready) == []
