@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from sijil_core import audit
@@ -258,3 +259,40 @@ async def test_roundtrip_through_jsonb_verifies(
     finally:
         await engine.dispose()
     assert (result.ok, result.count) == (True, 1)
+
+
+async def test_platform_chain_links_verifies_and_is_append_only(
+    db: AsyncSession, owner_conn: AsyncConnection
+) -> None:
+    """The org-free chain (staff grants): hashed like a workspace's, no UPDATE or DELETE."""
+    for i in range(3):
+        await audit.append_platform(
+            db,
+            action="staff.granted",
+            actor_type=ActorType.platform,
+            actor_id=None,
+            target_type="user",
+            target_id=str(uuid.uuid4()),
+            data={"i": i},
+            now=NOW,
+        )
+    await db.commit()
+    result = await audit.verify_platform(db)
+    assert (result.ok, result.count) == (True, 3)
+    for sql in ("UPDATE platform_audit_event SET action = 'x'", "DELETE FROM platform_audit_event"):
+        with pytest.raises(DBAPIError, match="permission denied"):
+            await db.execute(text(sql))
+        await db.rollback()
+        with pytest.raises(DBAPIError, match="audit.append_only"):
+            await owner_conn.execute(text(sql))
+    trigger = "platform_audit_event_append_only"
+    await owner_conn.execute(text(f"ALTER TABLE platform_audit_event DISABLE TRIGGER {trigger}"))
+    try:
+        await owner_conn.execute(
+            text("UPDATE platform_audit_event SET data = '{\"i\": 9}' WHERE seq = 2")
+        )
+    finally:
+        await owner_conn.execute(text(f"ALTER TABLE platform_audit_event ENABLE TRIGGER {trigger}"))
+    db.expire_all()
+    result = await audit.verify_platform(db)
+    assert (result.ok, result.first_bad_seq) == (False, 2)

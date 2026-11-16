@@ -3,6 +3,10 @@
 `hash = sha256(bytes.fromhex(prev_hash) || canonical_json(event))`; the first event's `prev_hash`
 is 64 zeros. Appends are serialised per workspace by a transaction-scoped advisory lock and run
 inside the caller's transaction (the caller commits).
+
+Events that belong to no organisation (a staff grant) go on the platform's own chain
+(`append_platform`, `verify_platform`): the same hashing, with `"scope": "platform"` in place
+of the workspace id, in `platform_audit_event`.
 """
 
 import hashlib
@@ -16,7 +20,7 @@ from uuid import UUID
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from sijil_core.db.models import ActorType, AuditEvent
+from sijil_core.db.models import ActorType, AuditEvent, PlatformAuditEvent
 
 GENESIS_HASH = "0" * 64
 
@@ -196,6 +200,128 @@ async def verify(db: AsyncSession, workspace_id: UUID) -> VerifyResult:
             row.seq != expected_seq
             or row.prev_hash != prev_hash
             or row.hash != event_hash(prev_hash, _row_event(row))
+        ):
+            return VerifyResult(ok=False, count=expected_seq - 1, first_bad_seq=row.seq)
+        prev_hash = row.hash
+        expected_seq += 1
+    return VerifyResult(ok=True, count=expected_seq - 1, first_bad_seq=None)
+
+
+# The platform chain ---------------------------------------------------------------------------
+
+PLATFORM_SCOPE = "platform"
+
+
+def _platform_fields(
+    *,
+    seq: int,
+    at: datetime,
+    actor_type: ActorType,
+    actor_id: str | None,
+    action: str,
+    target_type: str | None,
+    target_id: str | None,
+    ip: str | None,
+    data: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "scope": PLATFORM_SCOPE,
+        "seq": seq,
+        "at": at,
+        "actor_type": ActorType(actor_type).value,
+        "actor_id": actor_id,
+        "action": action,
+        "target_type": target_type,
+        "target_id": target_id,
+        "ip": ip,
+        "data": data,
+    }
+
+
+def _platform_row_event(row: PlatformAuditEvent) -> dict[str, Any]:
+    return _platform_fields(
+        seq=row.seq,
+        at=row.at,
+        actor_type=row.actor_type,
+        actor_id=row.actor_id,
+        action=row.action,
+        target_type=row.target_type,
+        target_id=row.target_id,
+        ip=row.ip,
+        data=row.data,
+    )
+
+
+async def append_platform(
+    db: AsyncSession,
+    *,
+    action: str,
+    actor_type: ActorType,
+    actor_id: str | None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    ip: str | None = None,
+    data: Mapping[str, Any] | None = None,
+    now: datetime,
+) -> PlatformAuditEvent:
+    """Add the next event of the platform's chain, in the caller's transaction."""
+    if now.tzinfo is None:
+        raise ValueError("audit timestamp must be timezone-aware")
+    _check_data(data or {})
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtextextended('audit:platform', 0))"))
+    last = (
+        await db.execute(
+            select(PlatformAuditEvent.seq, PlatformAuditEvent.hash)
+            .order_by(PlatformAuditEvent.seq.desc())
+            .limit(1)
+        )
+    ).first()
+    seq, prev_hash = (last[0] + 1, last[1]) if last else (1, GENESIS_HASH)
+    at = now.astimezone(UTC)
+    payload: dict[str, Any] = json.loads(canonical_json(dict(data or {})))
+    fields = _platform_fields(
+        seq=seq,
+        at=at,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        ip=ip,
+        data=payload,
+    )
+    row = PlatformAuditEvent(
+        seq=seq,
+        at=at,
+        actor_type=ActorType(actor_type),
+        actor_id=actor_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        ip=ip,
+        data=payload,
+        prev_hash=prev_hash,
+        hash=event_hash(prev_hash, fields),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def verify_platform(db: AsyncSession) -> VerifyResult:
+    """`verify` for the platform's chain."""
+    rows = await db.stream_scalars(
+        select(PlatformAuditEvent)
+        .order_by(PlatformAuditEvent.seq)
+        .execution_options(yield_per=500, populate_existing=True)
+    )
+    expected_seq = 1
+    prev_hash = GENESIS_HASH
+    async for row in rows:
+        if (
+            row.seq != expected_seq
+            or row.prev_hash != prev_hash
+            or row.hash != event_hash(prev_hash, _platform_row_event(row))
         ):
             return VerifyResult(ok=False, count=expected_seq - 1, first_bad_seq=row.seq)
         prev_hash = row.hash

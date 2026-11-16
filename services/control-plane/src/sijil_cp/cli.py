@@ -1,6 +1,7 @@
 """`sijil-cp` console entry: `serve` runs the API, `bootstrap-storage` prepares the object store,
-`audit verify` recomputes a workspace's audit chain, `export verify` checks an export ZIP and
-`search backfill` has the worker rebuild a workspace's search index."""
+`audit verify` recomputes a workspace's audit chain, `export verify` checks an export ZIP,
+`search backfill` has the worker rebuild a workspace's search index and `staff grant|revoke`
+sets who is platform staff."""
 
 import argparse
 import asyncio
@@ -168,6 +169,72 @@ def search_backfill(
     return 0
 
 
+def _set_staff(email: str, staff: bool, settings: "CpSettings | None") -> int:
+    """Writes `user_account.is_staff`, and nothing else, audited `staff.granted` or
+    `staff.revoked` `{}` (the user's id as target, never the email) on the platform's chain by
+    the `platform` actor. Prints `granted|revoked|unchanged <user id>`. Exit code 0, or 2 for
+    an unknown email or a database that cannot be reached."""
+    from sqlalchemy import select
+
+    from sijil_core import audit
+    from sijil_core.db.base import utcnow
+    from sijil_core.db.models import ActorType, User
+    from sijil_cp.db import make_engine, make_sessionmaker
+    from sijil_cp.settings import CpSettings
+
+    normalised = email.strip().lower()
+
+    async def _run() -> tuple[UUID, bool] | None:
+        engine = make_engine(settings or CpSettings())
+        try:
+            async with make_sessionmaker(engine)() as db:
+                user = await db.scalar(
+                    select(User).where(User.email == normalised).with_for_update()
+                )
+                if user is None:
+                    return None
+                if user.is_staff is staff:
+                    return user.id, False
+                user.is_staff = staff
+                await audit.append_platform(
+                    db,
+                    action="staff.granted" if staff else "staff.revoked",
+                    actor_type=ActorType.platform,
+                    actor_id=None,
+                    target_type="user",
+                    target_id=str(user.id),
+                    now=utcnow(),
+                )
+                await db.commit()
+                return user.id, True
+        finally:
+            await engine.dispose()
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        # The type only: messages can carry the connection string.
+        print(f"database error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    if result is None:
+        print("unknown user", file=sys.stderr)  # noqa: T201
+        return 2
+    user_id, changed = result
+    verb = ("granted" if staff else "revoked") if changed else "unchanged"
+    print(f"{verb} {user_id}")  # noqa: T201
+    return 0
+
+
+def staff_grant(email: str, settings: "CpSettings | None" = None) -> int:
+    """`sijil-cp staff grant <email>`: the user becomes platform staff (see `_set_staff`)."""
+    return _set_staff(email, True, settings)
+
+
+def staff_revoke(email: str, settings: "CpSettings | None" = None) -> int:
+    """`sijil-cp staff revoke <email>`: the user is platform staff no more."""
+    return _set_staff(email, False, settings)
+
+
 async def _ledger_problems(report: dict[str, Any], database_url: str) -> list[str]:
     """`ledger.mismatch:<id>` for each reported document whose ledger row is missing, belongs
     to another workspace, or holds another `sha256` or `fields_sha256`."""
@@ -272,9 +339,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     search_sub = search_parser.add_subparsers(dest="search_command", required=True)
     backfill = search_sub.add_parser("backfill", help="rebuild a workspace's search index")
     backfill.add_argument("workspace", type=UUID)
+    staff_parser = sub.add_parser("staff", help="platform staff (the /v1/staff API)")
+    staff_sub = staff_parser.add_subparsers(dest="staff_command", required=True)
+    staff_sub.add_parser("grant", help="make a user platform staff").add_argument("email")
+    staff_sub.add_parser("revoke", help="revoke a user's staff access").add_argument("email")
     args = parser.parse_args(argv)
     if args.command == "serve":
         serve()
+    elif args.command == "staff":
+        command = staff_grant if args.staff_command == "grant" else staff_revoke
+        sys.exit(command(args.email))
     elif args.command == "search":
         sys.exit(search_backfill(args.workspace))
     elif args.command == "audit":

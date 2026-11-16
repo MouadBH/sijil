@@ -159,6 +159,8 @@ class ActorType(StrEnum):
     user = "user"
     system = "system"
     email = "email"
+    # 0017: a platform operator at the `sijil-cp` command line (e.g. `staff grant`); no user id.
+    platform = "platform"
 
 
 def _enum(cls: type[StrEnum]) -> Enum:
@@ -257,6 +259,8 @@ class User(Base):
     totp_secret: Mapped[bytes | None] = mapped_column(LargeBinary)
     totp_pending: Mapped[bytes | None] = mapped_column(LargeBinary)
     totp_last_step: Mapped[int | None] = mapped_column(Integer)
+    # 0017 (ADM-4): platform staff (the `/v1/staff` API), set only by `sijil-cp staff grant`.
+    is_staff: Mapped[bool] = mapped_column(default=False, server_default=false())
 
     @validates("email")
     def _normalise_email(self, _key: str, value: str) -> str:
@@ -450,6 +454,28 @@ class AuditEvent(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    seq: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    actor_type: Mapped[ActorType] = mapped_column(_enum(ActorType))
+    actor_id: Mapped[str | None] = mapped_column(String)
+    action: Mapped[str] = mapped_column(String)
+    target_type: Mapped[str | None] = mapped_column(String)
+    target_id: Mapped[str | None] = mapped_column(String)
+    ip: Mapped[str | None] = mapped_column(String)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
+class PlatformAuditEvent(Base):
+    """The platform's own audit chain (0017), for events that belong to no organisation (a
+    staff grant): one chain, hashed and append-only like `AuditEvent`
+    (`sijil_core.audit.append_platform`). The app role has no UPDATE/DELETE grant."""
+
+    __tablename__ = "platform_audit_event"
+    __table_args__ = (UniqueConstraint("seq", name="uq_platform_audit_event_seq"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
     seq: Mapped[int] = mapped_column(Integer)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     actor_type: Mapped[ActorType] = mapped_column(_enum(ActorType))

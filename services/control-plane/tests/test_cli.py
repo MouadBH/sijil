@@ -157,3 +157,64 @@ def test_search_backfill_command_is_wired(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(SystemExit) as exited:
         cli.main(["search", "backfill", str(target)])
     assert (exited.value.code, seen) == (0, [target])
+
+
+async def _staff(command: str, email: str, settings: CpSettings) -> int:
+    fn = cli.staff_grant if command == "grant" else cli.staff_revoke
+    return await asyncio.to_thread(fn, email, settings)
+
+
+async def test_cli_grant_and_revoke(
+    db: AsyncSession, migrated_db: Any, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    from sqlalchemy import select
+
+    from sijil_core.db.models import PlatformAuditEvent, User
+
+    settings = _settings(migrated_db.app_url)
+    user = User(email="sam@example.com", name="SAMPLE", password_hash="x")
+    db.add(user)
+    await db.commit()
+
+    async def is_staff() -> bool:
+        await db.refresh(user)
+        return user.is_staff
+
+    user_id = user.id
+    assert not await is_staff()
+    # The email is matched as stored: case and spaces do not matter.
+    assert await _staff("grant", " Sam@Example.com ", settings) == 0
+    assert capsys.readouterr().out.strip() == f"granted {user.id}"
+    assert await is_staff()
+    # Granting again changes and audits nothing.
+    assert await _staff("grant", "sam@example.com", settings) == 0
+    assert capsys.readouterr().out.strip() == f"unchanged {user.id}"
+    assert await _staff("revoke", "sam@example.com", settings) == 0
+    assert capsys.readouterr().out.strip() == f"revoked {user.id}"
+    assert not await is_staff()
+    # An unknown email, or no database: exit code 2, nothing written.
+    assert await _staff("grant", "nobody@example.com", settings) == 2
+    assert "unknown user" in capsys.readouterr().err
+    assert await _staff("revoke", "sam@example.com", _settings(CLOSED_DB)) == 2
+    assert "database error" in capsys.readouterr().err
+
+    # Audited on the platform's own chain (no org), by the platform operator; ids, no email.
+    db.expire_all()
+    events = list(await db.scalars(select(PlatformAuditEvent).order_by(PlatformAuditEvent.seq)))
+    assert [(e.action, e.actor_type, e.actor_id) for e in events] == [
+        ("staff.granted", ActorType.platform, None),
+        ("staff.revoked", ActorType.platform, None),
+    ]
+    assert all((e.target_type, e.target_id, e.data) == ("user", str(user_id), {}) for e in events)
+    assert (await audit.verify_platform(db)).ok
+
+    # The commands are wired.
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(cli, "staff_grant", lambda email: seen.append(("grant", email)) or 0)
+    monkeypatch.setattr(cli, "staff_revoke", lambda email: seen.append(("revoke", email)) or 0)
+    for command in ("grant", "revoke"):
+        with pytest.raises(SystemExit) as exited:
+            cli.main(["staff", command, "sam@example.com"])
+        assert exited.value.code == 0
+    assert seen == [("grant", "sam@example.com"), ("revoke", "sam@example.com")]
