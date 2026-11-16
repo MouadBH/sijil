@@ -3,7 +3,8 @@ and queues its provisioning.
 
 `PATCH /orgs/{id}` accepts the organisation's `ice`: 15 ASCII digits, else 422
 `org.ice_invalid` (it cannot be cleared). It is required to choose a plan, and it is the first
-own-ICE guard of extraction and learning. A change is audited `org.ice_changed` `{ice}`.
+own-ICE guard of extraction and learning. A change is audited `org.ice_changed`
+`{ice_set: true}`, never the value (the hash-chained log can never be redacted).
 """
 
 import asyncio
@@ -244,7 +245,7 @@ async def patch_org(
             action="org.ice_changed",
             target_type="org",
             target_id=str(org_id),
-            data={"ice": body.ice},
+            data={"ice_set": True},  # never the value: the log can never be redacted
             now=now,
         )
     if body.name is not None:

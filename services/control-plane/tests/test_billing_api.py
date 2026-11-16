@@ -183,7 +183,8 @@ async def test_org_ice_is_15_digits(make_actor: MakeActor, db: AsyncSession) -> 
     org = await db.get(Organisation, UUID(org_id), populate_existing=True)
     assert org is not None and org.ice == ICE
     events = await db.scalars(select(AuditEvent.data).where(AuditEvent.action == "org.ice_changed"))
-    assert list(events) == [{"ice": ICE}]
+    # Never the value: the hash-chained log can never be redacted.
+    assert list(events) == [{"ice_set": True}]
 
 
 async def test_choose_plan_requires_org_ice(make_actor: MakeActor, db: AsyncSession) -> None:
@@ -253,18 +254,31 @@ async def _fill(db: AsyncSession, workspace_id: UUID, documents: int, big_bytes:
     await db.commit()
 
 
-async def test_capture_never_blocked_over_quota(
-    make_actor: MakeActor, db: AsyncSession, enqueuer: Any
-) -> None:
-    """At 150% of documents and storage, an upload is still accepted (202) and ingested."""
-    alice = await make_actor("alice@example.com")
-    org_id = await create_org(alice)
-    workspace = await db.scalar(select(Workspace).where(Workspace.org_id == UUID(org_id)))
-    assert workspace is not None
+async def _over_quota(alice: Any, db: AsyncSession, org_id: str, workspace: Workspace) -> None:
+    """150% of the trial's documents and storage."""
     await _fill(db, workspace.id, 3_000, 15 * GB // 2)
     usage = (await alice.client.get(f"/v1/orgs/{org_id}/usage")).json()["quotas"]
     assert (usage["documents"]["percent"], usage["documents"]["level"]) == (150, "over_100")
     assert (usage["storage"]["percent"], usage["storage"]["level"]) == (150, "over_100")
+
+
+# Task 3 adds `overdue` and `read_only` here. The inbound-email half of the same test, with
+# the same states, is services/worker/tests/test_smtp.py::test_capture_never_blocked_over_quota.
+BILLING_STATES: dict[str, Callable[[Any, AsyncSession, str, Workspace], Awaitable[None]]] = {
+    "over_quota": _over_quota,
+}
+
+
+@pytest.mark.parametrize("billing_state", list(BILLING_STATES))
+async def test_capture_never_blocked_over_quota(
+    make_actor: MakeActor, db: AsyncSession, enqueuer: Any, billing_state: str
+) -> None:
+    """In every billing state, an upload is still accepted (202) and queued for ingest."""
+    alice = await make_actor("alice@example.com")
+    org_id = await create_org(alice)
+    workspace = await db.scalar(select(Workspace).where(Workspace.org_id == UUID(org_id)))
+    assert workspace is not None
+    await BILLING_STATES[billing_state](alice, db, org_id, workspace)
     r = await alice.client.post(
         f"/v1/workspaces/{workspace.id}/documents",
         files={"file": ("facture.pdf", PDF, "application/pdf")},
