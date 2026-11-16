@@ -38,6 +38,13 @@ a question still `queued` or `answering` (`ask_store.claim_ask`); anything else 
    is computed again, at most STORE_ATTEMPTS times) and audits `ask.answered` `{kind,
    citation_count, templated}`.
 
+The asker's document-type grant (`ask_query.document_types`, ADM-1; NULL for every type) bounds
+every step from 2 on: the supplier is resolved among the granted documents only, and the figures,
+the left-out count, the retrieval and so the citations see only rows of a granted type
+(unclassified rows, which a grant shows only to their uploader, are left out). The intent's own
+document type applies on top, so an intent naming a type outside the grant matches nothing and
+gets the same answer as a type the archive has no documents of.
+
 The model never sees a figure it could change: the stored figures are the computed ones. Nothing
 leaves the workspace's index database and the allow-listed Ollama. Ollama unavailable raises for
 the task to retry (the M3 rules); once the retries are spent the question is `failed` with
@@ -321,7 +328,8 @@ async def _answer(
     engine: AsyncEngine, ollama: OllamaClient, settings: AskSettings,
     record: ask_store.AskRecord, intent: Intent, vector: list[float] | None,
 ) -> ask_store.Answer:  # fmt: skip
-    facts = await _facts(engine, intent, vector)
+    grant = None if record.document_types is None else frozenset(record.document_types)
+    facts = await _facts(engine, intent, vector, grant)
     if facts is None or not (facts.figures or facts.citations):
         return ask_store.Answer(
             intent=intent.as_json(), answer_text=None, answer_code=ANSWER_NO_MATCH,
@@ -386,18 +394,21 @@ def _writer_message(record: ask_store.AskRecord, facts: _Facts, lines: list[str]
 # The figures and the retrieval ----------------------------------------------------------------
 
 
-async def _facts(engine: AsyncEngine, intent: Intent, vector: list[float] | None) -> _Facts | None:
-    """None when the intent names a supplier no live document has. One REPEATABLE READ
-    transaction: the figures, their documents and the retrieval see the same rows."""
+async def _facts(
+    engine: AsyncEngine, intent: Intent, vector: list[float] | None, grant: frozenset[str] | None
+) -> _Facts | None:
+    """None when the intent names a supplier no live document of the `grant`'s types has (None:
+    every type). One REPEATABLE READ transaction: the figures, their documents and the retrieval
+    see the same rows."""
     async with engine.connect() as conn:
         await conn.execution_options(isolation_level="REPEATABLE READ")
         async with conn.begin():
             supplier = None
             if intent.supplier is not None:
-                supplier = await resolve_supplier(conn, intent.supplier)
+                supplier = await resolve_supplier(conn, intent.supplier, grant)
                 if supplier is None:
                     return None
-            where, params = _where(intent, supplier)
+            where, params = _where(intent, supplier, grant)
             summed = intent.kind in ("sum", "count")
             figures: list[dict[str, Any]] = []
             members: list[_Doc] = []
@@ -411,7 +422,7 @@ async def _facts(engine: AsyncEngine, intent: Intent, vector: list[float] | None
                         params,
                     ) or 0
                 )  # fmt: skip
-            ranked = await _retrieve(conn, intent, supplier, vector, summed=summed)
+            ranked = await _retrieve(conn, intent, supplier, vector, grant, summed=summed)
             citations = members[:MAX_CITATIONS] if summed else [d for d, _ in ranked[:KEEP]]
             numbers = {doc.id: n for n, doc in enumerate(citations, start=1)}
             chosen = [(numbers[d.id], s) for d, s in ranked if d.id in numbers][:MAX_SNIPPETS]
@@ -436,11 +447,22 @@ async def _facts(engine: AsyncEngine, intent: Intent, vector: list[float] | None
             )
 
 
+def _granted(grant: frozenset[str] | None, alias: str = "") -> tuple[str, dict[str, Any]]:
+    """The SQL condition (on `search_doc`, as `alias`) and parameters of the asker's grant."""
+    if grant is None:
+        return "true", {}
+    return f"{alias}document_type = ANY(CAST(:allowed_types AS text[]))", {
+        "allowed_types": sorted(grant)
+    }
+
+
 async def _recorded_supplier(
-    conn: AsyncConnection, folded: str
+    conn: AsyncConnection, folded: str, grant: frozenset[str] | None = None
 ) -> tuple[bool, float, _Supplier] | None:
     """The supplier record `folded` names best (its normalised name or an alias, at trigram
-    similarity >= SUPPLIER_SIMILARITY), with a live document of its ICE: (exact, score, it)."""
+    similarity >= SUPPLIER_SIMILARITY), with a live document of its ICE (of the grant's types):
+    (exact, score, it)."""
+    granted, params = _granted(grant, "d.")
     best = (
         await conn.execute(
             text(
@@ -453,12 +475,13 @@ async def _recorded_supplier(
                 ) m
                 WHERE m.score >= :t AND EXISTS (
                     SELECT 1 FROM search_doc d WHERE d.supplier_ice = s.ice AND d.{_LIVE}
+                      AND {granted}
                 )
                 ORDER BY m.exact DESC, m.score DESC, s.ice
                 LIMIT 1
                 """  # noqa: S608
             ),
-            {"name": folded, "t": SUPPLIER_SIMILARITY},
+            {"name": folded, "t": SUPPLIER_SIMILARITY, **params},
         )
     ).first()
     if best is None:
@@ -467,10 +490,12 @@ async def _recorded_supplier(
 
 
 async def _live_supplier(
-    conn: AsyncConnection, folded: str
+    conn: AsyncConnection, folded: str, grant: frozenset[str] | None = None
 ) -> tuple[bool, float, _Supplier] | None:
     """The live search row's supplier `folded` names best (`supplier_norm`, at trigram
-    similarity >= SUPPLIER_SIMILARITY), by its ICE when it has one: (exact, score, it)."""
+    similarity >= SUPPLIER_SIMILARITY; a row of the grant's types), by its ICE when it has one:
+    (exact, score, it)."""
+    granted, params = _granted(grant)
     # `%` uses the trigram index at this threshold, for this transaction only.
     await conn.execute(
         text("SELECT set_config('pg_trgm.similarity_threshold', :t, true)"),
@@ -483,13 +508,13 @@ async def _live_supplier(
                 SELECT supplier_ice, supplier_norm, similarity(supplier_norm, :name) AS score
                 FROM search_doc
                 WHERE {_LIVE} AND supplier_norm <> '' AND supplier_norm % :name
-                  AND similarity(supplier_norm, :name) >= :t
+                  AND similarity(supplier_norm, :name) >= :t AND {granted}
                 ORDER BY supplier_norm = :name DESC, similarity(supplier_norm, :name) DESC,
                     supplier_ice IS NULL, supplier_norm, supplier_ice
                 LIMIT 1
                 """  # noqa: S608
             ),
-            {"name": folded, "t": SUPPLIER_SIMILARITY},
+            {"name": folded, "t": SUPPLIER_SIMILARITY, **params},
         )
     ).first()
     if best is None:
@@ -498,33 +523,41 @@ async def _live_supplier(
     return best.supplier_norm == folded, float(best.score), found
 
 
-async def resolve_supplier(conn: AsyncConnection, name: str) -> _Supplier | None:
+async def resolve_supplier(
+    conn: AsyncConnection, name: str, grant: frozenset[str] | None = None
+) -> _Supplier | None:
     """The live supplier `name` means: a 15-digit ICE a live document carries; else the best
     of the supplier records (name or alias, `_recorded_supplier`) and the live search rows
     (`_live_supplier`): an exact normalised name wins outright, then the higher trigram
     similarity, and a tie goes to the record. None: no such supplier among the live
-    documents."""
+    documents. Only documents of the `grant`'s types count (None: every type)."""
+    granted, params = _granted(grant)
     folded = search_normalise(name).strip()
     digits = re.sub(r"[\s.-]", "", folded)
     if re.fullmatch(r"[0-9]{15}", digits):
         found = await conn.scalar(
-            text(f"SELECT 1 FROM search_doc WHERE supplier_ice = :ice AND {_LIVE} LIMIT 1"),  # noqa: S608
-            {"ice": digits},
+            text(
+                f"SELECT 1 FROM search_doc WHERE supplier_ice = :ice AND {_LIVE} "  # noqa: S608
+                f"AND {granted} LIMIT 1"
+            ),
+            {"ice": digits, **params},
         )
         return None if found is None else _Supplier(ice=digits, norm="")
     if not folded:
         return None
-    recorded = await _recorded_supplier(conn, folded)
-    live = await _live_supplier(conn, folded)
+    recorded = await _recorded_supplier(conn, folded, grant)
+    live = await _live_supplier(conn, folded, grant)
     if recorded is None or live is None:
         best = recorded or live
         return None if best is None else best[2]
     return recorded[2] if recorded[:2] >= live[:2] else live[2]
 
 
-def _where(intent: Intent, supplier: _Supplier | None) -> tuple[str, dict[str, Any]]:
-    clauses: list[str] = []
-    params: dict[str, Any] = {}
+def _where(
+    intent: Intent, supplier: _Supplier | None, grant: frozenset[str] | None = None
+) -> tuple[str, dict[str, Any]]:
+    granted, params = _granted(grant)
+    clauses: list[str] = [] if grant is None else [granted]
     if supplier is not None:
         if supplier.ice:
             clauses.append("supplier_ice = :ice")
@@ -598,7 +631,7 @@ def _vector_literal(vector: Sequence[float]) -> str:
 
 async def _retrieve(
     conn: AsyncConnection, intent: Intent, supplier: _Supplier | None,
-    vector: list[float] | None, *, summed: bool,
+    vector: list[float] | None, grant: frozenset[str] | None = None, *, summed: bool,
 ) -> list[tuple[_Doc, str]]:  # fmt: skip
     """The top CANDIDATES documents by `build_search`, re-ranked with the chunk embeddings,
     each with its excerpt (its closest chunk, else the start of its text)."""
@@ -609,7 +642,7 @@ async def _retrieve(
         period_from=intent.period_from,
         period_to=intent.period_to,
         status=list(_SUMMED) if summed else [],
-    )
+    ).within(grant)
     rows = (await conn.execute(build_search(filters, "relevance", None, CANDIDATES))).all()
     if not rows and filters.q:  # the keywords found nothing: the other filters alone
         filters = filters.model_copy(update={"q": None})

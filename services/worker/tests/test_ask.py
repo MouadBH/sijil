@@ -272,13 +272,15 @@ def _atlas(**changes: str | None) -> dict[str, str | None]:
 
 
 async def _ask(
-    engine: AsyncEngine, question: str, locale: str = "fr", by: uuid.UUID | None = None
-) -> uuid.UUID:
+    engine: AsyncEngine, question: str, locale: str = "fr", by: uuid.UUID | None = None,
+    document_types: list[str] | None = None,
+) -> uuid.UUID:  # fmt: skip
     ask_id = uuid.uuid4()
     async with engine.begin() as conn:
         await ask_store.create_ask(
-            conn, ask_id, question=question, locale=locale, created_by=by or uuid.uuid4(), now=NOW
-        )
+            conn, ask_id, question=question, locale=locale, created_by=by or uuid.uuid4(), now=NOW,
+            document_types=document_types,
+        )  # fmt: skip
     return ask_id
 
 
@@ -1039,3 +1041,100 @@ async def test_a_resend_racing_a_slow_first_run_answers_once(
     async with engine.connect() as conn:
         assert await ask_store.read_ask(conn, ask_id) == second
     assert len(await _events(db, ready, "ask.answered")) == 1
+
+
+# Document-type grants (ADM-1) ---------------------------------------------------------------
+
+
+def _payslip(**changes: str | None) -> dict[str, str | None]:
+    """A SAMPLE payslip carrying Atlas's ICE, so that the supplier filter alone cannot hide it."""
+    return _atlas(**({"document_type": "payslip", "number": "P-2026-09"} | changes))
+
+
+async def test_ask_figures_exclude_types_outside_the_askers_grant(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    docs = await _samples(engine)
+    payslip = await _document(engine, _payslip(vat="100.00"), "SAMPLE Atlas bulletin de paie",
+                              chunks=["SAMPLE Atlas bulletin de paie"])  # fmt: skip
+    waiting = await _document(
+        engine, _payslip(number="P-2026-10", vat="5.00"), "SAMPLE Atlas paie", "needs_review"
+    )
+    atlas = {docs["sample-01-fr.pdf"], docs["sample-02-ar.pdf"]}
+
+    everything = await _answer(
+        await _ask(engine, QUESTION_FR), ready, sessions, engines,
+        FakeOllama(VAT_ATLAS_2026, says("529.80 MAD [#1]")),
+    )  # fmt: skip
+    assert [f["value"] for f in everything.figures] == ["529.80"]
+    assert everything.excluded == {"needs_review": 1}
+
+    invoices = await _answer(
+        await _ask(engine, QUESTION_FR, document_types=["invoice"]), ready, sessions, engines,
+        FakeOllama(VAT_ATLAS_2026, says("429.80 MAD [#1]")),
+    )  # fmt: skip
+    assert invoices.figures == [
+        {"measure": "vat", "value": "429.80", "currency": "MAD", "document_count": 2}
+    ]
+    assert set(invoices.counted) == set(invoices.citations) == atlas
+    assert invoices.excluded == {"needs_review": 0}
+    assert invoices.document_types == ["invoice"]
+
+    payslips = await _answer(
+        await _ask(engine, QUESTION_FR, document_types=["payslip"]), ready, sessions, engines,
+        FakeOllama(VAT_ATLAS_2026, says("100.00 MAD [#1]")),
+    )  # fmt: skip
+    assert [f["value"] for f in payslips.figures] == ["100.00"]
+    assert payslips.counted == payslips.citations == [payslip]
+    assert payslips.excluded == {"needs_review": 1}
+    assert waiting not in payslips.counted
+
+    # Retrieval too: a lookup that reads like the payslip never cites it.
+    lookup = await _answer(
+        await _ask(engine, "Le bulletin de paie Atlas ?", document_types=["invoice"]),
+        ready, sessions, engines,
+        FakeOllama(HOTEL, says("La facture [#1]."), like="SAMPLE Atlas bulletin de paie"),
+    )  # fmt: skip
+    assert lookup.citations and payslip not in lookup.citations
+    assert set(lookup.citations) <= set(docs.values())
+
+
+async def test_ask_for_a_hidden_type_answers_no_documents(
+    ready: Workspace, sessions: async_sessionmaker[AsyncSession], engines: IndexEngines,
+    engine: AsyncEngine,
+) -> None:  # fmt: skip
+    await _samples(engine)
+    await _document(engine, _payslip(vat="100.00"), "SAMPLE Atlas bulletin de paie")
+    await _document(
+        engine, _payslip(number="P-2026-10", vat="5.00"), "SAMPLE Atlas paie", "needs_review"
+    )
+
+    def asked(document_type: str) -> dict[str, Any]:
+        return VAT_ATLAS_2026 | {"document_type": document_type}
+
+    # The intent names payslips, outside the asker's grant: the answer an intent naming a type
+    # the archive has none of gets, nothing more.
+    hidden = await _answer(
+        await _ask(engine, QUESTION_FR, document_types=["invoice"]), ready, sessions, engines,
+        FakeOllama(asked("payslip")),
+    )  # fmt: skip
+    none = await _answer(
+        await _ask(engine, QUESTION_FR, document_types=["invoice"]), ready, sessions, engines,
+        FakeOllama(asked("contract")),
+    )  # fmt: skip
+    for record in (hidden, none):
+        assert (record.answer_text, record.answer_code) == (None, ANSWER_NO_MATCH)
+        assert record.figures == [] and record.citations == [] and record.counted == []
+        assert record.excluded == {"needs_review": 0}
+    # A supplier known only from payslips is no supplier for an invoice-only asker either.
+    only_payslips = "Paie Bâtiment SAMPLE SARL"
+    await _document(
+        engine, _payslip(supplier_name=only_payslips, supplier_ice="002905837000042"),
+        "SAMPLE paie",
+    )  # fmt: skip
+    unknown = await _answer(
+        await _ask(engine, QUESTION_FR, document_types=["invoice"]), ready, sessions, engines,
+        FakeOllama(VAT_ATLAS_2026 | {"supplier": only_payslips}),
+    )  # fmt: skip
+    assert (unknown.answer_code, unknown.figures, unknown.citations) == (ANSWER_NO_MATCH, [], [])
