@@ -25,7 +25,8 @@ Billing is per organisation, in the control-plane database of its region.
 - **Advance** (`advance`: the daily job `sijil.billing_daily`, and the request paths that need
   the stored state current): issues the first annual invoice once the trial has ended (with an
   ICE), the renewal RENEWAL_NOTICE before `period_end` (on `pending_plan_code` when there is
-  one), rolls the billing year on at `period_end` (the renewal's plan then applies), marks
+  one), rolls the billing year on at `period_end` (the plan the new year is invoiced on then
+  applies: its renewal's, or an upgrade's issued after it), marks
   unpaid invoices past due `overdue`, and stores the phase. Each transition is audited once:
   `billing.invoice_issued`, `billing.overdue` (`{number}` for an invoice, `{reason}` for the
   missing ICE) and `billing.read_only`.
@@ -441,6 +442,18 @@ async def locked_subscription(db: AsyncSession, org_id: UUID) -> tuple[Organisat
     return org, sub
 
 
+async def _billed_plan(db: AsyncSession, org_id: UUID, start: datetime) -> str | None:
+    """The plan the billing year starting at `start` is invoiced on: that of its last invoice
+    (its renewal, or an upgrade issued after it), or None when nothing is issued for it."""
+    found: str | None = await db.scalar(
+        select(Invoice.plan_code)
+        .where(Invoice.org_id == org_id, Invoice.period_start == start)
+        .order_by(Invoice.issued_at.desc(), Invoice.number.desc())
+        .limit(1)
+    )
+    return found
+
+
 async def _annual_for(db: AsyncSession, org_id: UUID, start: datetime) -> Invoice | None:
     """The annual invoice of the billing year starting at `start`, if issued."""
     found: Invoice | None = await db.scalar(
@@ -480,11 +493,16 @@ async def advance(
             )
         if now < sub.period_end:
             break
-        if renewal is not None:
-            sub.plan_code = renewal.plan_code
+        # The new year runs on the plan it is invoiced on (an upgrade issued after its renewal
+        # included). A pending downgrade that this renewal already carries is done; one chosen
+        # after it was issued waits for the following renewal.
+        billed = await _billed_plan(db, org.id, sub.period_end)
+        if billed is not None:
+            sub.plan_code = billed
+            if sub.pending_plan_code == billed:
+                sub.pending_plan_code = None
         elif sub.pending_plan_code is not None:
-            sub.plan_code = sub.pending_plan_code
-        sub.pending_plan_code = None
+            sub.plan_code, sub.pending_plan_code = sub.pending_plan_code, None
         sub.period_start, sub.period_end = sub.period_end, add_year(sub.period_end)
     late = await db.scalars(
         select(Invoice)
@@ -511,3 +529,66 @@ async def advance(
     sub.status_reason = current.reason
     await db.flush()
     return current
+
+
+@dataclass(frozen=True)
+class PlanChange:
+    previous: str  # the plan in force before
+    changed: bool
+    # `trial_end`, `now`, `renewal` (the next renewal invoice is on the new plan) or
+    # `following_renewal` (the next year is already invoiced: the renewal after it).
+    effective: str
+
+
+async def change_plan(
+    db: AsyncSession, org_id: UUID, plan: Plan, now: datetime, *, seller: SellerSettings
+) -> PlanChange:
+    """The Owner's choice of plan (`PUT /orgs/{id}/subscription`), after `advance`, in the
+    caller's transaction (the caller audits and commits)."""
+    current_phase = await advance(db, org_id, now, seller=seller)
+    org, sub = await locked_subscription(db, org_id)
+    previous = sub.plan_code
+    if current_phase.status is SubscriptionStatus.trial:
+        sub.plan_code = plan.code
+        return PlanChange(previous, plan.code != previous, "trial_end")
+    current = await _plan(db, sub.plan_code)
+    if plan.code == current.code:
+        changed = sub.pending_plan_code is not None
+        sub.pending_plan_code = None
+        return PlanChange(previous, changed, "now")
+    # The next year, when its renewal is already issued (the last RENEWAL_NOTICE of the year).
+    next_billed = await _billed_plan(db, org.id, sub.period_end)
+    if plan.price_ht > current.price_ht:
+        await invoicing.issue(
+            db,
+            org,
+            InvoiceKind.upgrade,
+            plan,
+            (now, sub.period_end),
+            now,
+            seller=seller,
+            price_ht=plan.price_ht - current.price_ht,
+            fraction=invoicing.prorata(sub.period_start, sub.period_end, now, org.region),
+        )
+        if next_billed is not None:
+            # Never altered: the issued renewal stands, and the next year's difference is
+            # invoiced in full, so the year after the roll is billed at the new plan's price.
+            billed = await _plan(db, next_billed)
+            if plan.price_ht > billed.price_ht:
+                await invoicing.issue(
+                    db,
+                    org,
+                    InvoiceKind.upgrade,
+                    plan,
+                    (sub.period_end, add_year(sub.period_end)),
+                    now,
+                    seller=seller,
+                    price_ht=plan.price_ht - billed.price_ht,
+                )
+        sub.plan_code, sub.pending_plan_code = plan.code, None
+        return PlanChange(previous, True, "now")
+    changed = plan.code != sub.pending_plan_code
+    sub.pending_plan_code = plan.code
+    # The next year already invoiced on the dearer plan: the downgrade applies at the renewal
+    # after it (no credit note, and the issued renewal is never altered).
+    return PlanChange(previous, changed, "renewal" if next_billed is None else "following_renewal")

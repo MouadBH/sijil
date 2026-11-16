@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from sijil_core import billing
+from sijil_core import billing, invoicing
 from sijil_core.db.models import (
     AuditEvent,
     Invoice,
@@ -19,6 +19,7 @@ from sijil_core.db.models import (
     Membership,
     Organisation,
     OrgType,
+    Plan,
     Role,
     Subscription,
     SubscriptionStatus,
@@ -255,3 +256,149 @@ async def test_daily_covers_this_region_only(
     await billing_daily(sessions, settings=SELLER, now=TRIAL_END + timedelta(days=1))
     assert await _invoices(db, abroad) == []
     assert (await _sub(db, abroad)).status is SubscriptionStatus.trial
+
+
+# Fix round 1: a plan change inside the renewal window (the last 30 days) ---------------------
+
+YEAR_END = TRIAL_END.replace(year=TRIAL_END.year + 1)
+
+
+async def _pay_all(sessions: async_sessionmaker[AsyncSession], org: Organisation) -> None:
+    async with sessions() as session:
+        rows = await session.scalars(
+            select(Invoice).where(Invoice.org_id == org.id, Invoice.state != InvoiceState.paid)
+        )
+        for row in rows:
+            row.state, row.paid_at, row.payment_reference = (
+                InvoiceState.paid, row.issued_at, f"VIR-SAMPLE-{row.number}"
+            )  # fmt: skip
+        await session.commit()
+
+
+async def _renewal_issued(
+    db: AsyncSession, sessions: async_sessionmaker[AsyncSession], org: Organisation, plan: str
+) -> None:
+    """The first year started on `plan` and paid; the renewal on it issued, 30 days before the
+    year ends."""
+    async with sessions() as session:
+        row = await session.scalar(select(Subscription).where(Subscription.org_id == org.id))
+        assert row is not None
+        row.plan_code = plan
+        await session.commit()
+    await billing_daily(sessions, settings=SELLER, now=TRIAL_END + timedelta(hours=2))
+    await _pay_all(sessions, org)
+    await billing_daily(sessions, settings=SELLER, now=YEAR_END - timedelta(days=29))
+    renewal = (await _invoices(db, org))[-1]
+    assert (renewal.period_start, renewal.plan_code) == (YEAR_END, plan)
+
+
+async def _change(
+    sessions: async_sessionmaker[AsyncSession], org: Organisation, plan: str, now: datetime
+) -> billing.PlanChange:
+    async with sessions() as session:
+        row = await session.get(Plan, plan)
+        assert row is not None
+        change = await billing.change_plan(session, org.id, row, now, seller=SELLER)
+        await session.commit()
+    return change
+
+
+@pytest.mark.db
+async def test_upgrade_in_the_renewal_window_is_billed_and_kept_after_the_roll(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    org: Organisation,
+    user: User,
+    workspace: Workspace,
+) -> None:
+    await _subscribed(db, org, user, ICE)
+    await _renewal_issued(db, sessions, org, "essentiel")
+    change = await _change(sessions, org, "pro", YEAR_END - timedelta(days=10))
+    assert (change.previous, change.changed, change.effective) == ("essentiel", True, "now")
+    invoices = await _invoices(db, org)
+    # The 10 days left of this year, prorated; then the next year's difference in full, since
+    # its renewal was already issued on essentiel (never altered).
+    days = invoicing.prorata(
+        TRIAL_END, YEAR_END, YEAR_END - timedelta(days=10), "ma-cas"
+    )  # fmt: skip
+    prorated, corrective = invoices[-2:]
+    assert (prorated.kind, prorated.plan_code, prorated.period_end) == (
+        InvoiceKind.upgrade, "pro", YEAR_END
+    )  # fmt: skip
+    assert prorated.amount_ht == invoicing.amounts(Decimal("3600.00"), days).ht
+    assert (corrective.kind, corrective.plan_code, corrective.amount_ht) == (
+        InvoiceKind.upgrade, "pro", Decimal("3600.00")
+    )  # fmt: skip
+    assert (corrective.period_start, corrective.period_end) == (
+        YEAR_END, YEAR_END.replace(year=YEAR_END.year + 1)
+    )  # fmt: skip
+    renewal = invoices[-3]
+    assert (renewal.plan_code, renewal.amount_ht) == ("essentiel", Decimal("2400.00"))
+    await _pay_all(sessions, org)
+    # The roll keeps pro in force: the next year is billed 2 400 + 3 600 = pro's 6 000 HT.
+    await billing_daily(sessions, settings=SELLER, now=YEAR_END + timedelta(hours=1))
+    sub = await _sub(db, org)
+    assert (sub.plan_code, sub.pending_plan_code, sub.period_start) == ("pro", None, YEAR_END)
+    assert (sub.status, len(await _invoices(db, org))) == (SubscriptionStatus.active, 4)
+    # The year after is renewed on pro.
+    year_2 = YEAR_END.replace(year=YEAR_END.year + 1)
+    await billing_daily(sessions, settings=SELLER, now=year_2 - timedelta(days=29))
+    last = (await _invoices(db, org))[-1]
+    assert (last.kind, last.plan_code, last.period_start) == (InvoiceKind.annual, "pro", year_2)
+
+
+@pytest.mark.db
+async def test_downgrade_in_the_renewal_window_applies_at_the_following_renewal(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    org: Organisation,
+    user: User,
+    workspace: Workspace,
+) -> None:
+    await _subscribed(db, org, user, ICE)
+    await _renewal_issued(db, sessions, org, "pro")
+    before = len(await _invoices(db, org))
+    change = await _change(sessions, org, "essentiel", YEAR_END - timedelta(days=10))
+    # The next year is already invoiced on pro: the downgrade waits for the renewal after it.
+    assert (change.changed, change.effective) == (True, "following_renewal")
+    assert len(await _invoices(db, org)) == before
+    await _pay_all(sessions, org)
+    await billing_daily(sessions, settings=SELLER, now=YEAR_END + timedelta(hours=1))
+    sub = await _sub(db, org)
+    assert (sub.plan_code, sub.pending_plan_code) == ("pro", "essentiel")
+    year_2 = YEAR_END.replace(year=YEAR_END.year + 1)
+    await billing_daily(sessions, settings=SELLER, now=year_2 - timedelta(days=29))
+    renewal = (await _invoices(db, org))[-1]
+    assert (renewal.plan_code, renewal.amount_ht, renewal.period_start) == (
+        "essentiel", Decimal("2400.00"), year_2
+    )  # fmt: skip
+    await _pay_all(sessions, org)
+    await billing_daily(sessions, settings=SELLER, now=year_2 + timedelta(hours=1))
+    sub = await _sub(db, org)
+    assert (sub.plan_code, sub.pending_plan_code) == ("essentiel", None)
+
+
+@pytest.mark.db
+async def test_downgrade_before_the_renewal_is_invoiced_applies_at_that_renewal(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    org: Organisation,
+    user: User,
+    workspace: Workspace,
+) -> None:
+    await _subscribed(db, org, user, ICE)
+    async with sessions() as session:
+        row = await session.scalar(select(Subscription).where(Subscription.org_id == org.id))
+        assert row is not None
+        row.plan_code = "pro"
+        await session.commit()
+    await billing_daily(sessions, settings=SELLER, now=TRIAL_END + timedelta(hours=2))
+    await _pay_all(sessions, org)
+    change = await _change(sessions, org, "essentiel", YEAR_END - timedelta(days=60))
+    assert change.effective == "renewal"
+    await billing_daily(sessions, settings=SELLER, now=YEAR_END - timedelta(days=29))
+    assert (await _invoices(db, org))[-1].plan_code == "essentiel"
+    await _pay_all(sessions, org)
+    await billing_daily(sessions, settings=SELLER, now=YEAR_END + timedelta(hours=1))
+    sub = await _sub(db, org)
+    assert (sub.plan_code, sub.pending_plan_code) == ("essentiel", None)

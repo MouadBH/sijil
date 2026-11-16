@@ -13,10 +13,13 @@
   a trial that ended is never treated as running.
   - In the trial, the plan is the one the first year starts on (the trial keeps
     `essentiel`'s quotas): effective `trial_end`.
-  - Otherwise a dearer plan applies at once (effective `now`) with an `upgrade` invoice for
-    the price difference times the share of the billing year left (`invoicing.prorata`), a
-    cheaper one waits for the renewal as `pending_plan_code` (effective `renewal`, no credit
-    note), and the current plan clears a pending change.
+  - Otherwise (`billing.change_plan`) a dearer plan applies at once (effective `now`) with an
+    `upgrade` invoice for the price difference times the share of the billing year left
+    (`invoicing.prorata`); if the next year's renewal is already issued (its last 30 days), a
+    second `upgrade` invoice bills that year's full difference, and the plan stays in force
+    after the roll. A cheaper one waits as `pending_plan_code`, with no credit note: effective
+    `renewal`, or `following_renewal` when the next year is already invoiced (it then applies
+    at the renewal after that one). The current plan clears a pending change.
   - A change is audited `billing.plan_chosen` `{from, to, effective}`.
 - `GET /orgs/{id}/invoices`, `GET /orgs/{id}/invoices/{inv}` and `GET …/{inv}/pdf` (the PDF
   stored at issue, never rendered again): Owners and Admins; another org's invoice, or none,
@@ -34,7 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
-from sijil_core import billing, invoicing
+from sijil_core import billing
 from sijil_core.db.models import (
     Invoice,
     InvoiceKind,
@@ -214,37 +217,9 @@ async def choose_plan(
     if org.ice is None:
         raise ApiError("org.ice_required", 422)
     ensure_step_up(session, user, now)
-    settings = request.app.state.settings
-    current_phase = await billing.advance(db, org_id, now, seller=settings)
-    org, sub = await billing.locked_subscription(db, org_id)
-    previous = sub.plan_code
-    if current_phase.status is SubscriptionStatus.trial:
-        changed, effective = plan.code != sub.plan_code, "trial_end"
-        sub.plan_code = plan.code
-    else:
-        current = await db.get(Plan, sub.plan_code)
-        if current is None:  # unreachable: the foreign key guarantees the plan
-            raise ApiError("not_found", 404)
-        if plan.code == current.code:
-            changed, effective = sub.pending_plan_code is not None, "now"
-            sub.pending_plan_code = None
-        elif plan.price_ht > current.price_ht:
-            changed, effective = True, "now"
-            await invoicing.issue(
-                db,
-                org,
-                InvoiceKind.upgrade,
-                plan,
-                (now, sub.period_end),
-                now,
-                seller=settings,
-                price_ht=plan.price_ht - current.price_ht,
-                fraction=invoicing.prorata(sub.period_start, sub.period_end, now, org.region),
-            )
-            sub.plan_code, sub.pending_plan_code = plan.code, None
-        else:
-            changed, effective = plan.code != sub.pending_plan_code, "renewal"
-            sub.pending_plan_code = plan.code
+    change = await billing.change_plan(db, org_id, plan, now, seller=request.app.state.settings)
+    _, sub = await billing.locked_subscription(db, org_id)
+    previous, changed, effective = change.previous, change.changed, change.effective
     if changed:
         await audit_org_event(
             db,
