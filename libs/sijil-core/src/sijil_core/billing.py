@@ -552,12 +552,37 @@ async def change_plan(
         sub.plan_code = plan.code
         return PlanChange(previous, plan.code != previous, "trial_end")
     current = await _plan(db, sub.plan_code)
+
+    async def bill_next_year() -> bool:
+        """When the next year is already invoiced (its renewal is issued: the last
+        RENEWAL_NOTICE of the year) on a plan cheaper than the one chosen, invoices that
+        year's difference in full, so it is billed, and then runs, on the chosen plan. An
+        issued invoice is never altered. Returns whether the next year is now billed on it."""
+        billed_code = await _billed_plan(db, org.id, sub.period_end)
+        if billed_code is None:
+            return False
+        billed = await _plan(db, billed_code)
+        if plan.price_ht > billed.price_ht:
+            await invoicing.issue(
+                db,
+                org,
+                InvoiceKind.upgrade,
+                plan,
+                (sub.period_end, add_year(sub.period_end)),
+                now,
+                seller=seller,
+                price_ht=plan.price_ht - billed.price_ht,
+            )
+            return True
+        return billed.code == plan.code
+
     if plan.code == current.code:
-        changed = sub.pending_plan_code is not None
+        # Keeping the plan in force (or cancelling a pending downgrade): it stays after the
+        # roll, the next year billed at its price.
+        corrected = await bill_next_year()
+        changed = sub.pending_plan_code is not None or corrected
         sub.pending_plan_code = None
         return PlanChange(previous, changed, "now")
-    # The next year, when its renewal is already issued (the last RENEWAL_NOTICE of the year).
-    next_billed = await _billed_plan(db, org.id, sub.period_end)
     if plan.price_ht > current.price_ht:
         await invoicing.issue(
             db,
@@ -570,25 +595,13 @@ async def change_plan(
             price_ht=plan.price_ht - current.price_ht,
             fraction=invoicing.prorata(sub.period_start, sub.period_end, now, org.region),
         )
-        if next_billed is not None:
-            # Never altered: the issued renewal stands, and the next year's difference is
-            # invoiced in full, so the year after the roll is billed at the new plan's price.
-            billed = await _plan(db, next_billed)
-            if plan.price_ht > billed.price_ht:
-                await invoicing.issue(
-                    db,
-                    org,
-                    InvoiceKind.upgrade,
-                    plan,
-                    (sub.period_end, add_year(sub.period_end)),
-                    now,
-                    seller=seller,
-                    price_ht=plan.price_ht - billed.price_ht,
-                )
+        await bill_next_year()
         sub.plan_code, sub.pending_plan_code = plan.code, None
         return PlanChange(previous, True, "now")
+    # A cheaper plan waits: no credit note. It applies at the coming roll when the next year is
+    # (now) billed on it, or has no invoice yet; otherwise at the renewal after it.
+    issued = await _billed_plan(db, org.id, sub.period_end) is not None
+    at_roll = await bill_next_year() or not issued
     changed = plan.code != sub.pending_plan_code
     sub.pending_plan_code = plan.code
-    # The next year already invoiced on the dearer plan: the downgrade applies at the renewal
-    # after it (no credit note, and the issued renewal is never altered).
-    return PlanChange(previous, changed, "renewal" if next_billed is None else "following_renewal")
+    return PlanChange(previous, changed, "renewal" if at_roll else "following_renewal")
