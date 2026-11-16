@@ -106,6 +106,7 @@ def test_weights_table_is_the_design_one() -> None:
         "retention.extend_failed",
         "supplier_mismatch",
         "supplier_own_ice",
+        "quota_exceeded",
     }
 
 

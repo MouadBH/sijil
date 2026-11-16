@@ -3,7 +3,8 @@
 For each manifest entry the ledger row is found by the SHA-256 of the fixture file within the
 workspace (the ledger holds it, unique per workspace), and its stored `document_fields` are
 compared with the manifest. A row without fields is computed now with the same step
-`extract_document` uses (`_compute`: the two model runs, nothing written) and is marked
+`extract_document` uses (`_compute`: the two model runs, nothing written, not even the AI
+pages of the billing meter) and is marked
 "computed": the index, the audit log and the ledger are never written, and nothing is routed.
 Accuracy is reported, never gated: the exit code is 0 whatever it is, and 2 when the set or the
 workspace is not found (or the set is malformed).
@@ -271,6 +272,7 @@ async def evaluate(
                     else:
                         row, _, _ = await _compute(
                             job,
+                            sessions=None,  # read-only: no billing gate, nothing metered
                             index=engines,
                             paperless=paperless,
                             ollama=ollama,
