@@ -24,12 +24,14 @@ from sijil_core.db.models import (
     DocumentSource,
     IngestState,
     Organisation,
+    SubscriptionStatus,
     Workspace,
     WorkspaceState,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES
 from sijil_core.settings import CoreSettings
 from sijil_worker.smtp import SijilSmtpHandler, configure_logging
+from tests.support.billing_states import make_late
 from tests.support.memory_store import MemoryObjectStore
 
 pytestmark = pytest.mark.db
@@ -409,9 +411,19 @@ async def _over_quota(db: AsyncSession, workspace: Workspace) -> None:
     assert (meter.quotas["documents"].percent, meter.quotas["storage"].percent) == (150, 150)
 
 
-# Task 3 adds `overdue` and `read_only` here, each with its own setup.
+async def _overdue(db: AsyncSession, workspace: Workspace) -> None:
+    await make_late(db, workspace.org_id, utcnow(), SubscriptionStatus.overdue)
+
+
+async def _read_only(db: AsyncSession, workspace: Workspace) -> None:
+    await make_late(db, workspace.org_id, utcnow(), SubscriptionStatus.read_only)
+
+
+# Every billing state (the upload half is in services/control-plane/tests/test_billing_api.py).
 BILLING_STATES: dict[str, Callable[[AsyncSession, Workspace], Awaitable[None]]] = {
     "over_quota": _over_quota,
+    "overdue": _overdue,
+    "read_only": _read_only,
 }
 
 

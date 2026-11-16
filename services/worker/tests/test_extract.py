@@ -2064,9 +2064,7 @@ async def test_ai_stops_when_overdue_documents_go_to_review(
     row = await fields_of(engines, ready, ledger.id)
     assert (row.flags, row.values) == (("billing_overdue",), dict.fromkeys(FIELD_NAMES))
     assert (await reload(db, ledger)).state is DocumentState.needs_review
-    skipped = [
-        e.data for e in await events(db, ready) if e.action == "document.extraction_skipped"
-    ]
+    skipped = [e.data for e in await events(db, ready) if e.action == "document.extraction_skipped"]
     assert skipped == [{"code": "billing_overdue"}]
 
 
