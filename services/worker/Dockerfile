@@ -6,6 +6,8 @@ WORKDIR /src
 
 COPY pyproject.toml uv.lock ./
 COPY libs ./libs
+# The invoice PDF's labels: the product's one message catalogue (sijil_core.invoicing).
+COPY packages/i18n/messages ./packages/i18n/messages
 COPY services ./services
 RUN uv sync --frozen --no-dev --package sijil-worker
 

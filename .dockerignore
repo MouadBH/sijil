@@ -11,6 +11,8 @@
 .claude
 apps
 packages
+# The invoice PDF reads its labels from the catalogue (sijil_core.invoicing.messages).
+!packages/i18n/messages
 fixtures
 infra
 docs

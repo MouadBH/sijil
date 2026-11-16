@@ -144,6 +144,17 @@ class SubscriptionStatus(StrEnum):
     closed = "closed"
 
 
+class InvoiceKind(StrEnum):
+    annual = "annual"
+    upgrade = "upgrade"
+
+
+class InvoiceState(StrEnum):
+    issued = "issued"
+    overdue = "overdue"
+    paid = "paid"
+
+
 class ActorType(StrEnum):
     user = "user"
     system = "system"
@@ -546,8 +557,11 @@ class Subscription(Base):
     trial_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    # A downgrade waits for the renewal (Task 3 applies it).
+    # A downgrade waits for the renewal, which applies it (`sijil_core.billing.advance`).
     pending_plan_code: Mapped[str | None] = mapped_column(ForeignKey("plan.code"))
+    # 0016: why the status is what it is, when the status alone does not say
+    # (`org.ice_required`: the trial ended with no ICE to invoice).
+    status_reason: Mapped[str | None] = mapped_column(String(64))
 
 
 class UsageRecord(Base):
@@ -589,3 +603,59 @@ class QuotaWarning(Base):
     threshold: Mapped[int] = mapped_column(Integer)
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class InvoiceCounter(Base):
+    """The last invoice number given in a calendar year of issue (0016): locked FOR UPDATE in
+    the issuing transaction, so numbers are gapless and a rollback gives its number back."""
+
+    __tablename__ = "invoice_counter"
+    __table_args__ = (CheckConstraint("last >= 0", name="last_non_negative"),)
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last: Mapped[int] = mapped_column(Integer)
+
+
+class Invoice(Base):
+    """An invoice in MAD (0016, ADM-4): `SIJ-{YYYY}-{NNNNNN}`. Everything but its payment
+    (`state`, `paid_at`, `payment_reference`) is frozen at issue, the buyer and seller as
+    snapshots and the PDF with its SHA-256; a trigger refuses any other change, and the app role
+    may not DELETE it."""
+
+    __tablename__ = "invoice"
+    __table_args__ = (
+        CheckConstraint("kind IN ('annual', 'upgrade')", name="kind_known"),
+        CheckConstraint("state IN ('issued', 'overdue', 'paid')", name="state_known"),
+        CheckConstraint("currency = 'MAD'", name="currency_mad"),
+        CheckConstraint("amount_ttc = amount_ht + amount_vat", name="ttc_is_ht_plus_vat"),
+        CheckConstraint("amount_ht >= 0 AND amount_vat >= 0", name="amounts_non_negative"),
+        CheckConstraint("number ~ '^SIJ-[0-9]{4}-[0-9]{6}$'", name="number_format"),
+        CheckConstraint("period_end > period_start", name="period_ordered"),
+        CheckConstraint("(state = 'paid') = (paid_at IS NOT NULL)", name="paid_at_iff_paid"),
+        UniqueConstraint("number", name="uq_invoice_number"),
+        Index("ix_invoice_org_issued", "org_id", "issued_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    number: Mapped[str] = mapped_column(String(16))
+    year: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[InvoiceKind] = mapped_column(_enum(InvoiceKind))
+    plan_code: Mapped[str] = mapped_column(ForeignKey("plan.code"))
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    amount_ht: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    vat_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2))
+    amount_vat: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    amount_ttc: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    currency: Mapped[str] = mapped_column(String(3))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = _tstz()
+    payment_reference: Mapped[str | None] = mapped_column(String(128))
+    state: Mapped[InvoiceState] = mapped_column(_enum(InvoiceState), default=InvoiceState.issued)
+    buyer: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    seller: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    locale: Mapped[Locale] = mapped_column(_enum(Locale))
+    pdf: Mapped[bytes] = mapped_column(LargeBinary)
+    pdf_sha256: Mapped[str] = mapped_column(String(64))

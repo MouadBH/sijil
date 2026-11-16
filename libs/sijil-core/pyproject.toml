@@ -1,7 +1,7 @@
 [project]
 name = "sijil-core"
 version = "0.0.0"
-description = "Shared code for Sijil Python services: settings, region guard, crypto, Paperless client."
+description = "Shared code for Sijil Python services: settings, region guard, crypto, Paperless client, billing."
 requires-python = ">=3.13,<3.14"
 dependencies = [
   "pydantic>=2.10",
@@ -12,6 +12,11 @@ dependencies = [
   "httpx>=0.28",
   "boto3>=1.35",
   "tzdata>=2024.1",
+  # The invoice PDF (`invoice_pdf`): fr and ar (reshaped, bidi-ordered), the total in words.
+  "reportlab>=4.2",
+  "arabic-reshaper>=3.0",
+  "python-bidi>=0.6",
+  "num2words>=0.5.14",
 ]
 
 [build-system]
