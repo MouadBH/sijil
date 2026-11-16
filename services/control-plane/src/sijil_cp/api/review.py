@@ -41,7 +41,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -677,6 +677,33 @@ def _failure_code(exc: Exception) -> str:
     return SEAL_FAILED
 
 
+async def _visible_batch(
+    request: Request, ctx: WorkspaceContext, db: AsyncSession, where: list[Any], limit: int
+) -> list[tuple[UUID, datetime]]:
+    """Up to `limit` (id, arrival) of the rows matching `where` that the caller's grant shows,
+    oldest first, reading further batches past the hidden ones."""
+    found: list[tuple[UUID, datetime]] = []
+    after: list[Any] = []
+    while len(found) < limit:
+        batch = (
+            await db.execute(
+                select(DocumentLedger.id, DocumentLedger.ingested_at, DocumentLedger.uploaded_by)
+                .where(*where, *after)
+                .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
+                .limit(limit)
+            )
+        ).all()
+        hidden = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in batch])
+        found += [(r.id, r.ingested_at) for r in batch if r.id not in hidden]
+        if len(batch) < limit:
+            break
+        last = batch[-1]
+        after = [
+            tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (last.ingested_at, last.id)
+        ]
+    return found[:limit]
+
+
 @router.post("/workspaces/{workspace_id}/seal-batch", response_model=SealBatchOut)
 async def seal_batch(
     body: SealBatchIn, request: Request, ctx: Sealing, user: CurrentUser, db: Db, now: Now
@@ -702,24 +729,13 @@ async def seal_batch(
     if body.cursor is not None:
         at, last_id = _decode_batch_cursor(body.cursor)
         in_month.append(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (at, last_id))
-    rows = list(
-        (
-            await db.execute(
-                select(DocumentLedger.id, DocumentLedger.ingested_at, DocumentLedger.uploaded_by)
-                .where(*in_month)
-                .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
-                .limit(SEAL_BATCH_LIMIT)
-            )
-        ).all()
-    )
+    # A document the caller's grant hides is neither sealed, reported, counted, nor ever the
+    # cursor (which names its row): only the visible rows are read on.
+    rows = await _visible_batch(request, ctx, db, in_month, SEAL_BATCH_LIMIT)
     await db.commit()
-    # A document the caller's grant hides is neither sealed, reported nor counted.
-    hidden = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in rows])
     sealed = 0
     skipped: list[Skipped] = []
-    for doc_id, _, _ in rows:
-        if doc_id in hidden:
-            continue
+    for doc_id, _ in rows:
         try:
             ledger = await _locked_ledger(db, workspace, doc_id)
             await _seal_locked(db, sealer, ledger)
@@ -735,7 +751,7 @@ async def seal_batch(
     remaining = 0
     next_cursor: str | None = None
     if rows:
-        last_id, last_at, _ = rows[-1]
+        last_id, last_at = rows[-1]
         after = tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (last_at, last_id)
         if ctx.document_types is None:
             remaining = int(await db.scalar(select(func.count()).where(*in_month, after)) or 0)

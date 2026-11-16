@@ -6,8 +6,11 @@ row's (`search_doc.document_type`), written here as the worker writes it at rout
 values only.
 """
 
+import base64
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -26,6 +29,7 @@ from sijil_core.db.models import (
 )
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_cp import permissions
+from sijil_cp.api import review
 from tests.support.index_db import throwaway_index_db
 from tests.support.memory_store import MemoryObjectStore
 from tests.support.sealing import INVOICE, add_document, add_index_credential, engines_on
@@ -426,3 +430,100 @@ async def test_restricted_ask_stores_the_askers_grant(
     await db.commit()
     r = await clerk.client.get(mine)
     assert (r.status_code, _code(r)) == (404, "ask.not_found")
+
+
+def _cursor_id(cursor: str) -> str:
+    """The ledger id a seal-batch cursor carries (plain base64 of `ingested_at|id`)."""
+    raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+    return raw.split("|")[1]
+
+
+async def test_seal_batch_cursor_never_names_a_hidden_document(
+    make_actor: MakeActor, db: AsyncSession, memory_store: MemoryObjectStore,
+    index_conn: AsyncConnection, ws: Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    monkeypatch.setattr(review, "SEAL_BATCH_LIMIT", 2)
+    order: list[tuple[str, dict[str, str | None]]] = [
+        ("i1", INVOICE), ("p1", PAYSLIP), ("i2", INVOICE | {"number": "F-2"}),
+        ("p2", PAYSLIP | {"number": "P-2"}), ("i3", INVOICE | {"number": "F-3"}),
+        ("p3", PAYSLIP | {"number": "P-3"}),
+    ]  # fmt: skip
+    docs: dict[str, DocumentLedger] = {}
+    for day, (name, values) in enumerate(order, start=2):
+        row = await add_document(
+            db, memory_store, index_conn, ws, values=values,
+            document_type=values["document_type"], ingested_at=datetime(2026, 10, day, tzinfo=UTC),
+        )  # fmt: skip
+        facts = SearchLedgerFacts(
+            ledger_id=row.id, state=DocumentState.filed, ingested_at=row.ingested_at,
+            region="ma-cas", now=row.ingested_at,
+        )  # fmt: skip
+        await refresh_search_doc(index_conn, facts, "SAMPLE document")
+        docs[name] = row
+    hidden = {str(docs[n].id) for n in ("p1", "p2", "p3")}
+    invoices = {str(docs[n].id) for n in ("i1", "i2", "i3")}
+    clerk = await _actor(make_actor, db, ws, Role.member, ["invoice"])
+    url = f"/v1/workspaces/{ws.id}/seal-batch"
+
+    pages = []
+    body: dict[str, Any] = {"month": "2026-10"}
+    while True:
+        r = await clerk.client.post(url, json=body)
+        assert r.status_code == 200, r.text
+        page = r.json()
+        pages.append(page)
+        assert page["skipped"] == []
+        if page["next_cursor"] is None:
+            break
+        assert _cursor_id(page["next_cursor"]) not in hidden
+        body = {"month": "2026-10", "cursor": page["next_cursor"]}
+        assert len(pages) < 5
+    assert [(p["sealed"], p["remaining"]) for p in pages] == [(2, 1), (1, 0)]
+    ws_id = ws.id
+    db.expire_all()
+    rows = await db.scalars(select(DocumentLedger).where(DocumentLedger.workspace_id == ws_id))
+    states = {str(r.id): r.state for r in rows}
+    assert {i for i, s in states.items() if s is DocumentState.sealed} == invoices
+    assert all(states[h] is DocumentState.filed for h in hidden)
+
+
+PDF = (Path(__file__).resolve().parents[3] / "fixtures" / "formats" / "sample.pdf").read_bytes()
+
+
+async def test_duplicate_upload_names_the_existing_document_only_when_visible(
+    make_actor: MakeActor, db: AsyncSession, index_conn: AsyncConnection, ws: Workspace,
+) -> None:  # fmt: skip
+    admin = await _actor(make_actor, db, ws, Role.admin)
+    clerk = await _actor(make_actor, db, ws, Role.member, ["invoice"])
+    url = f"/v1/workspaces/{ws.id}/documents"
+
+    async def upload(actor: Actor) -> Any:
+        return await actor.client.post(url, files={"file": ("f.pdf", PDF, "application/pdf")})
+
+    first = await upload(admin)
+    assert first.status_code == 202, first.text
+    existing = first.json()["document_id"]
+    # Unclassified and the admin's: hidden from the clerk, whose 409 does not name it.
+    r = await upload(clerk)
+    assert r.status_code == 409
+    assert r.json() == {"error": {"code": "document.duplicate"}}
+    # The admin still gets the id.
+    r = await upload(admin)
+    assert r.json() == {"error": {"code": "document.duplicate"}, "document_id": existing}
+    # Classified as an invoice, it is the clerk's to see: the id comes back.
+    when = datetime(2026, 10, 1, tzinfo=UTC)
+    await index.write_extraction(
+        index_conn,
+        index.FieldsRow(
+            ledger_id=uuid.UUID(existing), document_type="invoice", values=INVOICE,
+            updated_at=when,
+        ),
+    )  # fmt: skip
+    facts = SearchLedgerFacts(
+        ledger_id=uuid.UUID(existing), state=DocumentState.received, ingested_at=when,
+        region="ma-cas", now=when,
+    )  # fmt: skip
+    await refresh_search_doc(index_conn, facts, "SAMPLE document")
+    r = await upload(clerk)
+    assert r.status_code == 409
+    assert r.json() == {"error": {"code": "document.duplicate"}, "document_id": existing}

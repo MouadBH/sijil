@@ -162,6 +162,18 @@ async def _file_part(request: Request, boundary: bytes) -> AsyncIterator[bytes]:
         yield b"".join(data)
 
 
+async def _visible_by_id(request: Request, ctx: WorkspaceContext, doc_id: UUID) -> bool:
+    """Whether the caller's grant shows the document (its own short session: the request's
+    was handed back before the upload)."""
+    if ctx.document_types is None:
+        return True
+    async with request.app.state.sessionmaker() as db:
+        uploaded_by = await db.scalar(
+            select(DocumentLedger.uploaded_by).where(DocumentLedger.id == doc_id)
+        )
+    return not await hidden_ids(request, ctx, [(doc_id, uploaded_by)])
+
+
 @router.post("/workspaces/{workspace_id}/documents", status_code=202, response_model=UploadOut)
 async def upload_document(
     request: Request, ctx: Uploading, user: CurrentUser, db: Db, now: Now
@@ -208,10 +220,11 @@ async def upload_document(
     except (_MissingFile, MultipartParseError):
         raise _invalid() from None
     if isinstance(result, ingest.Duplicate):
-        return JSONResponse(
-            {"error": {"code": "document.duplicate"}, "document_id": str(result.document_id)},
-            status_code=409,
-        )
+        # The existing document is named only when the caller's grant shows it.
+        body: dict[str, object] = {"error": {"code": "document.duplicate"}}
+        if await _visible_by_id(request, ctx, result.document_id):
+            body["document_id"] = str(result.document_id)
+        return JSONResponse(body, status_code=409)
     return UploadOut(
         document_id=result.document_id,
         state=DocumentState.received,
