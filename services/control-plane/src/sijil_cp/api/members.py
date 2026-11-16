@@ -9,8 +9,11 @@ types themselves.
 
 A new user (one with no membership in the org or its workspaces yet) is refused with 409
 `quota.users_exceeded` when the org's standing allows no new user (`sijil_core.billing`: the
-user quota is full, or a quota is exceeded). The org row is locked first, so concurrent
-additions cannot both take the last seat. An addition that reaches a quota warning audits it.
+user quota is full, or a quota is exceeded), and with 402 `billing.overdue` /
+`billing.read_only` while an invoice is unpaid past due. The org row is locked first, so
+concurrent additions cannot both take the last seat. An addition that reaches a quota warning
+audits it. Changing a role or removing a member is never gated by billing: access control
+must always work.
 """
 
 from datetime import datetime
@@ -118,7 +121,8 @@ async def _audit_grant(
 
 
 async def _ensure_seat(db: AsyncSession, org_id: UUID, user_id: UUID, now: datetime) -> None:
-    """409 `quota.users_exceeded` when `user_id` would be a new user the standing refuses.
+    """409 `quota.users_exceeded` (or 402 with the billing code, overdue or read-only) when
+    `user_id` would be a new user the standing refuses.
     Locks the org row, so the check holds until the caller's commit."""
     await db.execute(select(Organisation.id).where(Organisation.id == org_id).with_for_update())
     workspaces = select(Workspace.id).where(Workspace.org_id == org_id)
@@ -130,8 +134,13 @@ async def _ensure_seat(db: AsyncSession, org_id: UUID, user_id: UUID, now: datet
         )
         .limit(1)
     )
-    if counted is None and not (await billing.standing(db, org_id, now)).new_users_allowed:
-        raise ApiError("quota.users_exceeded", 409)
+    if counted is None:
+        standing = await billing.standing(db, org_id, now)
+        if not standing.new_users_allowed:
+            # Non-payment (`billing.overdue` / `billing.read_only`) says so; a quota is 409.
+            if standing.billing_code is not None:
+                raise ApiError(standing.billing_code, 402)
+            raise ApiError("quota.users_exceeded", 409)
 
 
 async def _lock_owners(db: AsyncSession, org_id: UUID) -> list[Membership]:

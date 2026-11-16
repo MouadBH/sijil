@@ -53,9 +53,10 @@ from sijil_cp.api.review import (
     UPDATE_FAILED,
     CurrentUser,
     Db,
+    Editing,
     Now,
     Reading,
-    Reviewing,
+    ReadWriting,
     _engines,
     _ip,
 )
@@ -244,7 +245,7 @@ async def views(request: Request, ctx: Reading) -> ViewsOut:
 
 @router.post("/workspaces/{workspace_id}/search/views", response_model=ViewOut, status_code=201)
 async def create_view(
-    request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
+    request: Request, ctx: ReadWriting, user: CurrentUser, db: Db, now: Now
 ) -> ViewOut:
     body = _parse(ViewIn, await request.body(), QUERY_INVALID)
     view = SavedView(
@@ -269,7 +270,7 @@ async def _editable(request: Request, ctx: Reading, user_id: UUID, view_id: UUID
 
 @router.put("/workspaces/{workspace_id}/search/views/{view_id}", response_model=ViewOut)
 async def update_view(
-    view_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
+    view_id: UUID, request: Request, ctx: ReadWriting, user: CurrentUser, db: Db, now: Now
 ) -> ViewOut:
     view = await _editable(request, ctx, user.id, view_id)
     body = _parse(ViewIn, await request.body(), QUERY_INVALID)
@@ -285,7 +286,7 @@ async def update_view(
 
 @router.delete("/workspaces/{workspace_id}/search/views/{view_id}", status_code=204)
 async def remove_view(
-    view_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
+    view_id: UUID, request: Request, ctx: ReadWriting, user: CurrentUser, db: Db, now: Now
 ) -> Response:
     view = await _editable(request, ctx, user.id, view_id)
     await _audit_view(db, request, ctx.workspace, user.id, view.id, "delete", now)
@@ -318,7 +319,7 @@ async def _shared_ledger(
 
 @router.put("/workspaces/{workspace_id}/documents/{doc_id}/tags", response_model=TagsOut)
 async def put_tags(
-    doc_id: UUID, request: Request, ctx: Reviewing, user: CurrentUser, db: Db, now: Now
+    doc_id: UUID, request: Request, ctx: Editing, user: CurrentUser, db: Db, now: Now
 ) -> TagsOut:
     workspace = ctx.workspace
     body = _parse(TagsIn, await request.body(), TAG_INVALID)

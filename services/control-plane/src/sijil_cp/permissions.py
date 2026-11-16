@@ -11,20 +11,22 @@ search row's type is in the set, or when it is unclassified and they uploaded it
 
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import Depends, Request
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sijil_core import billing
 from sijil_core.db.models import DocumentLedger, Membership, Organisation, Role, User, Workspace
 from sijil_core.index import IndexEngines
 from sijil_core.region import assert_region
 from sijil_core.search_query import document_types, grant_allows
 from sijil_core.settings import CoreSettings
-from sijil_cp.deps import current_user, get_db
+from sijil_cp.deps import current_user, get_db, get_now
 from sijil_cp.errors import ApiError
 
 
@@ -172,6 +174,75 @@ def require_workspace(action: Action) -> Callable[..., Coroutine[Any, Any, Works
         types = await visible_types(db, user.id, workspace)
         return WorkspaceContext(workspace, role, types, user.id)
 
+    return dependency
+
+
+# The billing gate (ADM-4, design §5.7a) ------------------------------------------------------
+
+Gate = Literal["writes", "export"]
+WorkspaceDep = Callable[..., Coroutine[Any, Any, WorkspaceContext]]
+# The dependencies that apply the gate, and the endpoints that apply it in their own body (to
+# audit the refusal): every state-changing route is one or the other, or on the allow-list of
+# services/control-plane/tests/test_billing_gate.py.
+BILLING_GATES: set[object] = set()
+GATED_IN_HANDLER: set[object] = set()
+_GATED: dict[tuple[Action, Gate], WorkspaceDep] = {}
+
+
+async def ensure_billing(
+    db: AsyncSession, org_id: UUID, now: datetime, gate: Gate = "writes"
+) -> None:
+    """402 `billing.read_only` (any write) or `billing.overdue` (an export) when the org's
+    standing refuses it. Capture and reads never come here."""
+    standing = await billing.standing(db, org_id, now)
+    allowed = standing.export_allowed if gate == "export" else standing.writes_allowed
+    if not allowed:
+        raise ApiError(standing.billing_code or billing.READ_ONLY_CODE, 402)
+
+
+def gated_in_handler[F](endpoint: F) -> F:
+    """Marks an endpoint that calls `ensure_billing` itself, after its own checks."""
+    GATED_IN_HANDLER.add(endpoint)
+    return endpoint
+
+
+def require_writable(action: Action, gate: Gate = "writes") -> WorkspaceDep:
+    """`require_workspace` for a state-changing route, then the billing gate. The order is
+    ruling R3: authenticated, region, role (`authorize`), then a `{doc_id}` of the path that
+    is missing or hidden by the caller's grant answers 404 `document.not_found` (a hidden
+    document never reveals the org's billing state), then 402 (`ensure_billing`)."""
+    key = (action, gate)
+    if key in _GATED:
+        return _GATED[key]
+    context = require_workspace(action)
+
+    async def dependency(
+        request: Request,
+        ctx: Annotated[WorkspaceContext, Depends(context)],
+        db: Annotated[AsyncSession, Depends(get_db)],
+        now: Annotated[datetime, Depends(get_now)],
+    ) -> WorkspaceContext:
+        raw = request.path_params.get("doc_id")
+        if raw is not None:
+            try:
+                doc_id = UUID(str(raw))
+            except ValueError:
+                raise ApiError("document.not_found", 404) from None
+            row = (
+                await db.execute(
+                    select(DocumentLedger.id, DocumentLedger.uploaded_by).where(
+                        DocumentLedger.id == doc_id,
+                        DocumentLedger.workspace_id == ctx.workspace.id,
+                    )
+                )
+            ).first()
+            if row is None or await hidden_ids(request, ctx, [(row.id, row.uploaded_by)]):
+                raise ApiError("document.not_found", 404)
+        await ensure_billing(db, ctx.workspace.org_id, now, gate)
+        return ctx
+
+    BILLING_GATES.add(dependency)
+    _GATED[key] = dependency
     return dependency
 
 

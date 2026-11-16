@@ -44,7 +44,7 @@ from sijil_cp.deps import (
 )
 from sijil_cp.enqueue import Enqueuer, get_enqueuer
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, require_workspace
+from sijil_cp.permissions import Action, WorkspaceContext, require_workspace, require_writable
 from sijil_cp.settings import CpSettings
 
 log = logging.getLogger(__name__)
@@ -63,6 +63,10 @@ Now = Annotated[datetime, Depends(get_now)]
 CurrentUser = Annotated[User, Depends(current_user)]
 # Declared in this order on every route: the role first (403 `forbidden`), then the step-up.
 Exporting = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_export))]
+# A new export: the billing gate too (`billing.overdue` or `billing.read_only` 402).
+NewExport = Annotated[
+    WorkspaceContext, Depends(require_writable(Action.documents_export, "export"))
+]
 SteppedUp = Annotated[UserSession, Depends(require_recent_totp(STEP_UP_MINUTES))]
 Queue = Annotated[Enqueuer, Depends(get_enqueuer)]
 
@@ -131,7 +135,7 @@ def _out(job: ExportJob) -> ExportOut:
 async def request_export(
     body: ExportIn,
     request: Request,
-    ctx: Exporting,
+    ctx: NewExport,
     _step_up: SteppedUp,
     user: CurrentUser,
     db: Db,

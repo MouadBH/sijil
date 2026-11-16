@@ -77,6 +77,7 @@ from sijil_cp.permissions import (
     ensure_visible,
     hidden_ids,
     require_workspace,
+    require_writable,
 )
 
 log = logging.getLogger(__name__)
@@ -89,6 +90,10 @@ Now = Annotated[datetime, Depends(get_now)]
 Reading = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_read))]
 Reviewing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_review))]
 Sealing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_seal))]
+# State-changing routes: the same roles, then the billing gate (`require_writable`, ADM-4).
+Editing = Annotated[WorkspaceContext, Depends(require_writable(Action.documents_review))]
+SealWriting = Annotated[WorkspaceContext, Depends(require_writable(Action.documents_seal))]
+ReadWriting = Annotated[WorkspaceContext, Depends(require_writable(Action.documents_read))]
 
 LOCKED: Final = "retention.locked"
 SEAL_UNFINISHED: Final = "seal.incomplete"
@@ -379,7 +384,7 @@ async def edit_fields(
     doc_id: UUID,
     body: FieldsPatch,
     request: Request,
-    ctx: Reviewing,
+    ctx: Editing,
     user: CurrentUser,
     db: Db,
     now: Now,
@@ -643,7 +648,7 @@ async def _sealer(
 
 @router.post("/workspaces/{workspace_id}/documents/{doc_id}/seal", response_model=FieldsOut)
 async def seal_document(
-    doc_id: UUID, request: Request, ctx: Sealing, user: CurrentUser, db: Db, now: Now
+    doc_id: UUID, request: Request, ctx: SealWriting, user: CurrentUser, db: Db, now: Now
 ) -> FieldsOut:
     sealer = await _sealer(request, db, ctx.workspace, user, now)
     ledger = await _locked_ledger(db, ctx.workspace, doc_id)
@@ -706,7 +711,7 @@ async def _visible_batch(
 
 @router.post("/workspaces/{workspace_id}/seal-batch", response_model=SealBatchOut)
 async def seal_batch(
-    body: SealBatchIn, request: Request, ctx: Sealing, user: CurrentUser, db: Db, now: Now
+    body: SealBatchIn, request: Request, ctx: SealWriting, user: CurrentUser, db: Db, now: Now
 ) -> SealBatchOut:
     """Seals the month's `filed` documents (region-local arrival), oldest first, at most
     SEAL_BATCH_LIMIT per call, each in its own transaction through the single seal's code.

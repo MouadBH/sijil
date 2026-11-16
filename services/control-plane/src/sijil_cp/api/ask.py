@@ -28,7 +28,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from sijil_core import ask_store, audit
 from sijil_core.db.models import ActorType, Role
-from sijil_cp.api.review import CurrentUser, Db, Now, Reading, _engines, _ip
+from sijil_cp.api.review import CurrentUser, Db, Now, Reading, ReadWriting, _engines, _ip
 from sijil_cp.api.search import _parse
 from sijil_cp.auth import ratelimit
 from sijil_cp.deps import require_totp_compliance
@@ -99,7 +99,7 @@ def _covered(record: ask_store.AskRecord, types: frozenset[str] | None) -> bool:
 
 
 @router.post("/workspaces/{workspace_id}/ask", response_model=AskQueued, status_code=202)
-async def ask(request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now) -> AskQueued:
+async def ask(request: Request, ctx: ReadWriting, user: CurrentUser, db: Db, now: Now) -> AskQueued:
     workspace = ctx.workspace
     body = _parse(AskIn, await request.body(), QUESTION_INVALID)
     key = ratelimit.user_key("ask", user.id)
