@@ -2,11 +2,13 @@ from pydantic import PostgresDsn, RedisDsn, field_validator
 
 from sijil_core.crypto import KeySettings
 from sijil_core.export_report import decode_key
-from sijil_core.settings import CoreSettings
+from sijil_core.settings import CoreSettings, SellerSettings
 from sijil_core.storage import StorageSettings
 
 
-class CpSettings(KeySettings, StorageSettings):
+class CpSettings(KeySettings, StorageSettings, SellerSettings):
+    # The invoices' seller (SIJIL_SELLER_*, SellerSettings): required, as the control plane
+    # issues an upgrade's invoice.
     # Object-store fields come from StorageSettings (SIJIL_OBJECTSTORE_*): the services' app key,
     # which can put and extend a lock but never replace one. The control plane never holds the
     # sealing key: the seal worker (`sijil.lock_sealed`) switches originals to COMPLIANCE.

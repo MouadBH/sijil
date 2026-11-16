@@ -20,6 +20,7 @@ from sijil_cp.main import create_app
 from sijil_cp.settings import CpSettings
 from tests.support.export_keys import TEST_PUBLIC_KEY_B64
 from tests.support.memory_store import MemoryExportStore, MemoryObjectStore
+from tests.support.seller import SAMPLE_SELLER
 
 # Ports nothing listens on: readiness must report these as down.
 CLOSED_DB = "postgresql+asyncpg://sijil:sijil@127.0.0.1:1/sijil_cp"
@@ -30,21 +31,25 @@ UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 def make_settings(**overrides: str) -> CpSettings:
-    values = {
-        "region": "ma-cas",
-        "environment": "test",
-        "database_url": CLOSED_DB,
-        "redis_url": CLOSED_REDIS,
-        "master_key": TEST_MASTER_KEY,
-        "cookie_secure": "false",
-        "inbound_domain": "in.sijil.local",
-        # Never contacted in unit tests: cp_app swaps in the in-memory store.
-        "objectstore_endpoint": "http://127.0.0.1:1",
-        "objectstore_access_key": "test-access",
-        "objectstore_secret_key": "test-secret",
-        "objectstore_bucket": "sijil-originals-test",
-        "export_public_key": TEST_PUBLIC_KEY_B64,
-    } | overrides
+    values = (
+        {
+            "region": "ma-cas",
+            "environment": "test",
+            "database_url": CLOSED_DB,
+            "redis_url": CLOSED_REDIS,
+            "master_key": TEST_MASTER_KEY,
+            "cookie_secure": "false",
+            "inbound_domain": "in.sijil.local",
+            # Never contacted in unit tests: cp_app swaps in the in-memory store.
+            "objectstore_endpoint": "http://127.0.0.1:1",
+            "objectstore_access_key": "test-access",
+            "objectstore_secret_key": "test-secret",
+            "objectstore_bucket": "sijil-originals-test",
+            "export_public_key": TEST_PUBLIC_KEY_B64,
+        }
+        | SAMPLE_SELLER
+        | overrides
+    )
     return CpSettings.model_validate(values)
 
 

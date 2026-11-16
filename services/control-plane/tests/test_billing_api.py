@@ -1,10 +1,11 @@
 """Plans, the subscription, the usage meter, the user quota and the organisation's ICE (ADM-3)."""
 
+import hashlib
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select, text
@@ -20,6 +21,7 @@ from sijil_core.db.models import (
     User,
     Workspace,
 )
+from tests.support.billing_states import make_late
 
 pytestmark = pytest.mark.db
 
@@ -265,10 +267,22 @@ async def _over_quota(alice: Any, db: AsyncSession, org_id: str, workspace: Work
     assert (usage["storage"]["percent"], usage["storage"]["level"]) == (150, "over_100")
 
 
-# Task 3 adds `overdue` and `read_only` here. The inbound-email half of the same test, with
-# the same states, is services/worker/tests/test_smtp.py::test_capture_never_blocked_over_quota.
+async def _overdue(alice: Any, db: AsyncSession, org_id: str, workspace: Workspace) -> None:
+    await make_late(db, UUID(org_id), alice.clock.now, SubscriptionStatus.overdue)
+
+
+async def _read_only(alice: Any, db: AsyncSession, org_id: str, workspace: Workspace) -> None:
+    await make_late(db, UUID(org_id), alice.clock.now, SubscriptionStatus.read_only)
+    r = await alice.client.get(f"/v1/orgs/{org_id}/subscription")
+    assert r.json()["status"] == "read_only"
+
+
+# The inbound-email half of the same test, with the same states, is
+# services/worker/tests/test_smtp.py::test_capture_never_blocked_over_quota.
 BILLING_STATES: dict[str, Callable[[Any, AsyncSession, str, Workspace], Awaitable[None]]] = {
     "over_quota": _over_quota,
+    "overdue": _overdue,
+    "read_only": _read_only,
 }
 
 
@@ -288,3 +302,90 @@ async def test_capture_never_blocked_over_quota(
     )
     assert r.status_code == 202, r.text
     assert [w for _, w in enqueuer.ingests] == [workspace.id]
+
+
+async def _active_since(db: AsyncSession, org_id: str, start: datetime) -> None:
+    """An active essentiel subscription whose billing year started at `start`."""
+    sub = await db.scalar(select(Subscription).where(Subscription.org_id == UUID(org_id)))
+    assert sub is not None
+    sub.status, sub.trial_ends_at = SubscriptionStatus.active, start
+    sub.period_start, sub.period_end = start, start.replace(year=start.year + 1)
+    await db.commit()
+
+
+async def test_active_upgrade_issues_a_prorated_invoice(
+    make_actor: MakeActor, db: AsyncSession
+) -> None:
+    alice, org_id = await stepped_up_owner(make_actor)
+    assert (await alice.client.patch(f"/v1/orgs/{org_id}", json={"ice": ICE})).status_code == 200
+    await _active_since(db, org_id, alice.clock.now - timedelta(hours=1))  # its first day
+    r = await alice.client.put(f"/v1/orgs/{org_id}/subscription", json={"plan_code": "pro"})
+    assert r.status_code == 200, r.text
+    invoices = (await alice.client.get(f"/v1/orgs/{org_id}/invoices")).json()
+    assert [(i["kind"], i["plan_code"], i["amount_ht"], i["amount_vat"], i["amount_ttc"])
+            for i in invoices] == [("upgrade", "pro", "3600.00", "720.00", "4320.00")]  # fmt: skip
+    # A downgrade issues nothing (it waits for the renewal); no credit note either.
+    r = await alice.client.put(f"/v1/orgs/{org_id}/subscription", json={"plan_code": "essentiel"})
+    assert r.json()["pending_plan_code"] == "essentiel"
+    assert len((await alice.client.get(f"/v1/orgs/{org_id}/invoices")).json()) == 1
+
+
+async def test_invoices_and_their_pdf_for_owners_and_admins(
+    make_actor: MakeActor, db: AsyncSession
+) -> None:
+    alice, org_id = await stepped_up_owner(make_actor)
+    bob = await make_actor("bob@example.com")
+    carol = await make_actor("carol@example.com")
+    await add(db, org_id, bob.user_id, Role.admin)
+    await add(db, org_id, carol.user_id, Role.member)
+    await make_late(db, UUID(org_id), alice.clock.now, SubscriptionStatus.overdue)
+    r = await bob.client.get(f"/v1/orgs/{org_id}/invoices")
+    assert r.status_code == 200, r.text
+    (listed,) = r.json()
+    assert listed["number"].startswith("SIJ-")
+    assert (listed["state"], listed["currency"], listed["kind"]) == ("overdue", "MAD", "annual")
+    assert (listed["amount_ht"], listed["vat_rate"], listed["amount_ttc"]) == (
+        "2400.00", "20.00", "2880.00"
+    )  # fmt: skip
+    assert "pdf" not in listed
+    one = await alice.client.get(f"/v1/orgs/{org_id}/invoices/{listed['id']}")
+    assert one.json() == listed
+    pdf = await alice.client.get(f"/v1/orgs/{org_id}/invoices/{listed['id']}/pdf")
+    assert pdf.status_code == 200
+    assert pdf.headers["content-type"] == "application/pdf"
+    assert listed["number"] in pdf.headers["content-disposition"]
+    assert hashlib.sha256(pdf.content).hexdigest() == listed["pdf_sha256"]
+    # A Member sees no invoice; an unknown one is 404, and so is another org's.
+    assert (await carol.client.get(f"/v1/orgs/{org_id}/invoices")).status_code == 403
+    r = await alice.client.get(f"/v1/orgs/{org_id}/invoices/{uuid4()}")
+    assert (r.status_code, error(r)) == (404, "invoice.not_found")
+    dave = await make_actor("dave@example.com")
+    other = await create_org(dave)
+    r = await dave.client.get(f"/v1/orgs/{other}/invoices/{listed['id']}/pdf")
+    assert (r.status_code, error(r)) == (404, "invoice.not_found")
+
+
+async def test_an_expired_trial_counts_as_ended_before_the_daily_job(
+    make_actor: MakeActor, db: AsyncSession
+) -> None:
+    """The trial's end has passed and `billing_daily` has not run: the API already treats it
+    as ended. Giving the ICE brings the state up to date (the first annual invoice), and an
+    upgrade then applies now, never at a `trial_end` already past."""
+    alice, org_id = await stepped_up_owner(make_actor)
+    assert (await alice.client.get(f"/v1/orgs/{org_id}/subscription")).json()["status"] == "trial"
+    alice.clock.advance(timedelta(days=31))
+    await alice.step_up()  # a new session: the first one has expired by then
+    sub = (await alice.client.get(f"/v1/orgs/{org_id}/subscription")).json()
+    assert (sub["status"], sub["status_reason"]) == ("overdue", "org.ice_required")
+    assert (await alice.client.patch(f"/v1/orgs/{org_id}", json={"ice": ICE})).status_code == 200
+    sub = (await alice.client.get(f"/v1/orgs/{org_id}/subscription")).json()
+    assert (sub["status"], sub["status_reason"]) == ("active", None)
+    r = await alice.client.put(f"/v1/orgs/{org_id}/subscription", json={"plan_code": "pro"})
+    assert r.status_code == 200, r.text
+    assert (r.json()["plan_code"], r.json()["status"]) == ("pro", "active")
+    events = await db.scalars(
+        select(AuditEvent.data).where(AuditEvent.action == "billing.plan_chosen")
+    )
+    assert [e["effective"] for e in events] == ["now"]
+    kinds = [i["kind"] for i in (await alice.client.get(f"/v1/orgs/{org_id}/invoices")).json()]
+    assert sorted(kinds) == ["annual", "upgrade"]

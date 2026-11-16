@@ -15,6 +15,7 @@ from sijil_core.db.models import ActorType, Workspace
 from sijil_cp import cli
 from sijil_cp.settings import CpSettings
 from tests.support.export_keys import TEST_PUBLIC_KEY_B64
+from tests.support.seller import SAMPLE_SELLER
 
 pytestmark = pytest.mark.db
 
@@ -38,6 +39,7 @@ def _settings(url: str) -> CpSettings:
             "objectstore_bucket": "sijil-originals-test",
             "export_public_key": TEST_PUBLIC_KEY_B64,
         }
+        | SAMPLE_SELLER
     )
 
 

@@ -4,7 +4,10 @@ and queues its provisioning.
 `PATCH /orgs/{id}` accepts the organisation's `ice`: 15 ASCII digits, else 422
 `org.ice_invalid` (it cannot be cleared). It is required to choose a plan, and it is the first
 own-ICE guard of extraction and learning. A change is audited `org.ice_changed`
-`{ice_set: true}`, never the value (the hash-chained log can never be redacted).
+`{ice_set: true}`, never the value (the hash-chained log can never be redacted). The first ICE
+given brings the billing state up to date (`billing.advance`): a trial that ended without one
+gets its first annual invoice at once. `PATCH` is never behind the billing gate: it is how an
+overdue org gives the ICE its invoice needs.
 """
 
 import asyncio
@@ -235,6 +238,7 @@ async def patch_org(
                 data={"require_totp": body.require_totp},
                 now=now,
             )
+    first_ice = isinstance(body.ice, str) and org.ice is None
     if isinstance(body.ice, str) and body.ice != org.ice:
         org.ice = body.ice
         await audit_org_event(
@@ -250,5 +254,10 @@ async def patch_org(
         )
     if body.name is not None:
         org.name = body.name
+    if first_ice:
+        # A trial that ended without an ICE waits for it: the first annual invoice is issued
+        # now, by the same transition as the daily job's (`billing.advance`).
+        await db.flush()
+        await billing.advance(db, org_id, now, seller=request.app.state.settings)
     await db.commit()
     return org_out(org, role)

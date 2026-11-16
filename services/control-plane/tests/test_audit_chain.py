@@ -14,6 +14,7 @@ from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.db.models import ActorType, AuditEvent, Workspace
 from sijil_cp.cli import main
 from tests.support.export_keys import TEST_PUBLIC_KEY_B64
+from tests.support.seller import SAMPLE_SELLER
 
 pytestmark = pytest.mark.db
 
@@ -183,6 +184,8 @@ async def test_cli_verify_exit_codes(
     monkeypatch.setenv("SIJIL_OBJECTSTORE_SECRET_KEY", "test-secret")
     monkeypatch.setenv("SIJIL_OBJECTSTORE_BUCKET", "sijil-originals-test")
     monkeypatch.setenv("SIJIL_EXPORT_PUBLIC_KEY", TEST_PUBLIC_KEY_B64)
+    for name, value in SAMPLE_SELLER.items():
+        monkeypatch.setenv(f"SIJIL_{name.upper()}", value)
     loop = asyncio.get_running_loop()
 
     def run() -> int:
