@@ -409,8 +409,8 @@ async def test_m5_acceptance(
         with attach_runner(docker_runtime.network_name(tenant_ref(workspace_id))):
             async with reader.client() as client:
                 row, _ = await _extract(
-                    job, index=engines, paperless=PaperlessClient, ollama=client,
-                    model="qwen3:4b", now=extracted_at,
+                    job, sessions=sessions, index=engines, paperless=PaperlessClient,
+                    ollama=client, model="qwen3:4b", now=extracted_at,
                 )  # fmt: skip
         assert row.extracted_at == extracted_at, "the extraction worker got there first"
         hint = f"Known company in this workspace: {corrected} (ICE {HYDRO})"

@@ -43,6 +43,8 @@ from sijil_core.db.models import (
     DocumentLedger,
     DocumentState,
     IngestState,
+    Subscription,
+    SubscriptionStatus,
     TenantCredential,
     User,
     Workspace,
@@ -177,7 +179,15 @@ async def test_m4_acceptance(
             workspace = await db.get(Workspace, workspace_id)
         assert workspace is not None and workspace.paperless_url is not None
 
-        # The other roles: users made in the database, added by the Owner over the API.
+        # The other roles: users made in the database, added by the Owner over the API. Four
+        # users exceed the trial's 3 (ADM-3): the org is put on an active `pro` plan first.
+        async with sessions() as db:
+            sub = await db.scalar(
+                select(Subscription).where(Subscription.org_id == uuid.UUID(org_id))
+            )
+            assert sub is not None
+            sub.plan_code, sub.status = "pro", SubscriptionStatus.active
+            await db.commit()
         await owner.step_up()
         members: dict[str, httpx.AsyncClient] = {"owner": http}
         for role in ("admin", "member", "readonly"):
