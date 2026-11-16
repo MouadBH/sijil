@@ -356,11 +356,12 @@ async def approve_deletion(
         await authorize(db, user_id, workspace, Action.retention_approve_deletion, settings)
         await require_totp_compliance(session, user, db)
         await _step_up(session, user, now)
-        # Read-only (non-payment) refuses it, audited like any refusal (ADM-4).
-        await ensure_billing(db, workspace.org_id, now)
         ids = sorted(set(parse_body(ApproveIn, await request.body()).ids))
         today = region_local_date(now, settings.region)
         rows = await _locked_eligible(db, workspace, ids, today)
+        # Read-only (non-payment) refuses it, audited like any refusal (ADM-4), once the
+        # documents are found (ruling R3: a missing one answers as such, never the 402).
+        await ensure_billing(db, workspace.org_id, now)
     except RequestValidationError:
         await audit_refusal(db, request, ws_id, user_id, [None], INVALID_BODY, now)
         raise

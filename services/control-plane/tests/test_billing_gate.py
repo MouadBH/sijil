@@ -78,8 +78,10 @@ async def _owner(make_actor: MakeActor, db: AsyncSession) -> tuple[Any, str, Wor
     return alice, org_id, workspace
 
 
-async def _document(db: AsyncSession, workspace: Workspace, user_id: UUID) -> UUID:
-    """A SAMPLE filed ledger row."""
+async def _document(
+    db: AsyncSession, workspace: Workspace, user_id: UUID, retain: date = date(2036, 12, 31)
+) -> UUID:
+    """A SAMPLE filed ledger row, retained until `retain`."""
     doc_id = uuid4()
     await db.execute(
         text(
@@ -91,7 +93,7 @@ async def _document(db: AsyncSession, workspace: Workspace, user_id: UUID) -> UU
                 'v1', 'filed', 'consumed', 0, :retain, now(), :user)
             """
         ),
-        {"id": doc_id, "ws": workspace.id, "n": str(doc_id), "retain": date(2036, 12, 31),
+        {"id": doc_id, "ws": workspace.id, "n": str(doc_id), "retain": retain,
          "user": user_id},
     )  # fmt: skip
     await db.commit()
@@ -103,7 +105,7 @@ def error(r: Any) -> str:
     return code
 
 
-def _writes(ws: UUID, doc: UUID) -> list[tuple[str, str, Any]]:
+def _writes(ws: UUID, doc: UUID, expired: UUID) -> list[tuple[str, str, Any]]:
     base = f"/v1/workspaces/{ws}"
     reason = "SAMPLE: uploaded by mistake"
     return [
@@ -114,7 +116,8 @@ def _writes(ws: UUID, doc: UUID) -> list[tuple[str, str, Any]]:
         ("POST", f"{base}/documents/{doc}/corrections",
          {"field": "total_ttc", "value": "1.00", "reason": reason}),
         ("PUT", f"{base}/retention/policies/invoice", {"years": 12}),
-        ("POST", f"{base}/retention/approve-deletion", {"ids": [str(doc)]}),
+        # A document past retention: eligible, so only the billing gate refuses it.
+        ("POST", f"{base}/retention/approve-deletion", {"ids": [str(expired)]}),
         ("POST", f"{base}/documents/{doc}/remove", {"reason": reason}),
         ("POST", f"{base}/search/views", {"name": "SAMPLE"}),
         ("PUT", f"{base}/search/views/{uuid4()}", {"name": "SAMPLE"}),
@@ -138,8 +141,9 @@ async def test_read_only_refuses_writes_but_not_upload_or_reads(
 ) -> None:
     alice, org_id, workspace = await _owner(make_actor, db)
     doc = await _document(db, workspace, alice.user_id)
+    expired = await _document(db, workspace, alice.user_id, retain=date(2020, 12, 31))
     await make_late(db, UUID(org_id), alice.clock.now, SubscriptionStatus.read_only)
-    for method, url, body in _writes(workspace.id, doc):
+    for method, url, body in _writes(workspace.id, doc, expired):
         r = await alice.client.request(method, url, json=body)
         assert (r.status_code, error(r)) == (402, "billing.read_only"), (method, url, r.text)
     # Rule R3: a document that does not exist (or is hidden) answers 404, never the 402.
@@ -183,6 +187,26 @@ async def test_overdue_restricts_exports_not_capture(
     )
     assert r.status_code == 200, r.text
     await _upload(alice, workspace, enqueuer)
+
+
+async def test_a_missing_document_answers_before_the_billing_gate_in_handlers(
+    make_actor: MakeActor, db: AsyncSession
+) -> None:
+    """Ruling R3 in the routes that check in their handler: on a read-only workspace, removing
+    a document that does not exist is 404 `document.not_found`, and approving its deletion is
+    the usual `retention.not_eligible` naming it, never the 402."""
+    alice, org_id, workspace = await _owner(make_actor, db)
+    await make_late(db, UUID(org_id), alice.clock.now, SubscriptionStatus.read_only)
+    missing = uuid4()
+    base = f"/v1/workspaces/{workspace.id}"
+    r = await alice.client.post(
+        f"{base}/documents/{missing}/remove", json={"reason": "SAMPLE: uploaded by mistake"}
+    )
+    assert (r.status_code, error(r)) == (404, "document.not_found")
+    r = await alice.client.post(f"{base}/retention/approve-deletion", json={"ids": [str(missing)]})
+    assert (r.status_code, error(r), r.json()["ids"]) == (
+        409, "retention.not_eligible", [str(missing)]
+    )  # fmt: skip
 
 
 @pytest.mark.parametrize("status", [SubscriptionStatus.overdue, SubscriptionStatus.read_only])
