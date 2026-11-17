@@ -12,6 +12,7 @@ from sijil_cp.api import (
     ask,
     auth,
     billing,
+    closure,
     corrections,
     documents,
     exports,
@@ -87,6 +88,7 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(workspaces.router)
     v1.include_router(members.router)
     v1.include_router(billing.router)
+    v1.include_router(closure.router)
     v1.include_router(jobs.router)
     v1.include_router(documents.router)
     v1.include_router(review.router)

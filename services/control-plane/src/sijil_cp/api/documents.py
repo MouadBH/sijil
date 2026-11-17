@@ -1,5 +1,12 @@
 """Documents (CAP-2 web upload). The body is streamed straight into the shared ingest path.
 
+The list and a document's metadata come from the ledger, with titles from the workspace's
+Paperless when it is active; a workspace that is not (a hibernated one, ADM-5) is never sent a
+request: its titles are absent and `engine` is `unavailable`. `GET …/documents/{id}/file`
+streams the original from our object store, never from Paperless, in every workspace state,
+audited `document.downloaded`; a document the caller's grant hides, or whose original is gone
+(removed or deleted), answers 404 `document.not_found`.
+
 The multipart body is parsed incrementally from `request.stream()`: FastAPI's `UploadFile`
 would spool the whole part before the handler runs, so an oversized upload could only be
 refused after it had been fully received. The client's filename and Content-Type are read past
@@ -12,12 +19,13 @@ import binascii
 import logging
 from collections.abc import AsyncIterator, Callable
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Final, Literal
 from uuid import UUID
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from python_multipart.exceptions import MultipartParseError
 from python_multipart.multipart import MultipartParser, parse_options_header
@@ -27,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sijil_core import audit, ingest
 from sijil_core.crypto import Envelope, open_envelope
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     CredentialKind,
     DocumentLedger,
@@ -41,6 +50,7 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.paperless import PaperlessClient, PaperlessDoc, PaperlessError
+from sijil_core.storage import ObjectRef, ObjectStore
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
@@ -312,6 +322,8 @@ async def _titles(
     """
     if not ids:
         return {}
+    if workspace.state is not WorkspaceState.active:
+        return None  # a hibernated (or not yet active) workspace's Paperless is never called
     try:
         if not workspace.paperless_url:
             return None
@@ -478,3 +490,72 @@ async def get_document(
     )
     await db.commit()
     return tombstone(row, ctx.role) if dead else _out(row, docs)
+
+
+# The media type of each `content_kind` (sijil_core.filetypes.FileKind).
+MEDIA_TYPES: Final = {
+    "pdf": "application/pdf",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "tiff": "image/tiff",
+    "heic": "image/heic",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xml": "application/xml",
+    "eml": "message/rfc822",
+}
+_EXTENSIONS: Final = {"jpeg": "jpg", "tiff": "tif"}
+
+
+async def _chunks(first: bytes, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    yield first
+    async for chunk in rest:
+        yield chunk
+
+
+@router.get("/workspaces/{workspace_id}/documents/{doc_id}/file")
+async def download_original(
+    doc_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
+) -> StreamingResponse:
+    """The original, from our object store (see the module docstring)."""
+    workspace = ctx.workspace
+    row = await db.scalar(
+        select(DocumentLedger).where(
+            DocumentLedger.id == doc_id, DocumentLedger.workspace_id == workspace.id
+        )
+    )
+    if row is None:
+        raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, row)
+    if row.state in TERMINAL_STATES or row.original_removed_at is not None:
+        raise ApiError("document.not_found", 404)
+    store: ObjectStore = request.app.state.store
+    rest = store.open(ObjectRef(row.object_key, row.object_version_id))
+    try:
+        # The first chunk before the 200: a missing object answers an error, not a cut stream.
+        first = await anext(rest)
+    except (FileNotFoundError, ClientError, BotoCoreError, StopAsyncIteration) as exc:
+        log.error("original of document %s unreadable: %s", row.id, type(exc).__name__)
+        raise ApiError("document.unavailable", 503) from None
+    await audit.append(
+        db,
+        workspace_id=workspace.id,
+        action="document.downloaded",
+        actor_type=ActorType.user,
+        actor_id=str(user.id),
+        target_type="document",
+        target_id=str(row.id),
+        ip=_ip(request),
+        now=now,
+    )
+    await db.commit()
+    kind = row.content_kind
+    headers = {
+        "Content-Disposition": f'attachment; filename="{row.id}.{_EXTENSIONS.get(kind, kind)}"',
+        "Content-Length": str(row.size_bytes),
+    }
+    return StreamingResponse(
+        _chunks(first, rest),
+        media_type=MEDIA_TYPES.get(kind, "application/octet-stream"),
+        headers=headers,
+    )

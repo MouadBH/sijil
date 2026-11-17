@@ -21,7 +21,15 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import billing
-from sijil_core.db.models import DocumentLedger, Membership, Organisation, Role, User, Workspace
+from sijil_core.db.models import (
+    DocumentLedger,
+    Membership,
+    Organisation,
+    Role,
+    User,
+    Workspace,
+    WorkspaceState,
+)
 from sijil_core.index import IndexEngines
 from sijil_core.region import assert_region
 from sijil_core.search_query import document_types, grant_allows
@@ -52,6 +60,8 @@ class Action(StrEnum):
     # only the Owner chooses the plan.
     billing_read = "billing_read"
     billing_manage = "billing_manage"
+    # Closing the account, its take-over statement (ADM-5): the Owner's only.
+    org_close = "org_close"
 
 
 MATRIX: dict[Role, frozenset[Action]] = {
@@ -62,6 +72,7 @@ MATRIX: dict[Role, frozenset[Action]] = {
         Action.documents_remove,
         Action.retention_approve_deletion,
         Action.billing_manage,
+        Action.org_close,
     },
     Role.member: frozenset(
         {
@@ -135,7 +146,10 @@ async def authorize(
     """The user's role if it allows `action` on the workspace; otherwise an ApiError.
 
     Non-members get 404 (no existence leak), then the region is checked before anything of the
-    workspace is served, then an insufficient role gets 403.
+    workspace is served, then an insufficient role gets 403. A closed account's workspace
+    (ADM-5) answers as one that does not exist: a hibernated one to everyone but its Owners
+    (who keep their reads; its writes meet the billing gate, `billing.read_only`), a destroyed
+    one (`closed`) to everyone.
     """
     role = await effective_role(db, user_id, workspace)
     if role is None:
@@ -144,6 +158,10 @@ async def authorize(
     if org is None:
         raise ApiError("not_found", 404)
     assert_region(org.region, settings)
+    if workspace.state is WorkspaceState.closed or (
+        workspace.state is WorkspaceState.hibernated and role is not Role.owner
+    ):
+        raise ApiError("not_found", 404)
     if not allows(role, action):
         raise ApiError("forbidden", 403)
     return role

@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.models import SubscriptionStatus, User, Workspace
 from sijil_cp.permissions import BILLING_GATES, GATED_IN_HANDLER
-from tests.support.billing_states import make_late
+from tests.support.billing_states import make_late, workspace_writes
 
 MakeActor = Callable[[str], Awaitable[Any]]
 FORMATS = Path(__file__).resolve().parents[3] / "fixtures" / "formats"
@@ -25,7 +25,7 @@ PDF = (FORMATS / "sample.pdf").read_bytes()
 UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Every state-changing route outside /v1/auth/ applies the billing gate, unless it is here,
-# with the reason (the closure routes of Task 5 join the list).
+# with the reason.
 NOT_GATED = {
     ("POST", "/v1/workspaces/{workspace_id}/documents"): "upload: capture is never gated",
     ("POST", "/v1/workspaces/{workspace_id}/search"): "a read sent as POST: reads are never gated",
@@ -37,6 +37,9 @@ NOT_GATED = {
     ("PATCH", "/v1/orgs/{org_id}/members/{user_id}"): "access control is never blocked",
     ("DELETE", "/v1/orgs/{org_id}/members/{user_id}"): "revoking access is never blocked",
     ("POST", "/v1/staff/invoices/{invoice_id}/mark-paid"): "staff: a payment lifts the gate",
+    ("POST", "/v1/orgs/{org_id}/closure"): "closure: an account can always be closed (R4)",
+    ("DELETE", "/v1/orgs/{org_id}/closure"): "closure: cancelling it, during the grace period",
+    ("POST", "/v1/orgs/{org_id}/closure/takeover"): "closure: the take-over statement",
 } | {
     (method, path): "staff: the catch-all hiding /v1/staff, always 404"
     for method in UNSAFE
@@ -110,28 +113,6 @@ def error(r: Any) -> str:
     return code
 
 
-def _writes(ws: UUID, doc: UUID, expired: UUID) -> list[tuple[str, str, Any]]:
-    base = f"/v1/workspaces/{ws}"
-    reason = "SAMPLE: uploaded by mistake"
-    return [
-        ("PATCH", f"{base}/documents/{doc}/fields", {"fields": {"total_ttc": "1.00"}}),
-        ("POST", f"{base}/documents/{doc}/seal", None),
-        ("POST", f"{base}/seal-batch", {"month": "2026-11"}),
-        ("PUT", f"{base}/documents/{doc}/tags", {"tags": ["SAMPLE"]}),
-        ("POST", f"{base}/documents/{doc}/corrections",
-         {"field": "total_ttc", "value": "1.00", "reason": reason}),
-        ("PUT", f"{base}/retention/policies/invoice", {"years": 12}),
-        # A document past retention: eligible, so only the billing gate refuses it.
-        ("POST", f"{base}/retention/approve-deletion", {"ids": [str(expired)]}),
-        ("POST", f"{base}/documents/{doc}/remove", {"reason": reason}),
-        ("POST", f"{base}/search/views", {"name": "SAMPLE"}),
-        ("PUT", f"{base}/search/views/{uuid4()}", {"name": "SAMPLE"}),
-        ("DELETE", f"{base}/search/views/{uuid4()}", None),
-        ("POST", f"{base}/ask", {"question": "Total TTC de novembre ?", "locale": "fr"}),
-        ("POST", f"{base}/exports", {"period": "2026-11"}),
-    ]  # fmt: skip
-
-
 async def _upload(alice: Any, workspace: Workspace, enqueuer: Any) -> None:
     r = await alice.client.post(
         f"/v1/workspaces/{workspace.id}/documents",
@@ -148,7 +129,7 @@ async def test_read_only_refuses_writes_but_not_upload_or_reads(
     doc = await _document(db, workspace, alice.user_id)
     expired = await _document(db, workspace, alice.user_id, retain=date(2020, 12, 31))
     await make_late(db, UUID(org_id), alice.clock.now, SubscriptionStatus.read_only)
-    for method, url, body in _writes(workspace.id, doc, expired):
+    for method, url, body in workspace_writes(workspace.id, doc, expired):
         r = await alice.client.request(method, url, json=body)
         assert (r.status_code, error(r)) == (402, "billing.read_only"), (method, url, r.text)
     # Rule R3: a document that does not exist (or is hidden) answers 404, never the 402.

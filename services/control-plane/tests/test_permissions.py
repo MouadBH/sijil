@@ -33,10 +33,11 @@ def test_matrix_shape() -> None:
         Action.documents_remove,
         Action.retention_approve_deletion,
         Action.billing_manage,
+        Action.org_close,
     }
     assert MATRIX[Role.member] == MEMBER
     assert MATRIX[Role.readonly] == READONLY
-    assert len(Action) == 17
+    assert len(Action) == 18
 
 
 @pytest.mark.parametrize("role", list(Role))

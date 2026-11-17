@@ -6,7 +6,8 @@ the past, `billing.advance` issued the first annual invoice then, and nobody pai
 """
 
 from datetime import datetime, timedelta
-from uuid import UUID
+from typing import Any
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,3 +53,27 @@ async def make_late(
     await billing.advance(db, org_id, issued_at, seller=seller)
     assert (await billing.advance(db, org_id, now, seller=seller)).status is status
     await db.commit()
+
+
+def workspace_writes(ws: UUID, doc: UUID, expired: UUID) -> list[tuple[str, str, Any]]:
+    """Every state-changing workspace route the billing gate covers, as (method, url, body):
+    on document `doc`, approving the deletion of `expired`."""
+    base = f"/v1/workspaces/{ws}"
+    reason = "SAMPLE: uploaded by mistake"
+    return [
+        ("PATCH", f"{base}/documents/{doc}/fields", {"fields": {"total_ttc": "1.00"}}),
+        ("POST", f"{base}/documents/{doc}/seal", None),
+        ("POST", f"{base}/seal-batch", {"month": "2026-11"}),
+        ("PUT", f"{base}/documents/{doc}/tags", {"tags": ["SAMPLE"]}),
+        ("POST", f"{base}/documents/{doc}/corrections",
+         {"field": "total_ttc", "value": "1.00", "reason": reason}),
+        ("PUT", f"{base}/retention/policies/invoice", {"years": 12}),
+        # A document past retention: eligible, so only the billing gate refuses it.
+        ("POST", f"{base}/retention/approve-deletion", {"ids": [str(expired)]}),
+        ("POST", f"{base}/documents/{doc}/remove", {"reason": reason}),
+        ("POST", f"{base}/search/views", {"name": "SAMPLE"}),
+        ("PUT", f"{base}/search/views/{uuid4()}", {"name": "SAMPLE"}),
+        ("DELETE", f"{base}/search/views/{uuid4()}", None),
+        ("POST", f"{base}/ask", {"question": "Total TTC de novembre ?", "locale": "fr"}),
+        ("POST", f"{base}/exports", {"period": "2026-11"}),
+    ]  # fmt: skip

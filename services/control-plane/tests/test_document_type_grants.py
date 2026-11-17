@@ -28,6 +28,7 @@ from sijil_core.db.models import (
     Workspace,
 )
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
+from sijil_core.storage import ObjectRef
 from sijil_cp import permissions
 from sijil_cp.api import review
 from tests.support.index_db import throwaway_index_db
@@ -257,6 +258,7 @@ BY_ID: list[tuple[str, str, dict[str, Any] | None]] = [
     ("POST", "/seal", None),
     ("PUT", "/tags", {"tags": ["SAMPLE"]}),
     ("POST", "/corrections", {"field": "number", "value": "F-9", "reason": "SAMPLE typo fix"}),
+    ("GET", "/file", None),
 ]
 
 
@@ -527,3 +529,43 @@ async def test_duplicate_upload_names_the_existing_document_only_when_visible(
     r = await upload(clerk)
     assert r.status_code == 409
     assert r.json() == {"error": {"code": "document.duplicate"}, "document_id": existing}
+
+
+async def test_original_download_streams_from_the_store_and_is_audited(
+    make_actor: MakeActor, db: AsyncSession, ws: Workspace, invoice: DocumentLedger,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """`GET …/documents/{id}/file` (ADM-5): the original from our object store, audited
+    `document.downloaded`; gone from the store, 503; a tombstone, 404."""
+    ws_id, doc_id = ws.id, invoice.id
+    ref = ObjectRef(invoice.object_key, invoice.object_version_id)
+    reader = await _actor(make_actor, db, ws, Role.readonly)
+    url = f"/v1/workspaces/{ws_id}/documents/{doc_id}/file"
+    r = await reader.client.get(url)
+    assert r.status_code == 200, r.text
+    assert r.content == memory_store.objects[ref].data
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-disposition"] == f'attachment; filename="{doc_id}.pdf"'
+    events = (
+        await db.execute(
+            select(AuditEvent.action, AuditEvent.target_id, AuditEvent.actor_id).where(
+                AuditEvent.workspace_id == ws_id, AuditEvent.action == "document.downloaded"
+            )
+        )
+    ).all()
+    assert [tuple(e) for e in events] == [("document.downloaded", str(doc_id), str(reader.user_id))]
+    stored = memory_store.objects.pop(ref)
+    r = await reader.client.get(url)
+    assert (r.status_code, _code(r)) == (503, "document.unavailable")
+    memory_store.objects[ref] = stored
+    await db.execute(
+        update(DocumentLedger)
+        .where(DocumentLedger.id == doc_id)
+        .values(
+            state=DocumentState.removed, removed_at=datetime.now(UTC),
+            removed_by=reader.user_id, removal_reason="SAMPLE: uploaded by mistake",
+        )
+    )  # fmt: skip
+    await db.commit()
+    r = await reader.client.get(url)
+    assert (r.status_code, _code(r)) == (404, "document.not_found")
