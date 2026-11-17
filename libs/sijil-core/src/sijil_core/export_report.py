@@ -44,7 +44,8 @@ SIGNATURE_NAME: Final = "integrity-report.json.sig"
 INDEX_NAME: Final = "index.csv"
 KEY_BYTES: Final = 32
 _CHUNK: Final = 1024 * 1024
-# The same rule as the `export_job.period` CHECK (0012).
+# The same rule as the `export_job.period` CHECK (0012, 0018): a year, a month, or `all`.
+FULL_PERIOD: Final = "all"
 _PERIOD: Final = re.compile(r"(?P<year>[0-9]{4})(?:-(?P<month>0[1-9]|1[0-2]))?")
 
 
@@ -72,7 +73,10 @@ class VerifyOutcome:
 
 
 def period_bounds(period: str) -> tuple[date, date]:
-    """The first and last day of a period, `YYYY` or `YYYY-MM`. ValueError otherwise."""
+    """The first and last day of a period, `YYYY` or `YYYY-MM`; `all` (a full export, ADM-5)
+    spans every date. ValueError otherwise."""
+    if period == FULL_PERIOD:
+        return date.min, date.max
     match = _PERIOD.fullmatch(period)
     if match is None:
         raise ValueError("period must be YYYY or YYYY-MM")
@@ -262,6 +266,7 @@ def _verify(zf: zipfile.ZipFile, listed: list[str], public: bytes) -> list[str]:
 
 
 __all__ = [
+    "FULL_PERIOD",
     "INDEX_NAME",
     "REPORT_NAME",
     "SIGNATURE_NAME",

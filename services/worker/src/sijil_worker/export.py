@@ -1,4 +1,5 @@
-"""Period exports (plan 4.6, ARC-5, design §5.6), in the export-only worker.
+"""Period exports (plan 4.6, ARC-5, design §5.6), and full ones (period `all`, ADM-5: every
+non-terminal document, whatever its period), in the export-only worker.
 
 Product-owner ruling (2026-11-03): one worker, `worker-export`, builds exports. It reads
 originals with the read-only export key (never from Paperless), is the only holder of the
@@ -12,7 +13,8 @@ region's Ed25519 signing seed, reaches no tenant network and has no Docker socke
    the audit chain head (the workspace's last event), in a single REPEATABLE READ transaction;
    then the fields and correction notes in one index transaction opened right after (sealed
    rows are frozen, so the index has no seal-time race left);
-3. keeps the documents whose period basis falls in the period: their `search_doc.basis_date`
+3. keeps the documents whose period basis falls in the period (`all` spans every date, so it
+   keeps them all): their `search_doc.basis_date`
    (sijil_core.search_index), read in the same index transaction, so an export, a search and a
    sum over one period count the same documents. That basis is the `retention_basis` of the
    effective date (a correction note's date wins; else the region-local arrival date), its

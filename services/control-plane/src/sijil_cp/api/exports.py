@@ -1,8 +1,9 @@
 """Signed period exports (plan 4.6, ARC-5, design §5.6).
 
-`POST …/exports` `{period}` (`YYYY` or `YYYY-MM`) needs `Action.documents_export` and a TOTP
-step-up on this session within 10 minutes. A malformed period, a future one or one ending
-before the workspace was created (region-local dates) is 422 `export.period_invalid`. It
+`POST …/exports` `{period}` (`YYYY` or `YYYY-MM`, or `all` for a full export of every
+non-terminal document, ADM-5) needs `Action.documents_export` and a TOTP step-up on this session
+within 10 minutes. A malformed period, a future one or one ending before the workspace was
+created (region-local dates) is 422 `export.period_invalid`. It
 creates the job (`queued`), audits `export.requested` `{period}`, commits, then sends
 `sijil.build_export` to the export worker, the only holder of the region's signing seed; 202
 `{id, state}`.
@@ -31,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import audit
 from sijil_core.db.models import ActorType, ExportJob, ExportState, User, UserSession, Workspace
-from sijil_core.export_report import key_id, period_bounds
+from sijil_core.export_report import FULL_PERIOD, key_id, period_bounds
 from sijil_core.region import assert_region
 from sijil_core.retention import region_local_date
 from sijil_core.storage import ExportStore
@@ -107,6 +108,8 @@ def _ip(request: Request) -> str | None:
 
 def _checked_period(raw: str | None, workspace: Workspace, region: str, now: datetime) -> str:
     period = raw or ""
+    if period == FULL_PERIOD:
+        return period
     try:
         start, end = period_bounds(period)
     except ValueError:

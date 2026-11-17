@@ -46,6 +46,8 @@ class WorkspaceState(StrEnum):
     hibernated = "hibernated"
     closing = "closing"
     error = "error"
+    # 0018 (ADM-5): destroyed after an account closure; the ledger rows stay as tombstones.
+    closed = "closed"
 
 
 class Role(StrEnum):
@@ -119,6 +121,13 @@ class ExportState(StrEnum):
     failed = "failed"
     # A ready export whose ZIP the daily expiry deleted (7 days after `ready_at`).
     expired = "expired"
+
+
+class ClosureState(StrEnum):
+    grace = "grace"
+    hibernated = "hibernated"
+    destroyed = "destroyed"
+    cancelled = "cancelled"
 
 
 class IngestState(StrEnum):
@@ -505,13 +514,16 @@ class IntegrityAlert(Base):
 
 
 class ExportJob(Base):
-    """A period export (ARC-5): built by the export worker into the exports bucket at
-    `object_key` (`<workspace_id>/<job_id>.zip`). The app role has SELECT, INSERT and UPDATE
-    only (0012). Holds no content: the period, the ZIP's hash and size, a count."""
+    """A period export (ARC-5), or a full one (`period` `all`, 0018): built by the export
+    worker into the exports bucket at `object_key` (`<workspace_id>/<job_id>.zip`). The app
+    role has SELECT, INSERT and UPDATE only (0012). Holds no content: the period, the ZIP's
+    hash and size, a count."""
 
     __tablename__ = "export_job"
     __table_args__ = (
-        CheckConstraint(r"period ~ '^[0-9]{4}(-(0[1-9]|1[0-2]))?$'", name="period_format"),
+        CheckConstraint(
+            r"period = 'all' OR period ~ '^[0-9]{4}(-(0[1-9]|1[0-2]))?$'", name="period_format"
+        ),
         CheckConstraint(
             "state IN ('queued', 'building', 'ready', 'failed', 'expired')", name="state_known"
         ),
@@ -685,3 +697,68 @@ class Invoice(Base):
     locale: Mapped[Locale] = mapped_column(_enum(Locale))
     pdf: Mapped[bytes] = mapped_column(LargeBinary)
     pdf_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class Closure(Base):
+    """An organisation's closure request (0018, ADM-5): `grace` for GRACE_DAYS, then
+    `hibernated` (documents still under retention) or `destroyed`; `cancelled` by the Owner
+    during the grace period. At most one per org is open (any state but `cancelled`). The app
+    role may not DELETE it. `export_job_id` is the full export queued with the request for the
+    org's first workspace (one is queued for each)."""
+
+    __tablename__ = "closure"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('grace', 'hibernated', 'destroyed', 'cancelled')", name="state_known"
+        ),
+        CheckConstraint("grace_ends_at > requested_at", name="grace_ordered"),
+        CheckConstraint(
+            "(state = 'cancelled') = (cancelled_at IS NOT NULL)"
+            " AND (cancelled_at IS NULL) = (cancelled_by IS NULL)",
+            name="cancel_consistent",
+        ),
+        Index(
+            "uq_closure_org_open",
+            "org_id",
+            unique=True,
+            postgresql_where=text("state <> 'cancelled'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_account.id"))
+    grace_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    export_job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("export_job.id"))
+    state: Mapped[ClosureState] = mapped_column(_enum(ClosureState), default=ClosureState.grace)
+    cancelled_at: Mapped[datetime | None] = _tstz()
+    cancelled_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user_account.id"))
+    hibernated_at: Mapped[datetime | None] = _tstz()
+    destroyed_at: Mapped[datetime | None] = _tstz()
+
+
+class TakeoverStatement(Base):
+    """The Owner's signed take-over statement (0018, design §7 item 11): the PDF is in the
+    object store, write-once under its own lock, at `object_key`/`object_version_id`; this row
+    holds its SHA-256 and is write-once too (the app role has SELECT and INSERT only). One per
+    closure."""
+
+    __tablename__ = "takeover_statement"
+    __table_args__ = (
+        UniqueConstraint("closure_id"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="sha256_hex"),
+        CheckConstraint("size_bytes > 0", name="size_positive"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    closure_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("closure.id"))
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    signed_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_account.id"))
+    signer_name: Mapped[str] = mapped_column(String(200))
+    signer_capacity: Mapped[str] = mapped_column(String(200))
+    object_key: Mapped[str] = mapped_column(String)
+    object_version_id: Mapped[str] = mapped_column(String)
+    sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = _created_at()

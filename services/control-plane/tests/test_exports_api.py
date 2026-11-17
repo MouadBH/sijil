@@ -283,6 +283,22 @@ async def test_a_bad_period_is_refused(
         assert r.status_code == 202, (period, r.text)
 
 
+async def test_a_full_export_is_period_all(
+    owner: Actor, workspace: Workspace, db: AsyncSession, enqueuer: Any
+) -> None:
+    """ADM-5: `all` asks for every non-terminal document; other spellings stay invalid."""
+    for period in ("ALL", "All", "all-2026", " all"):
+        r = await owner.client.post(_url(workspace), json={"period": period})
+        assert (r.status_code, _code(r)) == (422, "export.period_invalid"), period
+    r = await owner.client.post(_url(workspace), json={"period": "all"})
+    assert r.status_code == 202, r.text
+    job_id = r.json()["id"]
+    assert enqueuer.exports == [uuid.UUID(job_id)]
+    assert (await owner.client.get(_url(workspace, f"/{job_id}"))).json()["period"] == "all"
+    [event] = await _events(db, workspace, "export.requested")
+    assert event.data == {"period": "all"}
+
+
 async def test_export_key_endpoint_matches_signing_key(
     cp_app: FastAPI, csrf_client_for: Callable[..., httpx.AsyncClient]
 ) -> None:
