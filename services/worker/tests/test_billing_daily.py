@@ -523,6 +523,52 @@ async def test_no_invoice_while_the_account_is_closing(
     assert len(await _invoices(db, org)) == 1
 
 
+async def test_a_closure_cancelled_after_the_year_end_still_gets_its_renewal(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    org: Organisation,
+    user: User,
+    workspace: Workspace,
+) -> None:
+    """Review fix 2: while the org is closing the billing year does not roll either, so a
+    closure cancelled after `period_end` gets the renewal it skipped, once, and the year then
+    rolls onto it."""
+    await _subscribed(db, org, user, ICE)
+    await _twice(sessions, TRIAL_END + timedelta(hours=2))
+    (first,) = await _invoices(db, org)
+    async with sessions() as session:
+        paid = await session.get(Invoice, first.id)
+        assert paid is not None
+        paid.state, paid.paid_at, paid.payment_reference = (
+            InvoiceState.paid, TRIAL_END + timedelta(days=1), "VIR-SAMPLE-2",
+        )  # fmt: skip
+        await session.commit()
+    year_end = (await _sub(db, org)).period_end
+    # Closing from inside the renewal notice until past the year's end: nothing is issued and
+    # the year stays where it was.
+    org.status = OrgStatus.closing
+    await db.commit()
+    await _twice(sessions, year_end - timedelta(days=20))
+    await _twice(sessions, year_end + timedelta(days=1))
+    assert len(await _invoices(db, org)) == 1
+    sub = await _sub(db, org)
+    assert (sub.period_start, sub.period_end) == (TRIAL_END, year_end)
+    # Cancelled: the next run issues the missed renewal, then rolls the year onto it.
+    org.status = OrgStatus.active
+    await db.commit()
+    await _twice(sessions, year_end + timedelta(days=2))
+    invoices = await _invoices(db, org)
+    assert len(invoices) == 2
+    renewal = invoices[1]
+    assert (renewal.kind, renewal.period_start, renewal.period_end) == (
+        InvoiceKind.annual, year_end, billing.add_year(year_end),
+    )  # fmt: skip
+    sub = await _sub(db, org)
+    assert (sub.period_start, sub.period_end) == (year_end, billing.add_year(year_end))
+    issued = [e for e in await _events(db, workspace) if e[0] == "billing.invoice_issued"]
+    assert len(issued) == 2
+
+
 async def test_a_closed_subscription_refuses_writes_but_not_exports(
     db: AsyncSession, org: Organisation, user: User
 ) -> None:

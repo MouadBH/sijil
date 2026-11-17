@@ -28,7 +28,8 @@ Billing is per organisation, in the control-plane database of its region.
   one), rolls the billing year on at `period_end` (the plan the new year is invoiced on then
   applies: its renewal's, or an upgrade's issued after it), marks
   unpaid invoices past due `overdue`, and stores the phase. While the org is closing or closed
-  (ADM-5, ruling R4) no invoice is issued: neither the first annual one nor a renewal. Each
+  (ADM-5, ruling R4) no invoice is issued, neither the first annual one nor a renewal, and the
+  billing year does not roll: a cancel then issues what was skipped. Each
   transition is audited once:
   `billing.invoice_issued`, `billing.overdue` (`{number}` for an invoice, `{reason}` for the
   missing ICE) and `billing.read_only`.
@@ -508,7 +509,9 @@ async def advance(
             renewal = await invoicing.issue(
                 db, org, InvoiceKind.annual, plan, period, now, seller=seller
             )
-        if now < sub.period_end:
+        # Nor does the year roll while the org is closing: a cancel then issues the renewal it
+        # skipped, and the year rolls onto it (an unrolled year is never left unbilled).
+        if now < sub.period_end or not invoicing_open:
             break
         # The new year runs on the plan it is invoiced on (an upgrade issued after its renewal
         # included). A pending downgrade that this renewal already carries is done; one chosen
