@@ -430,6 +430,8 @@ Branch `m5-search`. Covers **ARC-1, ARC-2, REC-5**.
 
 Branch `m6-admin`. Covers **ADM-1 (document-type permissions), ADM-3, ADM-4, ADM-5**.
 
+**Status: done** (tasks 6.1–6.4 as six tasks; the detailed plan is [docs/superpowers/plans/2026-11-13-m6-admin.md](superpowers/plans/2026-11-13-m6-admin.md); `test_lock_all_paths` covers closure, take-over, hibernation, billing read-only, staff `mark-paid` and the full export; `test_m6_acceptance` in `make itest` with no model). Amended: invoices are marked paid by platform staff through a hidden `/v1/staff` API (`sijil-cp staff grant|revoke`, audited on a platform chain); a hibernated workspace reuses the billing gate's `billing.read_only` for its Owner's writes (ruling R5); a destroyed one is `closed` (ruling R6); no invoice is issued while an account closes (ruling R4); the invoice PDF is rendered once, in the first Owner's locale (fr or ar). `make seed` keeps the SAMPLE org paid up.
+
 | Task | Deliverable | Acceptance tests |
 | --- | --- | --- |
 | 6.1 Document-type permissions | Membership grants restricted to document types; enforced in list, search, ask and export | `test_member_limited_to_invoices_cannot_see_payslips` (including via Ask and export) |
