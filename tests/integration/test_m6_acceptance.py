@@ -18,8 +18,11 @@ retention):
 3. The Owner sets the org's ICE and chooses a plan in the trial. The control plane's clock cannot
    move, so the trial is made to have ended 45 days ago and the daily job's transition
    (`billing.advance`) runs at that moment: the first annual invoice is issued then, in the
-   Owner's locale (fr). The Owner, now reading Arabic, upgrades: the prorated invoice is in ar.
-   Both PDFs are served as stored at issue.
+   Owner's locale (fr). That call runs in the test runner (`sijil_core` as built into it), not
+   in the deployed worker; it is the same function `sijil.billing_daily` runs. It also takes the
+   next gapless number with a past issue date, so the dev stack's numbering is not
+   chronological. The Owner, now reading Arabic, upgrades through the control plane: the
+   prorated invoice is in ar. Both PDFs are served as stored at issue.
 4. The annual invoice is unpaid past due: the org is overdue, a new export is refused
    (`billing.overdue`) and an upload still lands.
 5. Staff (`sijil-cp staff grant`, TOTP) mark it paid: active again, exporting works.
@@ -145,6 +148,13 @@ def _ids(r: httpx.Response) -> list[str]:
     return [item["id"] for item in r.json()["items"]]
 
 
+async def _db_user(sessions: Any, email: str, name: str) -> None:
+    """A user created in the database: the signup rate limit is per IP and hourly."""
+    async with sessions() as db:
+        db.add(User(email=email, name=name, password_hash=hash_password(PASSWORD)))
+        await db.commit()
+
+
 async def test_member_limited_to_invoices_cannot_see_payslips(
     worker_settings: WorkerSettings,
     docker_runtime: DockerRuntime,
@@ -161,7 +171,11 @@ async def test_member_limited_to_invoices_cannot_see_payslips(
     try:
         # 1. A fresh workspace and its Owner; a Member limited to invoices, through the API.
         owner = Owner(http, PASSWORD)
-        await owner.sign_up(f"m6-{run}@sijil.local", "SAMPLE M6 Owner")
+        # Users are created in the database and sign in: the signup rate limit is per IP
+        # and hourly.
+        owner_email = f"m6-{run}@sijil.local"
+        await _db_user(sessions, owner_email, "SAMPLE M6 Owner")
+        await owner.sign_in(owner_email)
         r = await post(
             http, "/v1/orgs",
             {"name": f"SAMPLE M6 Acceptance {run}", "type": "business", "country": "MA"},
@@ -172,7 +186,8 @@ async def test_member_limited_to_invoices_cannot_see_payslips(
         created_workspaces.append(workspace_id)
         base = f"/v1/workspaces/{workspace_id}"
         member_email = f"m6-member-{run}@sijil.local"
-        await Owner(member_http, PASSWORD).sign_up(member_email, "SAMPLE M6 Member")
+        await _db_user(sessions, member_email, "SAMPLE M6 Member")
+        await Owner(member_http, PASSWORD).sign_in(member_email)
         await owner.step_up()
         r = await post(
             http, f"/v1/orgs/{org_id}/members",
@@ -341,13 +356,6 @@ async def _report(owner: Owner, base: str, job: str) -> dict[str, Any]:
     return report
 
 
-async def _db_user(sessions: Any, email: str, name: str) -> None:
-    """A user created in the database: the signup rate limit is per IP and hourly."""
-    async with sessions() as db:
-        db.add(User(email=email, name=name, password_hash=hash_password(PASSWORD)))
-        await db.commit()
-
-
 async def test_billing_then_closure_end_to_end(
     worker_settings: WorkerSettings,
     docker_runtime: DockerRuntime,
@@ -364,8 +372,12 @@ async def test_billing_then_closure_end_to_end(
     staff_http = httpx.AsyncClient(base_url=CP_URL, timeout=60)
     try:
         # 1. A fresh workspace, its Owner and an Admin; one SAMPLE invoice through the API.
+        # Every user of this test is created in the database and signs in (the signup rate
+        # limit is per IP and hourly: test 1 and other runs spend it).
         owner = Owner(http, PASSWORD)
-        await owner.sign_up(f"m6-close-{run}@sijil.local", "SAMPLE M6 Owner")
+        owner_email = f"m6-close-{run}@sijil.local"
+        await _db_user(sessions, owner_email, "SAMPLE M6 Owner")
+        await owner.sign_in(owner_email)
         r = await post(
             http, "/v1/orgs",
             {"name": f"SAMPLE M6 Closure {run}", "type": "business", "country": "MA"},
@@ -471,7 +483,7 @@ async def test_billing_then_closure_end_to_end(
         await owner.step_up()
         r = await post(http, f"{base}/exports", {"period": "all"})
         assert (r.status_code, r.json()["error"]["code"]) == (402, "billing.overdue"), r.text
-        second = (FIXTURES / "invoices" / FILES["payslip"]).read_bytes()
+        second = (FIXTURES / "invoices" / "sample-03-fr.pdf").read_bytes()
         second_id = await classified("facture-2.pdf", second, INVOICE | {"number": "M6-F-0002"})
 
         # 5. Staff (granted by `sijil-cp staff grant`, TOTP enrolled) record the transfer: the
