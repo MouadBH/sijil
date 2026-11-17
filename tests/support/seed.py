@@ -139,8 +139,9 @@ async def keep_paid_up(
     db: AsyncSession, org_id: UUID, now: datetime, *, seller: SellerSettings
 ) -> list[str]:
     """Chooses SEED_PLAN (`billing.change_plan`, as the Owner's `PUT /orgs/{id}/subscription`)
-    unless another plan or a change is already chosen, and records every unpaid invoice as paid by a SAMPLE transfer, as staff `mark-paid` does,
-    then stores the status (`billing.advance`): active, nothing owed. The org must have an ICE.
+    unless another plan or a change is already chosen, and records every unpaid invoice as
+    paid by a SAMPLE transfer, as staff `mark-paid` does, then stores the status
+    (`billing.advance`): active, nothing owed. The org must have an ICE.
     Commits. Idempotent: returns the numbers it marked paid (none on a second run)."""
     # A plan someone already chose (another plan, or a change pending) is kept: seed never
     # schedules a downgrade.
