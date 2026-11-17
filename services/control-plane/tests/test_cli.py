@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -211,8 +212,16 @@ async def test_cli_grant_and_revoke(
 
     # The commands are wired.
     seen: list[tuple[str, str]] = []
-    monkeypatch.setattr(cli, "staff_grant", lambda email: seen.append(("grant", email)) or 0)
-    monkeypatch.setattr(cli, "staff_revoke", lambda email: seen.append(("revoke", email)) or 0)
+
+    def recorder(command: str) -> Callable[[str], int]:
+        def fake(email: str) -> int:
+            seen.append((command, email))
+            return 0
+
+        return fake
+
+    monkeypatch.setattr(cli, "staff_grant", recorder("grant"))
+    monkeypatch.setattr(cli, "staff_revoke", recorder("revoke"))
     for command in ("grant", "revoke"):
         with pytest.raises(SystemExit) as exited:
             cli.main(["staff", command, "sam@example.com"])
