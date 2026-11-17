@@ -920,6 +920,9 @@ async def _hibernate(
     assert state is not None and state.value == "hibernated"
 
 
+READ_EVENTS = {"documents.listed", "document.viewed", "document.downloaded", "search.performed"}
+
+
 async def _reads(actor: Actor, ws_id: uuid.UUID, row: Doc) -> list[int]:
     base = f"/v1/workspaces/{ws_id}"
     client: httpx.AsyncClient = actor.client
@@ -950,6 +953,7 @@ async def test_hibernated_path(
     await actor.step_up()
     before = await _snapshot(db, index_conn, memory_store, row)
     locks_before = list(enqueuer.locks)  # the seal's own
+    events_before = await _events(db, ws_id)
 
     if path == "reads":
         statuses = await _reads(actor, ws_id, row)
@@ -960,6 +964,10 @@ async def test_hibernated_path(
         assert (r.status_code, r.json()["error"]["code"]) == expected, r.text
     assert await _snapshot(db, index_conn, memory_store, row) == before
     assert enqueuer.removals == [] and enqueuer.locks == locks_before
+    # The Owner's reads are audited as reads; a write leaves at most its refusal.
+    new_events = (await _events(db, ws_id))[len(events_before) :]
+    allowed = READ_EVENTS if path == "reads" else {REFUSED}
+    assert [a for a, _d, _t in new_events if a not in allowed] == []
 
 
 async def _staff(make_actor: MakeActor, db: AsyncSession) -> Actor:
