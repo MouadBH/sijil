@@ -10,12 +10,23 @@ the list and from search, and 404 by id, exactly as an unknown id. Ask runs the 
 pipeline (`answer_question`) on a fake in-region model for questions stored as the API stores
 the Member's (with their grant): the figure counts the invoice only, and a question naming
 payslips gets the answer of no matching documents. Exporting is not the Member's (403).
+
+Account closure (ADM-5): a fresh workspace with one SAMPLE invoice (under retention). Its Owner
+requests the closure: the org is `closing` and the export worker builds the full export (period
+`all`), which the Owner downloads and which holds the invoice. The daily closure job then runs
+in-process with its clock 31 days on and the real Docker runtime: the workspace hibernates and
+its tenant is stopped. The Owner still lists the invoice (no Paperless title: it is never
+called) and downloads its original from our object store; an Admin gets 404; an upload is
+refused and so is a write (`billing.read_only`).
 """
 
 import asyncio
+import io
+import json
 import time
 import uuid
-from datetime import UTC, datetime
+import zipfile
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -35,12 +46,14 @@ from sijil_core.db.models import (
     Workspace,
     WorkspaceState,
 )
+from sijil_core.export_report import REPORT_NAME
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import FieldsRow, IndexEngines, read_fields, write_extraction
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_core.tenancy import tenant_ref
 from sijil_worker.ask import ANSWER_NO_MATCH, answer_question
+from sijil_worker.closure import closure_daily
 from sijil_worker.extract import _route
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import AskSettings, WorkerSettings
@@ -262,6 +275,124 @@ async def test_member_limited_to_invoices_cannot_see_payslips(
             await http.aclose()
             await member_http.aclose()
             await engines.aclose()
+            await engine.dispose()
+        finally:
+            for created_id in created_workspaces:
+                await docker_runtime.destroy(tenant_ref(created_id))
+
+
+EXPORT_BUDGET_S = 300
+
+
+async def test_closure_hibernates_a_workspace_with_retained_documents(
+    worker_settings: WorkerSettings,
+    docker_runtime: DockerRuntime,
+    created_workspaces: list[uuid.UUID],
+) -> None:
+    run = uuid.uuid4().hex[:8]
+    engine = make_engine(worker_settings.database_url)
+    sessions = make_sessionmaker(engine)
+    http = httpx.AsyncClient(base_url=CP_URL, timeout=60)
+    admin_http = httpx.AsyncClient(base_url=CP_URL, timeout=60)
+    try:
+        # 1. A fresh workspace, its Owner and an Admin; one SAMPLE invoice through the API.
+        owner = Owner(http, PASSWORD)
+        await owner.sign_up(f"m6-close-{run}@sijil.local", "SAMPLE M6 Owner")
+        r = await post(
+            http, "/v1/orgs",
+            {"name": f"SAMPLE M6 Closure {run}", "type": "business", "country": "MA"},
+        )  # fmt: skip
+        assert r.status_code == 202, r.text
+        org_id = r.json()["org"]["id"]
+        workspace_id = uuid.UUID(r.json()["workspace"]["id"])
+        created_workspaces.append(workspace_id)
+        base = f"/v1/workspaces/{workspace_id}"
+        admin_email = f"m6-close-admin-{run}@sijil.local"
+        await Owner(admin_http, PASSWORD).sign_up(admin_email, "SAMPLE M6 Admin")
+        await owner.step_up()
+        r = await post(http, f"/v1/orgs/{org_id}/members", {"email": admin_email, "role": "admin"})
+        assert r.status_code == 201, r.text
+        started = time.monotonic()
+        while (state := (await poll_get(http, base)).json()["state"]) != WorkspaceState.active:
+            assert state != WorkspaceState.error
+            assert time.monotonic() - started < PROVISION_BUDGET_S, state
+            await asyncio.sleep(3)
+        data = (FIXTURES / "invoices" / FILES["invoice"]).read_bytes()
+        r = await http.post(
+            f"{base}/documents", files={"file": ("facture.pdf", data, "application/pdf")},
+            headers=csrf(http),
+        )  # fmt: skip
+        assert r.status_code == 202, r.text
+        doc_id = r.json()["document_id"]
+        started = time.monotonic()
+        while True:
+            async with sessions() as db:
+                row = await db.get(DocumentLedger, uuid.UUID(doc_id))
+            assert row is not None
+            if row.ingest_state == IngestState.consumed:
+                break
+            assert time.monotonic() - started < CONSUME_BUDGET_S, row.ingest_state
+            await asyncio.sleep(3)
+
+        # 2. The closure: `closing`, and the full export built by the export worker.
+        await owner.step_up()
+        r = await post(http, f"/v1/orgs/{org_id}/closure", None)
+        assert r.status_code == 201, r.text
+        closure = r.json()
+        assert closure["state"] == "grace"
+        job = closure["export_job_id"]
+        started = time.monotonic()
+        while (r := await poll_get(http, f"{base}/exports/{job}")).json()["state"] != "ready":
+            assert r.json()["state"] in ("queued", "building"), r.text
+            assert time.monotonic() - started < EXPORT_BUDGET_S, r.text
+            await asyncio.sleep(3)
+        assert r.json()["document_count"] == 1
+        await owner.step_up()
+        r = await http.get(f"{base}/exports/{job}/download")
+        assert r.status_code == 200, r.text
+        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+            report = json.loads(zf.read(REPORT_NAME))
+        assert report["period"] == "all"
+        assert [d["id"] for d in report["documents"]] == [doc_id]
+
+        # 3. The grace period over: hibernated, the tenant stopped.
+        removals: list[uuid.UUID] = []
+
+        async def send_removal(ledger_id: uuid.UUID, _workspace_id: uuid.UUID) -> None:
+            removals.append(ledger_id)
+
+        outcome = await closure_daily(
+            sessions, runtime=docker_runtime, locks=S3ObjectStore(StorageSettings()),
+            settings=worker_settings, send_removal=send_removal,
+            now=datetime.now(UTC) + timedelta(days=31),
+        )  # fmt: skip
+        _log(f"closure: {outcome}")
+        assert (outcome.hibernated, outcome.destroyed, removals) == (1, 0, [])
+        assert await docker_runtime.status(tenant_ref(workspace_id)) == "stopped"
+        r = await poll_get(http, base)
+        assert r.json()["state"] == WorkspaceState.hibernated
+
+        # 4. The Owner reads; everyone else gets 404; capture and writes are refused.
+        r = await poll_get(http, f"{base}/documents")
+        assert (_ids(r), r.json()["engine"]) == ([doc_id], "unavailable")
+        r = await http.get(f"{base}/documents/{doc_id}/file")
+        assert r.status_code == 200, r.text
+        assert r.content == data
+        for path in ("/documents", f"/documents/{doc_id}", f"/documents/{doc_id}/file"):
+            assert (await admin_http.get(base + path)).status_code == 404, path
+        r = await http.post(
+            f"{base}/documents", files={"file": ("autre.pdf", data + b"\n", "application/pdf")},
+            headers=csrf(http),
+        )  # fmt: skip
+        assert r.status_code == 409, r.text
+        r = await http.put(
+            f"{base}/retention/policies/invoice", json={"years": 12}, headers=csrf(http)
+        )
+        assert (r.status_code, r.json()["error"]["code"]) == (402, "billing.read_only")
+    finally:
+        try:
+            await http.aclose()
+            await admin_http.aclose()
             await engine.dispose()
         finally:
             for created_id in created_workspaces:

@@ -14,6 +14,14 @@ a document, for every role, on an unsealed and on a sealed document.
 | 8 API `PUT …/documents/{id}/tags` | each | fields unchanged | - |
 | 9 API search, saved view, Ask (and its worker) | each | nothing written | - |
 | 10 search and embedding SQL without the gate | none | refused (see below) | refused |
+| 11 API closure request, cancel, take-over (M6) | each (org) | unchanged | unchanged |
+| 11 `sijil.closure_daily`: hibernation, take-over destruction | none | unchanged | unchanged |
+
+Path 11 (M6, ADM-5) is account closure: its routes are the Owner's (others 403) and touch no
+document; after the grace period the closure job stops or destroys the tenant and leaves a
+document still under retention (its ledger row, index rows and original with its lock) exactly
+as it was, sending no removal. A document is approved for deletion by a closure only once its
+retention has passed, through the same ledger guard (services/worker/tests/test_closure.py).
 
 Paths 8 and 9 (M5) are the annotations and the reads: on a sealed document a tag is allowed
 (Owner, Admin, Member) and a search, a saved view or a question is every role's; none of them
@@ -603,3 +611,130 @@ async def test_object_store_delete_refused(state: str, key: str, tmp_path: Path)
     finally:
         if state == "unsealed":  # a sealed one stays until its lock ends (a day)
             await root.remove_original(ref, governance=True)
+
+
+# Path 11 (M6): account closure ---------------------------------------------------------------
+
+
+async def _org_member(make_actor: MakeActor, db: AsyncSession, ws: Workspace, role: Role) -> Actor:
+    """A member of the workspace's org with `role`, TOTP enrolled and stepped up."""
+    actor = await make_actor(f"close-{role.value}-{uuid.uuid4().hex[:6]}@example.com")
+    db.add(Membership(user_id=actor.user_id, org_id=ws.org_id, role=role))
+    await db.commit()
+    await actor.enable_totp()
+    await actor.step_up()
+    return actor
+
+
+def _closure_expected(path: str, role: Role) -> tuple[int, str | None]:
+    if role is not Role.owner:
+        return 403, "forbidden"
+    owner = {"request": (201, None), "cancel": (200, None), "takeover": (422, "takeover.invalid")}
+    return owner[path]
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("path", ["request", "cancel", "takeover"])
+async def test_closure_api_path(
+    path: str, role: Role, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """Requesting, cancelling a closure and signing its take-over (ADM-5) change no document:
+    not its ledger row, index rows or original; nothing is sent to the removal worker."""
+    ws_id, org_id = ws.id, ws.org_id  # a rollback expires the ORM row
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    if path == "cancel":
+        opener = await _org_member(make_actor, db, ws, Role.owner)
+        assert (await opener.client.post(f"/v1/orgs/{org_id}/closure")).status_code == 201
+    actor = await _org_member(make_actor, db, ws, role)
+    before = await _snapshot(db, index_conn, memory_store, row)
+    events_before = await _events(db, ws_id)
+    url = f"/v1/orgs/{org_id}/closure"
+    if path == "request":
+        r = await actor.client.post(url)
+    elif path == "cancel":
+        r = await actor.client.delete(url)
+    else:
+        if role is Role.owner:  # an open closure, its full export not yet ready
+            assert (await actor.client.post(url)).status_code == 201
+        r = await actor.client.post(
+            f"{url}/takeover",
+            files={"file": ("statement.pdf", b"%PDF-1.7 SAMPLE", "application/pdf")},
+            data={"signer_name": "SAMPLE", "signer_capacity": "Gérant"},
+        )
+    status, code = _closure_expected(path, role)
+    assert r.status_code == status, r.text
+    if code is not None:
+        assert r.json()["error"]["code"] == code
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert enqueuer.removals == []
+    new_events = (await _events(db, ws_id))[len(events_before) :]
+    assert all(target != str(row.id) for _action, _data, target in new_events)
+
+
+class _Runtime:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def stop(self, ref: str) -> None:
+        self.calls.append("stop")
+
+    async def destroy(self, ref: str) -> None:
+        self.calls.append("destroy")
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("outcome", ["hibernated", "takeover"])
+async def test_closure_job_path(
+    outcome: str, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection,
+) -> None:  # fmt: skip
+    """`sijil.closure_daily` after the grace period (ADM-5), with a document under retention:
+    hibernation stops the tenant, a take-over destroys it, and either way the document's ledger
+    row, index rows and original (and its lock) stay exactly as they were, and no removal is
+    sent."""
+    from sijil_core.db.models import Closure, ClosureState, TakeoverStatement
+    from sijil_worker.closure import closure_daily
+
+    ws_id, org_id = ws.id, ws.org_id  # a rollback expires the ORM row
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    owner = await _org_member(make_actor, db, ws, Role.owner)
+    requested = datetime.now(UTC) - timedelta(days=31)
+    closure = Closure(
+        org_id=org_id, requested_at=requested, requested_by=owner.user_id,
+        grace_ends_at=requested + timedelta(days=30), state=ClosureState.grace,
+    )  # fmt: skip
+    db.add(closure)
+    await db.flush()
+    if outcome == "takeover":
+        db.add(
+            TakeoverStatement(
+                closure_id=closure.id, org_id=org_id, signed_by=owner.user_id,
+                signer_name="SAMPLE", signer_capacity="Gérant", object_key="takeover/x.pdf",
+                object_version_id="v1", sha256="a" * 64, size_bytes=1, created_at=requested,
+            )
+        )  # fmt: skip
+    await db.commit()
+    before = await _snapshot(db, index_conn, memory_store, row)
+    events_before = await _events(db, ws_id)
+    runtime, removals = _Runtime(), []
+
+    async def send_removal(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        removals.append(ledger_id)
+
+    await closure_daily(
+        async_sessionmaker(db.bind, expire_on_commit=False), runtime=runtime,
+        locks=memory_store, settings=SETTINGS, send_removal=send_removal,
+        now=datetime.now(UTC),
+    )  # fmt: skip
+    assert runtime.calls == (["stop"] if outcome == "hibernated" else ["destroy"])
+    assert removals == []
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    new_events = (await _events(db, ws_id))[len(events_before) :]
+    assert [a for a, _d, _t in new_events] == [
+        f"closure.{'destroyed' if outcome == 'takeover' else 'hibernated'}"
+    ]
+    assert all(target != str(row.id) for _action, _data, target in new_events)
