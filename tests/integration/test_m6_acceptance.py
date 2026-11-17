@@ -11,16 +11,28 @@ pipeline (`answer_question`) on a fake in-region model for questions stored as t
 the Member's (with their grant): the figure counts the invoice only, and a question naming
 payslips gets the answer of no matching documents. Exporting is not the Member's (403).
 
-Account closure (ADM-5): a fresh workspace with one SAMPLE invoice (under retention). Its Owner
-requests the closure: the org is `closing` and the export worker builds the full export (period
-`all`), which the Owner downloads and which holds the invoice. The daily closure job then runs
-in-process with its clock 31 days on and the real Docker runtime: the workspace hibernates and
-its tenant is stopped. The Owner still lists the invoice (no Paperless title: it is never
-called) and downloads its original from our object store; an Admin gets 404; an upload is
-refused and so is a write (`billing.read_only`).
+Billing, then the closure (ADM-3/4/5), on a fresh workspace with one SAMPLE invoice (under
+retention):
+
+2. The meter shows the upload (documents and storage).
+3. The Owner sets the org's ICE and chooses a plan in the trial. The control plane's clock cannot
+   move, so the trial is made to have ended 45 days ago and the daily job's transition
+   (`billing.advance`) runs at that moment: the first annual invoice is issued then, in the
+   Owner's locale (fr). The Owner, now reading Arabic, upgrades: the prorated invoice is in ar.
+   Both PDFs are served as stored at issue.
+4. The annual invoice is unpaid past due: the org is overdue, a new export is refused
+   (`billing.overdue`) and an upload still lands.
+5. Staff (`sijil-cp staff grant`, TOTP) mark it paid: active again, exporting works.
+6. A full export holds both documents. The closure is requested, cancelled, requested again;
+   its own full export is built by the export worker.
+7. The daily closure job runs in-process with its clock 31 days on and the real Docker runtime:
+   the workspace hibernates and its tenant is stopped. The Owner still lists the documents (no
+   Paperless: it is never called) and downloads an original from our object store; an Admin
+   gets 404; an upload is refused and so is a write (`billing.read_only`).
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import time
@@ -33,15 +45,17 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from sijil_core import ask_store
+from sijil_core import ask_store, billing
 from sijil_core.crypto import LocalKeyService
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.db.models import (
     DocumentLedger,
     DocumentState,
     IngestState,
+    Locale,
+    Subscription,
     User,
     Workspace,
     WorkspaceState,
@@ -49,7 +63,9 @@ from sijil_core.db.models import (
 from sijil_core.export_report import REPORT_NAME
 from sijil_core.fields import FIELD_NAMES
 from sijil_core.index import FieldsRow, IndexEngines, read_fields, write_extraction
+from sijil_core.retention import region_local_date
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
+from sijil_core.settings import SellerSettings
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_core.tenancy import tenant_ref
 from sijil_cp.auth.passwords import hash_password
@@ -58,7 +74,7 @@ from sijil_worker.closure import closure_daily
 from sijil_worker.extract import _route
 from sijil_worker.runtime.docker import DockerRuntime
 from sijil_worker.settings import AskSettings, WorkerSettings
-from tests.support.acceptance import Owner, csrf, post
+from tests.support.acceptance import Owner, cli, csrf, post
 from tests.support.fake_ollama import FakeOllama
 from tests.support.polling import poll_get
 
@@ -283,9 +299,56 @@ async def test_member_limited_to_invoices_cannot_see_payslips(
 
 
 EXPORT_BUDGET_S = 300
+SAMPLE_ORG_ICE = "002999888000011"  # SAMPLE: the org's own (fictitious) ICE
+TRANSFER = "VIR-M6-000123"  # SAMPLE: a fictitious bank transfer reference
 
 
-async def test_closure_hibernates_a_workspace_with_retained_documents(
+async def _consumed(sessions: Any, doc_id: str) -> None:
+    started = time.monotonic()
+    while True:
+        async with sessions() as db:
+            row = await db.get(DocumentLedger, uuid.UUID(doc_id))
+        assert row is not None
+        if row.ingest_state == IngestState.consumed:
+            return
+        assert time.monotonic() - started < CONSUME_BUDGET_S, row.ingest_state
+        await asyncio.sleep(3)
+
+
+async def _upload(http: httpx.AsyncClient, base: str, name: str, data: bytes) -> httpx.Response:
+    return await http.post(
+        f"{base}/documents", files={"file": (name, data, "application/pdf")}, headers=csrf(http)
+    )
+
+
+async def _ready(http: httpx.AsyncClient, base: str, job: str) -> dict[str, Any]:
+    started = time.monotonic()
+    while (r := await poll_get(http, f"{base}/exports/{job}")).json()["state"] != "ready":
+        assert r.json()["state"] in ("queued", "building"), r.text
+        assert time.monotonic() - started < EXPORT_BUDGET_S, r.text
+        await asyncio.sleep(3)
+    found: dict[str, Any] = r.json()
+    return found
+
+
+async def _report(owner: Owner, base: str, job: str) -> dict[str, Any]:
+    """Downloads a ready export (with a step-up) and returns its signed report."""
+    await owner.step_up()
+    r = await owner.http.get(f"{base}/exports/{job}/download")
+    assert r.status_code == 200, r.text
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        report: dict[str, Any] = json.loads(zf.read(REPORT_NAME))
+    return report
+
+
+async def _db_user(sessions: Any, email: str, name: str) -> None:
+    """A user created in the database: the signup rate limit is per IP and hourly."""
+    async with sessions() as db:
+        db.add(User(email=email, name=name, password_hash=hash_password(PASSWORD)))
+        await db.commit()
+
+
+async def test_billing_then_closure_end_to_end(
     worker_settings: WorkerSettings,
     docker_runtime: DockerRuntime,
     created_workspaces: list[uuid.UUID],
@@ -293,8 +356,12 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
     run = uuid.uuid4().hex[:8]
     engine = make_engine(worker_settings.database_url)
     sessions = make_sessionmaker(engine)
+    engines = IndexEngines(
+        worker_settings, LocalKeyService(worker_settings.master_key_bytes()), sessions
+    )
     http = httpx.AsyncClient(base_url=CP_URL, timeout=60)
     admin_http = httpx.AsyncClient(base_url=CP_URL, timeout=60)
+    staff_http = httpx.AsyncClient(base_url=CP_URL, timeout=60)
     try:
         # 1. A fresh workspace, its Owner and an Admin; one SAMPLE invoice through the API.
         owner = Owner(http, PASSWORD)
@@ -305,20 +372,15 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
         )  # fmt: skip
         assert r.status_code == 202, r.text
         org_id = r.json()["org"]["id"]
+        org = f"/v1/orgs/{org_id}"
         workspace_id = uuid.UUID(r.json()["workspace"]["id"])
         created_workspaces.append(workspace_id)
         base = f"/v1/workspaces/{workspace_id}"
-        # The Admin is created in the database (the signup rate limit is per IP and hourly),
-        # added by the Owner over the API, and signs in like anyone.
+        # The Admin is created in the database, added by the Owner over the API, and signs in.
         admin_email = f"m6-close-admin-{run}@sijil.local"
-        async with sessions() as db:
-            db.add(
-                User(email=admin_email, name="SAMPLE M6 Admin",
-                     password_hash=hash_password(PASSWORD))
-            )  # fmt: skip
-            await db.commit()
+        await _db_user(sessions, admin_email, "SAMPLE M6 Admin")
         await owner.step_up()
-        r = await post(http, f"/v1/orgs/{org_id}/members", {"email": admin_email, "role": "admin"})
+        r = await post(http, f"{org}/members", {"email": admin_email, "role": "admin"})
         assert r.status_code == 201, r.text
         (await admin_http.get("/v1/auth/csrf")).raise_for_status()
         r = await post(admin_http, "/v1/auth/login", {"email": admin_email, "password": PASSWORD})
@@ -328,45 +390,141 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
             assert state != WorkspaceState.error
             assert time.monotonic() - started < PROVISION_BUDGET_S, state
             await asyncio.sleep(3)
+        async with sessions() as db:
+            workspace = await db.get(Workspace, workspace_id)
+        assert workspace is not None
+
+        async def classified(name: str, data: bytes, values: dict[str, str | None]) -> str:
+            """Uploaded, then classified in the index before ingest finishes (no model)."""
+            r = await _upload(http, base, name, data)
+            assert r.status_code == 202, r.text
+            found = r.json()["document_id"]
+            async with (await engines.engine(workspace)).begin() as conn:
+                await write_extraction(conn, _fields(values, uuid.UUID(found), datetime.now(UTC)))
+            await _consumed(sessions, found)
+            return str(found)
+
         data = (FIXTURES / "invoices" / FILES["invoice"]).read_bytes()
-        r = await http.post(
-            f"{base}/documents", files={"file": ("facture.pdf", data, "application/pdf")},
-            headers=csrf(http),
-        )  # fmt: skip
-        assert r.status_code == 202, r.text
-        doc_id = r.json()["document_id"]
-        started = time.monotonic()
-        while True:
-            async with sessions() as db:
-                row = await db.get(DocumentLedger, uuid.UUID(doc_id))
-            assert row is not None
-            if row.ingest_state == IngestState.consumed:
-                break
-            assert time.monotonic() - started < CONSUME_BUDGET_S, row.ingest_state
-            await asyncio.sleep(3)
+        doc_id = await classified("facture.pdf", data, INVOICE)
 
-        # 2. The closure: `closing`, and the full export built by the export worker.
-        await owner.step_up()
-        r = await post(http, f"/v1/orgs/{org_id}/closure", None)
-        assert r.status_code == 201, r.text
-        closure = r.json()
-        assert closure["state"] == "grace"
-        job = closure["export_job_id"]
-        started = time.monotonic()
-        while (r := await poll_get(http, f"{base}/exports/{job}")).json()["state"] != "ready":
-            assert r.json()["state"] in ("queued", "building"), r.text
-            assert time.monotonic() - started < EXPORT_BUDGET_S, r.text
-            await asyncio.sleep(3)
-        assert r.json()["document_count"] == 1
-        await owner.step_up()
-        r = await http.get(f"{base}/exports/{job}/download")
+        # 2. The meter shows the upload.
+        r = await poll_get(http, f"{org}/usage")
         assert r.status_code == 200, r.text
-        with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
-            report = json.loads(zf.read(REPORT_NAME))
-        assert report["period"] == "all"
-        assert [d["id"] for d in report["documents"]] == [doc_id]
+        quotas = r.json()["quotas"]
+        assert (quotas["documents"]["used"], quotas["storage"]["used"]) == (1, len(data))
+        _log(f"\nusage: {quotas}")
 
-        # 3. The grace period over: hibernated, the tenant stopped.
+        # 3. The org's ICE, then a plan chosen in the trial (the first year starts on it).
+        r = await http.patch(org, json={"ice": SAMPLE_ORG_ICE}, headers=csrf(http))
+        assert r.status_code == 200, r.text
+        await owner.step_up()
+        r = await http.put(
+            f"{org}/subscription", json={"plan_code": "essentiel"}, headers=csrf(http)
+        )
+        assert (r.status_code, r.json()["status"]) == (200, "trial"), r.text
+        # The control plane's clock cannot move: the trial is made to have ended 45 days ago,
+        # and the daily job's transition (`billing.advance`) runs at that moment, issuing the
+        # first annual invoice then, in the Owner's locale (fr). Its 30 days to pay are over.
+        trial_end = datetime.now(UTC) - timedelta(days=45)
+        async with sessions() as db:
+            sub = await db.scalar(
+                select(Subscription).where(Subscription.org_id == uuid.UUID(org_id))
+            )
+            assert sub is not None
+            sub.trial_ends_at, sub.period_end = trial_end, trial_end
+            sub.period_start = trial_end - timedelta(days=billing.TRIAL_DAYS)
+            await db.commit()
+            await billing.advance(db, uuid.UUID(org_id), trial_end, seller=SellerSettings())
+            await db.commit()
+            # The Owner now reads Arabic (no route sets a locale yet): the next invoice is in ar.
+            owner_id = (await http.get("/v1/me")).json()["id"]
+            await db.execute(
+                update(User).where(User.id == uuid.UUID(owner_id)).values(locale=Locale.ar)
+            )
+            await db.commit()
+        await owner.step_up()
+        r = await http.put(f"{org}/subscription", json={"plan_code": "pro"}, headers=csrf(http))
+        assert r.status_code == 200, r.text
+        assert (r.json()["plan_code"], r.json()["status"]) == ("pro", "overdue")
+        r = await poll_get(http, f"{org}/invoices")
+        assert r.status_code == 200, r.text
+        invoices = {i["kind"]: i for i in r.json()}
+        assert set(invoices) == {"annual", "upgrade"}
+        annual, upgrade = invoices["annual"], invoices["upgrade"]
+        assert (annual["locale"], upgrade["locale"]) == ("fr", "ar")
+        assert (annual["state"], annual["plan_code"]) == ("overdue", "essentiel")
+        assert (upgrade["state"], upgrade["plan_code"]) == ("issued", "pro")
+        assert annual["buyer"]["ice"] == SAMPLE_ORG_ICE
+        for invoice in (annual, upgrade):
+            amounts = [Decimal(invoice[k]) for k in ("amount_ht", "amount_vat", "amount_ttc")]
+            assert amounts[0] + amounts[1] == amounts[2] and amounts[2] > 0
+            r = await http.get(f"{org}/invoices/{invoice['id']}/pdf")
+            assert r.status_code == 200, r.text
+            assert r.headers["content-type"] == "application/pdf"
+            assert r.content.startswith(b"%PDF")
+            assert hashlib.sha256(r.content).hexdigest() == invoice["pdf_sha256"]
+        _log(f"invoices: {annual['number']} fr, {upgrade['number']} ar")
+
+        # 4. Overdue: a new export is refused, capture still lands.
+        r = await poll_get(http, f"{org}/subscription")
+        assert r.json()["status"] == "overdue", r.text
+        await owner.step_up()
+        r = await post(http, f"{base}/exports", {"period": "all"})
+        assert (r.status_code, r.json()["error"]["code"]) == (402, "billing.overdue"), r.text
+        second = (FIXTURES / "invoices" / FILES["payslip"]).read_bytes()
+        second_id = await classified("facture-2.pdf", second, INVOICE | {"number": "M6-F-0002"})
+
+        # 5. Staff (granted by `sijil-cp staff grant`, TOTP enrolled) record the transfer: the
+        # subscription is active at once, and exporting works again.
+        staff_email = f"m6-staff-{run}@sijil.local"
+        await _db_user(sessions, staff_email, "SAMPLE M6 Staff")
+        code, out = await cli("staff", "grant", staff_email)
+        assert code == 0, out
+        staff = Owner(staff_http, PASSWORD)
+        await staff.sign_in(staff_email)
+        r = await poll_get(staff_http, "/v1/staff/invoices?state=overdue")
+        assert r.status_code == 200, r.text
+        assert annual["id"] in [i["id"] for i in r.json()]
+        paid_on = region_local_date(datetime.now(UTC), REGION).isoformat()
+        r = await post(
+            staff_http, f"/v1/staff/invoices/{annual['id']}/mark-paid",
+            {"payment_reference": TRANSFER, "paid_on": paid_on},
+        )  # fmt: skip
+        assert r.status_code == 200, r.text
+        assert (r.json()["invoice"]["state"], r.json()["subscription"]["status"]) == (
+            "paid", "active",
+        )  # fmt: skip
+        r = await poll_get(http, f"{org}/subscription")
+        assert r.json()["status"] == "active", r.text
+
+        # 6. A full export of every period; then the closure: requested, cancelled, requested
+        # again, its own full export built by the export worker.
+        await owner.step_up()
+        r = await post(http, f"{base}/exports", {"period": "all"})
+        assert r.status_code == 202, r.text
+        assert (await _ready(http, base, r.json()["id"]))["document_count"] == 2
+        report = await _report(owner, base, r.json()["id"])
+        assert report["period"] == "all"
+        assert {d["id"] for d in report["documents"]} == {doc_id, second_id}
+        await owner.step_up()
+        r = await post(http, f"{org}/closure", None)
+        assert (r.status_code, r.json()["state"]) == (201, "grace"), r.text
+        first_closure = r.json()["id"]
+        await owner.step_up()
+        r = await http.delete(f"{org}/closure", headers=csrf(http))
+        assert (r.status_code, r.json()["state"]) == (200, "cancelled"), r.text
+        assert (await poll_get(http, org)).json()["status"] == "active"
+        await owner.step_up()
+        r = await post(http, f"{org}/closure", None)
+        assert (r.status_code, r.json()["state"]) == (201, "grace"), r.text
+        assert r.json()["id"] != first_closure
+        job = r.json()["export_job_id"]
+        assert (await _ready(http, base, job))["document_count"] == 2
+        report = await _report(owner, base, job)
+        assert report["period"] == "all"
+        assert {d["id"] for d in report["documents"]} == {doc_id, second_id}
+
+        # 7. The grace period over (the job's clock 31 days on): hibernated, the tenant stopped.
         removals: list[uuid.UUID] = []
 
         async def send_removal(ledger_id: uuid.UUID, _workspace_id: uuid.UUID) -> None:
@@ -381,23 +539,21 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
         # The job serves the whole region (closures other runs left count too): this
         # workspace's outcome is read from its own state.
         assert outcome.hibernated >= 1
-        assert uuid.UUID(doc_id) not in removals
+        assert not {uuid.UUID(doc_id), uuid.UUID(second_id)} & set(removals)
         assert await docker_runtime.status(tenant_ref(workspace_id)) == "stopped"
         r = await poll_get(http, base)
         assert r.json()["state"] == WorkspaceState.hibernated
 
-        # 4. The Owner reads; everyone else gets 404; capture and writes are refused.
+        # The Owner reads the retained documents; everyone else gets 404; capture and writes
+        # are refused.
         r = await poll_get(http, f"{base}/documents")
-        assert (_ids(r), r.json()["engine"]) == ([doc_id], "unavailable")
+        assert (set(_ids(r)), r.json()["engine"]) == ({doc_id, second_id}, "unavailable")
         r = await http.get(f"{base}/documents/{doc_id}/file")
         assert r.status_code == 200, r.text
         assert r.content == data
         for path in ("/documents", f"/documents/{doc_id}", f"/documents/{doc_id}/file"):
             assert (await admin_http.get(base + path)).status_code == 404, path
-        r = await http.post(
-            f"{base}/documents", files={"file": ("autre.pdf", data + b"\n", "application/pdf")},
-            headers=csrf(http),
-        )  # fmt: skip
+        r = await _upload(http, base, "autre.pdf", data + b"\n")
         assert r.status_code == 409, r.text
         r = await http.put(
             f"{base}/retention/policies/invoice", json={"years": 12}, headers=csrf(http)
@@ -407,6 +563,8 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
         try:
             await http.aclose()
             await admin_http.aclose()
+            await staff_http.aclose()
+            await engines.aclose()
             await engine.dispose()
         finally:
             for created_id in created_workspaces:

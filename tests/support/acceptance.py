@@ -35,6 +35,17 @@ class Owner:
         body = {"email": email, "password": self.password, "name": name}
         r = await post(self.http, "/v1/auth/signup", body)
         assert r.status_code == 201, r.text
+        await self.enrol_totp()
+
+    async def sign_in(self, email: str) -> None:
+        """Signs in a user created in the database (the signup rate limit is per IP and
+        hourly), then enrols TOTP like `sign_up`."""
+        (await self.http.get("/v1/auth/csrf")).raise_for_status()
+        r = await post(self.http, "/v1/auth/login", {"email": email, "password": self.password})
+        assert r.status_code == 200, r.text
+        await self.enrol_totp()
+
+    async def enrol_totp(self) -> None:
         r = await post(self.http, "/v1/auth/totp/enrol", {"password": self.password})
         assert r.status_code == 200, r.text
         self.totp = pyotp.TOTP(parse_qs(urlparse(r.json()["otpauth_uri"]).query)["secret"][0])
