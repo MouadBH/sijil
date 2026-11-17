@@ -247,7 +247,7 @@ canonical_json = sorted keys, no whitespace, UTF-8, timestamps ISO-8601 UTC with
   - `sijil_cp_owner` owns the schema and runs only in the one-shot `migrate` service.
   - The API and worker connect as `sijil_cp_app`, which can't create, alter or drop tables, triggers or grants (smoke-tested).
 - The `audit_event` migration revokes `UPDATE` and `DELETE` from `sijil_cp_app`, and a trigger rejects them as defence in depth.
-- `sijil-cp audit verify --workspace <id>` walks the chain. Export integrity reports include the chain head.
+- `sijil-cp audit verify --workspace <id>` walks the chain; `sijil-cp audit verify --platform` walks the platform's (`platform_audit_event`). Both print `ok <count>` or `broken at seq <n>` and exit 0, 1, or 2 when they could not verify. Export integrity reports include the chain head.
 
 ## Period export (M4, ARC-5)
 

@@ -1,5 +1,6 @@
 """`sijil-cp` console entry: `serve` runs the API, `bootstrap-storage` prepares the object store,
-`audit verify` recomputes a workspace's audit chain, `export verify` checks an export ZIP,
+`audit verify` recomputes a workspace's audit chain (`--workspace <id>`) or the platform's
+(`--platform`), `export verify` checks an export ZIP,
 `search backfill` has the worker rebuild a workspace's search index and `staff grant|revoke`
 sets who is platform staff."""
 
@@ -29,6 +30,7 @@ from sijil_cp.storage_admin import (
 )
 
 if TYPE_CHECKING:
+    from sijil_core.audit import VerifyResult
     from sijil_cp.enqueue import Enqueuer
     from sijil_cp.settings import CpSettings
 
@@ -111,8 +113,39 @@ def audit_verify(workspace_id: UUID, settings: "CpSettings | None" = None) -> in
     if result is None:
         print("unknown workspace", file=sys.stderr)  # noqa: T201
         return 2
+    return _print_verdict(result)
+
+
+def _print_verdict(result: "VerifyResult") -> int:
     print(f"ok {result.count}" if result.ok else f"broken at seq {result.first_bad_seq}")  # noqa: T201
     return 0 if result.ok else 1
+
+
+def audit_verify_platform(settings: "CpSettings | None" = None) -> int:
+    """Recompute the platform's audit chain (events of no organisation, e.g. staff grants).
+
+    Same output and exit codes as `audit_verify`: 0 intact, 1 broken, 2 when the database could
+    not be reached.
+    """
+    from sijil_core import audit
+    from sijil_cp.db import make_engine, make_sessionmaker
+    from sijil_cp.settings import CpSettings
+
+    async def _run() -> audit.VerifyResult:
+        engine = make_engine(settings or CpSettings())
+        try:
+            async with make_sessionmaker(engine)() as db:
+                return await audit.verify_platform(db)
+        finally:
+            await engine.dispose()
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        # The type only: messages can carry the connection string.
+        print(f"database error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    return _print_verdict(result)
 
 
 def search_backfill(
@@ -325,8 +358,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("bootstrap-storage", help="create the object-locked original bucket")
     audit_parser = sub.add_parser("audit", help="audit log tools")
     audit_sub = audit_parser.add_subparsers(dest="audit_command", required=True)
-    verify = audit_sub.add_parser("verify", help="verify a workspace's audit hash chain")
-    verify.add_argument("--workspace", type=UUID, required=True)
+    verify = audit_sub.add_parser(
+        "verify", help="verify a workspace's audit hash chain, or the platform's"
+    )
+    chain = verify.add_mutually_exclusive_group(required=True)
+    chain.add_argument("--workspace", type=UUID)
+    chain.add_argument("--platform", action="store_true", help="the platform's own chain")
     export_parser = sub.add_parser("export", help="period export tools")
     export_sub = export_parser.add_subparsers(dest="export_command", required=True)
     check = export_sub.add_parser("verify", help="verify an export ZIP and its signed report")
@@ -352,7 +389,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "search":
         sys.exit(search_backfill(args.workspace))
     elif args.command == "audit":
-        sys.exit(audit_verify(args.workspace))
+        sys.exit(audit_verify_platform() if args.platform else audit_verify(args.workspace))
     elif args.command == "export":
         sys.exit(
             export_verify(

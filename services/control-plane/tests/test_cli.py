@@ -1,4 +1,5 @@
-"""`sijil-cp audit verify`: 0 intact, 1 broken, 2 when it could not verify at all."""
+"""`sijil-cp audit verify` (a workspace's chain, or `--platform`): 0 intact, 1 broken, 2 when it
+could not verify at all."""
 
 import asyncio
 import base64
@@ -110,6 +111,85 @@ async def test_database_unreachable_exits_2(capsys: pytest.CaptureFixture[str]) 
     captured = capsys.readouterr()
     assert "database" in captured.err
     assert "sijil:sijil" not in captured.err  # never the connection string
+
+
+# `sijil-cp audit verify --platform` ---------------------------------------------------------
+
+
+async def _append_platform(db: AsyncSession, n: int) -> None:
+    for i in range(n):
+        await audit.append_platform(
+            db, action="test.event", actor_type=ActorType.platform, actor_id=None,
+            data={"i": i}, now=NOW,
+        )  # fmt: skip
+    await db.commit()
+
+
+async def _verify_platform(settings: CpSettings) -> int:
+    return await asyncio.to_thread(cli.audit_verify_platform, settings)
+
+
+async def test_platform_chain_intact_exits_0(
+    db: AsyncSession, migrated_db: Any, capsys: pytest.CaptureFixture[str]
+) -> None:
+    await _append_platform(db, 3)
+    assert await _verify_platform(_settings(migrated_db.app_url)) == 0
+    assert capsys.readouterr().out.strip() == "ok 3"
+
+
+async def test_platform_chain_broken_exits_1(
+    db: AsyncSession, migrated_db: Any, owner_conn: AsyncConnection,
+    capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    await _append_platform(db, 3)
+    table, trigger = "platform_audit_event", "platform_audit_event_append_only"
+    await owner_conn.execute(text(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}"))
+    try:
+        await owner_conn.execute(
+            text("UPDATE platform_audit_event SET data = '{\"i\": 9}' WHERE seq = 2")
+        )
+    finally:
+        await owner_conn.execute(text(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}"))
+    assert await _verify_platform(_settings(migrated_db.app_url)) == 1
+    assert capsys.readouterr().out.strip() == "broken at seq 2"
+
+
+async def test_platform_chain_database_unreachable_exits_2(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert await _verify_platform(_settings(CLOSED_DB)) == 2
+    captured = capsys.readouterr()
+    assert "database" in captured.err
+    assert "sijil:sijil" not in captured.err  # never the connection string
+    assert not captured.out.startswith("ok")
+
+
+def test_audit_verify_commands_are_wired(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[object] = []
+
+    def workspace(workspace_id: uuid.UUID) -> int:
+        seen.append(workspace_id)
+        return 1
+
+    def platform() -> int:
+        seen.append("platform")
+        return 0
+
+    monkeypatch.setattr(cli, "audit_verify", workspace)
+    monkeypatch.setattr(cli, "audit_verify_platform", platform)
+    target = uuid.uuid4()
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["audit", "verify", "--platform"])
+    assert (exited.value.code, seen) == (0, ["platform"])
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["audit", "verify", "--workspace", str(target)])
+    assert (exited.value.code, seen) == (1, ["platform", target])
+    # One chain or the other: never both, never neither.
+    both = ["audit", "verify", "--platform", "--workspace", str(target)]
+    for argv in (["audit", "verify"], both):
+        with pytest.raises(SystemExit) as exited:
+            cli.main(argv)
+        assert exited.value.code == 2
 
 
 # `sijil-cp search backfill` ----------------------------------------------------------------
