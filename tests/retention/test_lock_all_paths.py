@@ -15,7 +15,7 @@ a document, for every role, on an unsealed and on a sealed document.
 | 9 API search, saved view, Ask (and its worker) | each | nothing written | - |
 | 10 search and embedding SQL without the gate | none | refused (see below) | refused |
 | 11 API closure request, cancel, take-over (M6) | each (org) | unchanged | unchanged |
-| 11 `sijil.closure_daily`: hibernation, take-over destruction | none | unchanged | unchanged |
+| 11 `sijil.closure_daily`: hibernation, take-over destroys or defers | none | unchanged | same |
 | 11 Owner's take-over succeeds, grace passes, tenant destroyed | Owner | locked, kept | kept |
 | 12 API remove, approve, fields with the org read-only (unpaid) | each | refused | refused |
 | 12 hibernated workspace: reads, remove, approve, fields | each | Owner reads only | same |
@@ -698,17 +698,36 @@ class _Runtime:
         self.calls.append("destroy")
 
 
+async def _full_export(
+    db: AsyncSession, ws_id: uuid.UUID, user_id: uuid.UUID, created: datetime,
+    held: list[uuid.UUID],
+) -> None:  # fmt: skip
+    """A ready full export (period `all`) holding exactly `held` (its recorded set)."""
+    from sijil_core.db.models import ExportDocument, ExportJob, ExportState
+
+    job = ExportJob(
+        workspace_id=ws_id, period="all", requested_by=user_id, created_at=created,
+        state=ExportState.ready, object_key="k", sha256="a" * 64, size_bytes=1,
+        document_count=len(held), ready_at=created,
+    )  # fmt: skip
+    db.add(job)
+    await db.flush()
+    db.add_all(ExportDocument(export_job_id=job.id, ledger_id=doc) for doc in held)
+    await db.flush()
+
+
 @pytest.mark.db
 @pytest.mark.parametrize("state", STATES)
-@pytest.mark.parametrize("outcome", ["hibernated", "takeover"])
+@pytest.mark.parametrize("outcome", ["hibernated", "takeover", "takeover_deferred"])
 async def test_closure_job_path(
     outcome: str, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
     memory_store: MemoryObjectStore, index_conn: AsyncConnection,
 ) -> None:  # fmt: skip
     """`sijil.closure_daily` after the grace period (ADM-5), with a document under retention:
-    hibernation stops the tenant, a take-over destroys it, and either way the document's ledger
-    row, index rows and original (and its lock) stay exactly as they were, and no removal is
-    sent."""
+    hibernation stops the tenant; a take-over destroys it when its full export holds the
+    document, and only hibernates it, the deferral audited, when the document arrived after
+    that export (final review I1). Every way the document's ledger row, index rows and
+    original (and its lock) stay exactly as they were, and no removal is sent."""
     from sijil_core.db.models import Closure, ClosureState, TakeoverStatement
     from sijil_worker.closure import closure_daily
 
@@ -722,7 +741,7 @@ async def test_closure_job_path(
     )  # fmt: skip
     db.add(closure)
     await db.flush()
-    if outcome == "takeover":
+    if outcome != "hibernated":
         db.add(
             TakeoverStatement(
                 closure_id=closure.id, org_id=org_id, signed_by=owner.user_id,
@@ -730,6 +749,9 @@ async def test_closure_job_path(
                 object_version_id="v1", sha256="a" * 64, size_bytes=1, created_at=requested,
             )
         )  # fmt: skip
+        # Its full export: holding the document, or built before it arrived.
+        held = [row.id] if outcome == "takeover" else []
+        await _full_export(db, ws_id, owner.user_id, requested + timedelta(hours=1), held)
     await db.commit()
     before = await _snapshot(db, index_conn, memory_store, row)
     events_before = await _events(db, ws_id)
@@ -743,13 +765,15 @@ async def test_closure_job_path(
         locks=memory_store, settings=SETTINGS, send_removal=send_removal,
         now=datetime.now(UTC),
     )  # fmt: skip
-    assert runtime.calls == (["stop"] if outcome == "hibernated" else ["destroy"])
+    assert runtime.calls == (["destroy"] if outcome == "takeover" else ["stop"])
     assert removals == []
     assert await _snapshot(db, index_conn, memory_store, row) == before
     new_events = (await _events(db, ws_id))[len(events_before) :]
-    assert [a for a, _d, _t in new_events] == [
-        f"closure.{'destroyed' if outcome == 'takeover' else 'hibernated'}"
-    ]
+    assert [a for a, _d, _t in new_events] == {
+        "hibernated": ["closure.hibernated"],
+        "takeover": ["closure.destroyed"],
+        "takeover_deferred": ["closure.hibernated", "closure.takeover_deferred"],
+    }[outcome]
     assert all(target != str(row.id) for _action, _data, target in new_events)
 
 
@@ -774,14 +798,20 @@ async def test_closure_takeover_success_path(
     url = f"/v1/orgs/{org_id}/closure"
     r = await owner.client.post(url)
     assert r.status_code == 201, r.text
-    # Its full export ready (the sealing helper's SAMPLE original is not hashed like an upload,
-    # so the export worker is not run here: tests/test_closure_api.py runs it).
+    # Its full export ready, holding the document (the sealing helper's SAMPLE original is not
+    # hashed like an upload, so the export worker is not run here: tests/test_closure_api.py
+    # runs it).
+    job_id = uuid.UUID(r.json()["export_job_id"])
     await db.execute(
         text(
             "UPDATE export_job SET state = 'ready', object_key = 'k', sha256 = repeat('a', 64),"
             " size_bytes = 1, document_count = 1, ready_at = now() WHERE id = :id"
         ),
-        {"id": uuid.UUID(r.json()["export_job_id"])},
+        {"id": job_id},
+    )
+    await db.execute(
+        text("INSERT INTO export_document (export_job_id, ledger_id) VALUES (:job, :doc)"),
+        {"job": job_id, "doc": row.id},
     )
     await db.commit()
     before = await _snapshot(db, index_conn, memory_store, row)

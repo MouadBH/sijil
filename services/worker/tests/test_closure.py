@@ -31,6 +31,9 @@ from sijil_core.db.models import (
     DocumentLedger,
     DocumentSource,
     DocumentState,
+    ExportDocument,
+    ExportJob,
+    ExportState,
     IngestState,
     Organisation,
     OrgStatus,
@@ -295,6 +298,35 @@ async def test_a_compliance_lock_beyond_retention_keeps_the_workspace_hibernated
     assert (await _row(db, DocumentLedger, doc)).state is DocumentState.sealed
 
 
+async def _full_export(
+    db: AsyncSession, ws_id: UUID, user_id: UUID, created: datetime, docs: list[UUID],
+    *, state: ExportState = ExportState.ready,
+) -> UUID:  # fmt: skip
+    """A built full export (period `all`) created at `created`, holding exactly `docs`."""
+    job = ExportJob(
+        workspace_id=ws_id, period="all", requested_by=user_id, created_at=created, state=state,
+        object_key=f"{ws_id}/x.zip", sha256="a" * 64, size_bytes=1, document_count=len(docs),
+        ready_at=created + timedelta(minutes=5),
+    )  # fmt: skip
+    db.add(job)
+    await db.flush()
+    db.add_all(ExportDocument(export_job_id=job.id, ledger_id=doc) for doc in docs)
+    await db.commit()
+    return job.id
+
+
+async def _takeover(db: AsyncSession, org: Organisation, user: User, closure: Closure) -> None:
+    db.add(
+        TakeoverStatement(
+            closure_id=closure.id, org_id=org.id, signed_by=user.id, signer_name="SAMPLE",
+            signer_capacity="Gérant", object_key=f"takeover/{org.id}/x.pdf",
+            object_version_id="v1", sha256="a" * 64, size_bytes=10,
+            created_at=utcnow() - timedelta(days=20),
+        )
+    )  # fmt: skip
+    await db.commit()
+
+
 async def test_takeover_statement_allows_destruction_after_grace(
     db: AsyncSession, sessions: Any, org: Organisation, user: User, workspace: Workspace,
     memory_store: MemoryObjectStore,
@@ -306,15 +338,13 @@ async def test_takeover_statement_allows_destruction_after_grace(
     long_held = await _document(db, memory_store, workspace, user, FAR, sealed=True)
     soon = await _document(db, memory_store, workspace, user, yesterday, sealed=True)
     closure = await _closure(db, org, user, days_ago=40)
-    db.add(
-        TakeoverStatement(
-            closure_id=closure.id, org_id=org.id, signed_by=user.id, signer_name="SAMPLE",
-            signer_capacity="Gérant", object_key=f"takeover/{org.id}/x.pdf",
-            object_version_id="v1", sha256="a" * 64, size_bytes=10,
-            created_at=utcnow() - timedelta(days=20),
-        )
+    # Its full export holds both: built, downloaded, then expired after its 7 days (it still
+    # counts: what it held is recorded).
+    await _full_export(
+        db, workspace.id, user.id, closure.requested_at + timedelta(hours=1), [long_held, soon],
+        state=ExportState.expired,
     )  # fmt: skip
-    await db.commit()
+    await _takeover(db, org, user, closure)
     runtime, removals = RecordingRuntime(), Removals()
     two_days_ago = utcnow() - timedelta(days=2)
 
@@ -353,6 +383,63 @@ async def test_takeover_statement_allows_destruction_after_grace(
     assert (stored.mode, stored.retain_until) == ("COMPLIANCE", FAR)
     approvals = await _events(db, workspace, "closure.deletion_approved")
     assert [e[1] for e in approvals] == [str(soon)]
+
+
+async def test_a_document_captured_after_the_export_defers_the_takeover(
+    db: AsyncSession, sessions: Any, org: Organisation, user: User, workspace: Workspace,
+    memory_store: MemoryObjectStore,
+) -> None:  # fmt: skip
+    """Final review I1: capture stays open during the grace period, so a document can arrive
+    after the full export the take-over relied on. The workspace then hibernates (its Owner
+    keeps reading it), the deferral audited with a code, and the take-over is honoured at a
+    later run, once a newer full export holds every live document."""
+    ws_id, user_id = workspace.id, user.id
+    held = await _document(db, memory_store, workspace, user, FAR, sealed=True)
+    closure = await _closure(db, org, user, days_ago=40)
+    closure_id, requested = closure.id, closure.requested_at
+    first = await _full_export(db, ws_id, user_id, requested + timedelta(hours=1), [held])
+    await _takeover(db, org, user, closure)
+    # Captured during the grace period, after that export.
+    late = await _capture(sessions, memory_store, workspace)
+    assert isinstance(late, ingest.Accepted)
+    # An older full export, from before the closure, never counts, even holding everything.
+    await _full_export(db, ws_id, user_id, requested - timedelta(days=1), [held, late.document_id])
+
+    runtime = RecordingRuntime()
+    run = await _run(sessions, memory_store, runtime, Removals())
+
+    assert (run.hibernated, run.destroyed) == (1, 0)
+    assert runtime.calls == [("stop", tenant_ref(ws_id))]
+    assert (await _row(db, Workspace, ws_id)).state is WorkspaceState.hibernated
+    assert (await _row(db, Closure, closure_id)).state is ClosureState.hibernated
+    deferred = {
+        "closure_id": str(closure_id), "code": "takeover.export_incomplete",
+        "export_id": str(first), "uncovered": "1",
+    }  # fmt: skip
+    assert await _events(db, workspace, "closure.takeover_deferred") == [
+        ("closure.takeover_deferred", str(closure_id), deferred)
+    ]
+    assert await _events(db, workspace, "closure.destroyed") == []
+    assert set(await _live(db, ws_id)) == {held, late.document_id}
+
+    # The next run, still no newer export: still hosted, the deferral not audited again.
+    runtime = RecordingRuntime()
+    run = await _run(sessions, memory_store, runtime, Removals())
+    assert run.destroyed == 0
+    assert ("destroy", tenant_ref(ws_id)) not in runtime.calls
+    workspace = await _row(db, Workspace, ws_id)  # `_live` rolled back: reloaded
+    assert len(await _events(db, workspace, "closure.takeover_deferred")) == 1
+
+    # The Owner exports again (the workspace is frozen, so it holds everything): the take-over
+    # is honoured at the next run.
+    await _full_export(db, ws_id, user_id, utcnow(), [held, late.document_id])
+    runtime = RecordingRuntime()
+    run = await _run(sessions, memory_store, runtime, Removals())
+    assert run.destroyed == 1
+    assert runtime.calls == [("destroy", tenant_ref(ws_id))]
+    assert (await _row(db, Workspace, ws_id)).state is WorkspaceState.closed
+    assert (await _row(db, Closure, closure_id)).state is ClosureState.destroyed
+    assert set(await _live(db, ws_id)) == {held, late.document_id}  # locked, never deleted early
 
 
 async def test_a_cancelled_or_other_region_closure_is_left_alone(

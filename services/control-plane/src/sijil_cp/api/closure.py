@@ -24,7 +24,10 @@ billing gate (ruling R4): an account can always be closed.
   org's latest retention, whichever is later), its SHA-256 in the write-once
   `takeover_statement` row, audited `closure.takeover_signed` `{statement_id, sha256}`. After
   the grace period the closure job then destroys every tenant even with documents under
-  retention, whose originals stay locked until their retention passes (sijil_worker.closure).
+  retention, whose originals stay locked until their retention passes, but only once the
+  workspace's newest full export holds every live document: one captured after it defers the
+  take-over and the workspace hibernates until a newer full export (sijil_worker.closure,
+  ruling I1).
 """
 
 import hashlib

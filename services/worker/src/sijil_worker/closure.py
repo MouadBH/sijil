@@ -21,11 +21,19 @@ grace period is over, region-local: `sijil_core.closure.grace_over`; `hibernated
    holder of the delete key, which also refuses an unexpired lock), which then sends the
    purge; the rows stay as tombstones.
 2. **Destroyed** when no live document is left under retention, or when the Owner signed a
-   take-over statement: `TenantRuntime.destroy` (its containers, volumes and network, its
+   take-over statement and the workspace's newest built full export since the closure holds
+   every live document (`sijil_core.closure.export_coverage`, on the export's recorded
+   document set; ruling I1): `TenantRuntime.destroy` (its containers, volumes and network, its
    Paperless database and its index database), then the workspace is `closed` (ruling R6),
    audited `closure.destroyed` `{closure_id, retained}`. After a take-over the originals still
    under retention stay in the store, locked, never deleted early: step 1 approves each one
    once its retention has passed, with no further approval.
+
+   A take-over whose export misses a live document (one captured during the grace period
+   after it) is deferred: the workspace hibernates as in step 3, so its Owner keeps reading
+   that document, audited once per export `closure.takeover_deferred` `{closure_id, code:
+   takeover.export_incomplete, export_id, uncovered}`; a later run destroys it once a newer
+   full export (the Owner may request one while hibernated) holds everything.
 3. **Hibernated** otherwise (once): `TenantRuntime.stop`, then the workspace `hibernated` and
    the org's subscription `closed` (every write then answers `billing.read_only`, ruling R5),
    audited `closure.hibernated` `{closure_id, retained}`. Its Owners keep their reads, from the
@@ -46,7 +54,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sijil_core import audit, billing
-from sijil_core.closure import OPEN_STATES, grace_over
+from sijil_core.closure import (
+    EXPORT_INCOMPLETE,
+    OPEN_STATES,
+    TAKEOVER_DEFERRED,
+    Coverage,
+    export_coverage,
+    grace_over,
+)
 from sijil_core.db.models import (
     TERMINAL_STATES,
     ActorType,
@@ -101,6 +116,7 @@ class _Closure:
     id: UUID
     org_id: UUID
     requested_by: UUID
+    requested_at: datetime
     takeover: bool
 
 
@@ -195,6 +211,53 @@ async def _destroy(
             data={"closure_id": str(closure.id), "retained": str(retained)},
             now=now,
         )
+        await session.commit()
+
+
+async def _coverage(
+    sessions: async_sessionmaker[AsyncSession], closure: _Closure, workspace_id: UUID
+) -> Coverage:
+    async with sessions() as session:
+        found = await export_coverage(session, workspace_id, closure.requested_at)
+        await session.rollback()
+    return found
+
+
+async def _defer_takeover(
+    sessions: async_sessionmaker[AsyncSession],
+    closure: _Closure,
+    workspace_id: UUID,
+    coverage: Coverage,
+    now: datetime,
+) -> None:
+    """Audits, once per closure, workspace and export, that the take-over waits (ruling I1)."""
+    export_id = "" if coverage.export_id is None else str(coverage.export_id)
+    async with sessions() as session:
+        done = await session.scalar(
+            select(AuditEvent.id).where(
+                AuditEvent.workspace_id == workspace_id,
+                AuditEvent.action == TAKEOVER_DEFERRED,
+                AuditEvent.target_id == str(closure.id),
+                AuditEvent.data["export_id"].astext == export_id,
+            )
+        )
+        if done is None:
+            await audit.append(
+                session,
+                workspace_id=workspace_id,
+                action=TAKEOVER_DEFERRED,
+                actor_type=ActorType.system,
+                actor_id=None,
+                target_type="closure",
+                target_id=str(closure.id),
+                data={
+                    "closure_id": str(closure.id),
+                    "code": EXPORT_INCOMPLETE,
+                    "export_id": export_id,
+                    "uncovered": str(coverage.uncovered),
+                },
+                now=now,
+            )
         await session.commit()
 
 
@@ -308,13 +371,24 @@ async def _run(
             sessions, closure, workspace_id, locks, today, now
         )
         run.approved += len(approved)
-        if state is not WorkspaceState.closed and (closure.takeover or retained == 0):
+        deferred: Coverage | None = None
+        if state is not WorkspaceState.closed and retained and closure.takeover:
+            # Counted after the freeze too: no document can land in between.
+            coverage = await _coverage(sessions, closure, workspace_id)
+            deferred = coverage if coverage.uncovered else None
+        if (
+            state is not WorkspaceState.closed
+            and deferred is None
+            and (closure.takeover or retained == 0)
+        ):
             await _destroy(sessions, runtime, closure, workspace_id, retained, now)
             run.destroyed += 1
         elif state is not WorkspaceState.closed:
             run.hibernated += await _hibernate(
                 sessions, runtime, closure, workspace_id, retained, now
             )
+            if deferred is not None:
+                await _defer_takeover(sessions, closure, workspace_id, deferred, now)
         for ledger_id in approved:
             try:
                 await send_removal(ledger_id, workspace_id)
@@ -352,7 +426,9 @@ async def closure_daily(
             signed = await session.scalar(
                 select(TakeoverStatement.id).where(TakeoverStatement.closure_id == row.id)
             )
-            due.append(_Closure(row.id, row.org_id, row.requested_by, signed is not None))
+            due.append(
+                _Closure(row.id, row.org_id, row.requested_by, row.requested_at, signed is not None)
+            )
     run = ClosureRun()
     for closure in due:
         try:
