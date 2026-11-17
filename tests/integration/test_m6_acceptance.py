@@ -378,7 +378,10 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
             now=datetime.now(UTC) + timedelta(days=31),
         )  # fmt: skip
         _log(f"closure: {outcome}")
-        assert (outcome.hibernated, outcome.destroyed, removals) == (1, 0, [])
+        # The job serves the whole region (closures other runs left count too): this
+        # workspace's outcome is read from its own state.
+        assert outcome.hibernated >= 1
+        assert uuid.UUID(doc_id) not in removals
         assert await docker_runtime.status(tenant_ref(workspace_id)) == "stopped"
         r = await poll_get(http, base)
         assert r.json()["state"] == WorkspaceState.hibernated
