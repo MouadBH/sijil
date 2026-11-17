@@ -16,6 +16,7 @@ a document, for every role, on an unsealed and on a sealed document.
 | 10 search and embedding SQL without the gate | none | refused (see below) | refused |
 | 11 API closure request, cancel, take-over (M6) | each (org) | unchanged | unchanged |
 | 11 `sijil.closure_daily`: hibernation, take-over destruction | none | unchanged | unchanged |
+| 11 Owner's take-over succeeds, grace passes, tenant destroyed | Owner | locked, kept | kept |
 
 Path 11 (M6, ADM-5) is account closure: its routes are the Owner's (others 403) and touch no
 document; after the grace period the closure job stops or destroys the tenant and leaves a
@@ -738,3 +739,88 @@ async def test_closure_job_path(
         f"closure.{'destroyed' if outcome == 'takeover' else 'hibernated'}"
     ]
     assert all(target != str(row.id) for _action, _data, target in new_events)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+async def test_closure_takeover_success_path(
+    state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """The Owner's take-over succeeds (its full export ready), and the grace period passes:
+    the tenant is destroyed, and the original under retention stays present and locked, its
+    ledger row and index rows unchanged, no removal sent. Its deletion stays refused by the
+    ledger and by the store until its `retention_until` has passed."""
+    from sijil_core.db.models import Closure
+    from sijil_core.storage import RetentionActive
+    from sijil_worker.closure import closure_daily
+    from tests.support.memory_store import LockedObjectError
+
+    ws_id, org_id = ws.id, ws.org_id  # a rollback expires the ORM row
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    owner = await _org_member(make_actor, db, ws, Role.owner)
+    url = f"/v1/orgs/{org_id}/closure"
+    r = await owner.client.post(url)
+    assert r.status_code == 201, r.text
+    # Its full export ready (the sealing helper's SAMPLE original is not hashed like an upload,
+    # so the export worker is not run here: tests/test_closure_api.py runs it).
+    await db.execute(
+        text(
+            "UPDATE export_job SET state = 'ready', object_key = 'k', sha256 = repeat('a', 64),"
+            " size_bytes = 1, document_count = 1, ready_at = now() WHERE id = :id"
+        ),
+        {"id": uuid.UUID(r.json()["export_job_id"])},
+    )
+    await db.commit()
+    before = await _snapshot(db, index_conn, memory_store, row)
+    r = await owner.client.post(
+        f"{url}/takeover",
+        files={"file": ("statement.pdf", b"%PDF-1.7 SAMPLE statement", "application/pdf")},
+        data={"signer_name": "SAMPLE", "signer_capacity": "Gérant"},
+    )
+    assert r.status_code == 201, r.text
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+
+    # The grace period passes; the daily job ends the hosting.
+    await db.execute(
+        text(
+            "UPDATE closure SET requested_at = requested_at - interval '31 days',"
+            " grace_ends_at = grace_ends_at - interval '31 days' WHERE org_id = :org"
+        ),
+        {"org": org_id},
+    )
+    await db.commit()
+    runtime, removals = _Runtime(), []
+
+    async def send_removal(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        removals.append(ledger_id)
+
+    await closure_daily(
+        async_sessionmaker(db.bind, expire_on_commit=False), runtime=runtime,
+        locks=memory_store, settings=SETTINGS, send_removal=send_removal,
+        now=datetime.now(UTC),
+    )  # fmt: skip
+    assert runtime.calls == ["destroy"]
+    assert removals == [] and enqueuer.removals == []
+    closure = await db.scalar(select(Closure).where(Closure.org_id == org_id))
+    assert closure is not None and closure.state.value == "destroyed"
+    await db.rollback()
+    # Present, locked, unchanged.
+    after = await _snapshot(db, index_conn, memory_store, row)
+    assert after == before
+    stored = memory_store.objects[row.ref]
+    assert stored.retain_until > datetime.now(UTC).date()
+    # Purged only after its retention: the ledger refuses `deleting`, the store the delete.
+    with pytest.raises(DBAPIError, match="ledger.immutable"):
+        await db.execute(
+            text(
+                "UPDATE document_ledger SET state = 'deleting', deletion_approved_at = now(),"
+                " deletion_approved_by = :u WHERE id = :id"
+            ),
+            {"id": row.id, "u": owner.user_id},
+        )
+    await db.rollback()
+    with pytest.raises((RetentionActive, LockedObjectError)):
+        await memory_store.remove_original(row.ref, governance=False)
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert after[0]["workspace_id"] == str(ws_id)
