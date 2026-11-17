@@ -171,9 +171,10 @@ async def authorize(
 class WorkspaceContext:
     workspace: Workspace
     role: Role
-    # The caller's document-type grant (`visible_types`); None: every type.
-    document_types: frozenset[str] | None = None
-    user_id: UUID | None = None
+    # The caller's document-type grant (`visible_types`); None: every type. Required, like the
+    # caller's id: no default may fail open to every type.
+    document_types: frozenset[str] | None
+    user_id: UUID
 
 
 def require_workspace(action: Action) -> Callable[..., Coroutine[Any, Any, WorkspaceContext]]:
