@@ -2,7 +2,7 @@
 (see design §5.2)."""
 
 from collections.abc import Mapping
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,11 @@ def region_local_date(now: datetime, region: str) -> date:
     if now.tzinfo is None:
         raise ValueError("region_local_date needs a timezone-aware datetime")
     return now.astimezone(ZoneInfo(REGION_TZ[region])).date()
+
+
+def region_day_start(day: date, region: str) -> datetime:
+    """The aware instant `day` begins in `region`. Unknown region: KeyError."""
+    return datetime.combine(day, time.min, tzinfo=ZoneInfo(REGION_TZ[region]))
 
 
 def provisional_retain_until(arrival: date, years: int) -> date:

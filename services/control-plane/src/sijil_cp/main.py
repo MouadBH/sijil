@@ -23,6 +23,7 @@ from sijil_cp.api import (
     retention,
     review,
     search,
+    staff,
     workspaces,
 )
 from sijil_cp.auth import csrf
@@ -96,6 +97,8 @@ def create_app(settings: CpSettings) -> FastAPI:
     v1.include_router(ask.router)
     v1.include_router(exports.router)
     v1.include_router(exports.regions)
+    # Last: its catch-all hides every /v1/staff path from non-staff.
+    v1.include_router(staff.router)
     app.include_router(v1)
     return app
 

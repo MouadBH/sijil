@@ -36,6 +36,11 @@ NOT_GATED = {
     ("POST", "/v1/orgs/{org_id}/members"): "the seat check refuses a new user with the 402",
     ("PATCH", "/v1/orgs/{org_id}/members/{user_id}"): "access control is never blocked",
     ("DELETE", "/v1/orgs/{org_id}/members/{user_id}"): "revoking access is never blocked",
+    ("POST", "/v1/staff/invoices/{invoice_id}/mark-paid"): "staff: a payment lifts the gate",
+} | {
+    (method, path): "staff: the catch-all hiding /v1/staff, always 404"
+    for method in UNSAFE
+    for path in ("/v1/staff", "/v1/staff/{rest:path}")
 }
 
 

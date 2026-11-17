@@ -148,7 +148,7 @@ def _plan_out(plan: Plan) -> PlanOut:
     )
 
 
-async def _subscription_out(db: AsyncSession, sub: Subscription, now: datetime) -> SubscriptionOut:
+async def subscription_out(db: AsyncSession, sub: Subscription, now: datetime) -> SubscriptionOut:
     plan = await db.get(Plan, sub.plan_code)
     if plan is None:  # unreachable: the foreign key guarantees the plan
         raise ApiError("not_found", 404)
@@ -195,7 +195,7 @@ async def get_subscription(
     org_id: UUID, request: Request, user: CurrentUser, db: Db, now: Now
 ) -> SubscriptionOut:
     await authorize_org(db, user.id, org_id, Action.billing_read, request.app.state.settings)
-    return await _subscription_out(db, await billing.subscription_of(db, org_id), now)
+    return await subscription_out(db, await billing.subscription_of(db, org_id), now)
 
 
 @router.put("/orgs/{org_id}/subscription")
@@ -233,7 +233,7 @@ async def choose_plan(
             now=now,
         )
     await db.commit()
-    return await _subscription_out(db, sub, now)
+    return await subscription_out(db, sub, now)
 
 
 def _invoice_out(row: Invoice) -> InvoiceOut:
