@@ -56,6 +56,12 @@ class FakeRuntime:
     async def status(self, slug: str) -> Literal["absent", "starting", "running", "stopped"]:
         return "running"
 
+    async def stop(self, slug: str) -> None:
+        self.calls.append("stop")
+
+    async def start(self, slug: str) -> None:
+        self.calls.append("start")
+
     async def destroy(self, slug: str) -> None:
         self.calls.append("destroy")
 

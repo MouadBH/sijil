@@ -42,6 +42,7 @@ from sijil_worker.ask import (
     sweep_questions,
 )
 from sijil_worker.billing import billing_daily
+from sijil_worker.closure import closure_daily
 from sijil_worker.drift import (
     ENGINE_UNREACHABLE,
     drift_check,
@@ -760,6 +761,42 @@ async def _billing_daily() -> int:
 def billing_daily_task() -> int:
     """Daily: this region's invoices, renewals, overdue and read-only (sijil_worker.billing)."""
     return asyncio.run(_billing_daily())
+
+
+async def send_removal(ledger_id: UUID, workspace_id: UUID) -> None:
+    """`sijil.remove_original`, by name, to the removal worker (the only delete key)."""
+    current_app.send_task(
+        "sijil.remove_original",
+        kwargs={"ledger_id": str(ledger_id), "workspace_id": str(workspace_id)},
+        queue="removal",
+    )
+
+
+async def _closure_daily() -> dict[str, int]:
+    settings = WorkerSettings()
+    engine = make_engine(settings.database_url)
+    client = docker.from_env()
+    try:
+        run = await closure_daily(
+            make_sessionmaker(engine),
+            runtime=DockerRuntime(client, settings),
+            locks=S3ObjectStore(StorageSettings()),
+            settings=settings,
+            send_removal=send_removal,
+            now=utcnow(),
+        )
+        return {"approved": run.approved, "hibernated": run.hibernated, "destroyed": run.destroyed}
+    finally:
+        client.close()
+        await engine.dispose()
+
+
+@shared_task(name="sijil.closure_daily")
+def closure_daily_task() -> dict[str, int]:
+    """Daily: closures past their grace period hibernate or destroy their workspaces, and
+    documents of a closed account are approved for deletion as their retention ends
+    (sijil_worker.closure). On the main worker: it has the Docker socket."""
+    return asyncio.run(_closure_daily())
 
 
 async def _search_resync(workspace_id: str | None) -> int:

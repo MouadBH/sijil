@@ -75,6 +75,12 @@ def make_celery(settings: BrokerSettings, *, reconcile_on_start: bool = False) -
                 "task": "sijil.mark_eligible",
                 "schedule": crontab(hour=2, minute=0),
             },
+            # Closed accounts after their grace period (sijil_worker.closure), on the main
+            # worker (the Docker socket), after the eligibility marks.
+            "closure-daily": {
+                "task": "sijil.closure_daily",
+                "schedule": crontab(hour=2, minute=15),
+            },
             "drift-check-nightly": {
                 "task": "sijil.drift_check_all",
                 "schedule": crontab(hour=2, minute=30),

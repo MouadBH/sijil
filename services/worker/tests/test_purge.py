@@ -660,7 +660,7 @@ async def test_a_pending_consume_past_the_bound_is_checked_hourly_and_never_reco
     assert await _events(db, ready) == []
 
 
-@pytest.mark.parametrize("state", [WorkspaceState.hibernated, WorkspaceState.closing])
+@pytest.mark.parametrize("state", [WorkspaceState.closing, WorkspaceState.error])
 async def test_a_workspace_not_active_is_retried_later(
     db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
     user: User, state: WorkspaceState, fake: FakePaperless,
@@ -672,6 +672,47 @@ async def test_a_workspace_not_active_is_retried_later(
         await _purge(row, sessions, keys, engines)
     assert fake.calls == []
     assert await _index_row(engines, ready, row.id) is not None
+
+
+@pytest.mark.parametrize("state", [DocumentState.removed, DocumentState.deleted])
+async def test_a_hibernated_workspace_purges_its_index_and_never_calls_paperless(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, state: DocumentState, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """ADM-5: a hibernated tenant is stopped. Its index rows go; its Paperless copy goes with
+    the tenant when the workspace is destroyed."""
+    row = await _document(db, engines, ready, user, state)
+    ready.state = WorkspaceState.hibernated
+    await db.commit()
+    assert await _purge(row, sessions, keys, engines)
+    assert fake.calls == []
+    assert await _index_row(engines, ready, row.id) is None
+    [event] = await _events(db, ready)
+    assert (event.action, event.target_id, event.data) == (
+        "document.purged", str(row.id), {"paperless": False, "tenant": "stopped"},
+    )  # fmt: skip
+
+
+async def test_a_destroyed_workspace_only_records_the_purge(
+    db: AsyncSession, sessions: Any, keys: Any, engines: IndexEngines, ready: Workspace,
+    user: User, fake: FakePaperless,
+) -> None:  # fmt: skip
+    """ADM-5: a destroyed (`closed`) workspace's Paperless and index went with its tenant;
+    the purge is recorded, and nothing is called."""
+    row = await _document(db, engines, ready, user, DocumentState.deleted)
+    ready.state = WorkspaceState.closed
+    await db.commit()
+
+    class NoIndex:
+        async def engine(self, _workspace: Workspace) -> Any:
+            raise AssertionError("the index of a destroyed workspace is gone")
+
+    assert await _purge(row, sessions, keys, NoIndex())
+    assert fake.calls == []
+    [event] = await _events(db, ready)
+    assert (event.action, event.data) == (
+        "document.purged", {"paperless": False, "tenant": "destroyed"},
+    )  # fmt: skip
 
 
 async def test_paperless_down_raises_and_keeps_the_index_row(
@@ -752,7 +793,7 @@ async def test_sweep_skips_inactive_workspaces_and_is_capped(
             raise ConnectionError("broker down")
         sent.append(ledger_id)
 
-    ready.state = WorkspaceState.hibernated
+    ready.state = WorkspaceState.closing
     await db.commit()
     assert await requeue_unpurged(sessions, send, region="ma-cas", pending=pending) == 0
     ready.state = WorkspaceState.active
@@ -761,6 +802,25 @@ async def test_sweep_skips_inactive_workspaces_and_is_capped(
     assert await requeue_unpurged(sessions, send, region="ma-cas", pending=pending, limit=1) == 1
     assert len([s for s in sent if s.int]) == 1
     assert {s for s in sent if s.int} <= {r.id for r in rows}
+
+
+@pytest.mark.parametrize("state", [WorkspaceState.hibernated, WorkspaceState.closed])
+async def test_sweep_covers_closed_accounts(
+    db: AsyncSession, sessions: Any, engines: IndexEngines, ready: Workspace, user: User,
+    pending: PendingExtractions, state: WorkspaceState,
+) -> None:  # fmt: skip
+    """ADM-5: a hibernated or destroyed workspace's purges complete (index only, or nothing to
+    call), so the sweep sends them."""
+    row = await _document(db, engines, ready, user, DocumentState.deleted)
+    ready.state = state
+    await db.commit()
+    sent: list[tuple[uuid.UUID, uuid.UUID]] = []
+
+    async def send(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        sent.append((ledger_id, workspace_id))
+
+    assert await requeue_unpurged(sessions, send, region="ma-cas", pending=pending) == 1
+    assert sent == [(row.id, ready.id)]
 
 
 # The task ---------------------------------------------------------------------------------
