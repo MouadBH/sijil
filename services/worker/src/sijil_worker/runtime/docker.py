@@ -8,7 +8,9 @@ are the only other members, so a tenant never reaches another tenant or the inte
 Resources are named from the tenant ref (`sijil_core.tenancy.tenant_ref`, short and opaque),
 never from the organisation's name, so container hostnames stay within DNS's 63-character label.
 Every resource carries the labels `sijil.tenant={ref}` (plus `sijil.workspace={id}` and
-`sijil.role`); `destroy` and the smoke test find tenants by them. Labels never carry secrets.
+`sijil.role`); `stop`, `start`, `destroy` and the smoke test find tenants by them. Labels never
+carry secrets. `stop` (a hibernated workspace, ADM-5) only stops the containers: with the
+`unless-stopped` policy they stay stopped across a daemon restart, until `start`.
 The Docker SDK is synchronous, so each public method runs in a worker thread.
 """
 
@@ -95,6 +97,16 @@ def validate_hostname(name: str) -> str:
     return name
 
 
+# How long `stop` gives a container to exit before Docker kills it.
+STOP_TIMEOUT_S: Final = 30
+
+
+def _start_order(container: Container) -> int:
+    """Redis before Paperless (it needs its broker), anything else last."""
+    role = (container.labels or {}).get("sijil.role")
+    return {"redis": 0, "paperless": 1}.get(str(role), 2)
+
+
 class SubnetPoolExhausted(RuntimeError):
     """No free tenant subnet is left in the configured pool."""
 
@@ -178,6 +190,14 @@ class DockerRuntime:
 
     async def status(self, ref: str) -> TenantStatus:
         return await asyncio.to_thread(self._status, ref)
+
+    async def stop(self, ref: str) -> None:
+        validate_ref(ref)
+        await asyncio.to_thread(self._stop, ref)
+
+    async def start(self, ref: str) -> None:
+        validate_ref(ref)
+        await asyncio.to_thread(self._start, ref)
 
     async def destroy(self, ref: str) -> None:
         await asyncio.to_thread(self._destroy_docker, ref)
@@ -331,6 +351,25 @@ class DockerRuntime:
             return "stopped"
         health = (state.get("Health") or {}).get("Status")
         return "running" if health in (None, "healthy") else "starting"
+
+    def _tenant_containers(self, ref: str) -> list[Container]:
+        flt: dict[str, str | list[str] | bool] = {"label": f"{TENANT_LABEL}={ref}"}
+        found: list[Container] = self._client.containers.list(all=True, filters=flt)
+        return found
+
+    def _stop(self, ref: str) -> None:
+        # Paperless first, then its Redis; a container already stopped stays so.
+        for container in sorted(self._tenant_containers(ref), key=_start_order, reverse=True):
+            with contextlib.suppress(NotFound):
+                container.stop(timeout=STOP_TIMEOUT_S)
+
+    def _start(self, ref: str) -> None:
+        containers = self._tenant_containers(ref)
+        if not containers:
+            raise LookupError("tenant has no containers")
+        for container in sorted(containers, key=_start_order):
+            if container.status != "running":
+                container.start()
 
     def _destroy_docker(self, ref: str) -> None:
         validate_ref(ref)

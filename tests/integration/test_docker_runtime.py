@@ -127,6 +127,45 @@ async def test_provision_is_idempotent_against_docker(
     assert tenant_resources(docker_client, tenant.spec.ref) == before
 
 
+async def _wait_status(runtime: DockerRuntime, ref: str, want: str) -> str:
+    deadline = time.monotonic() + READY_TIMEOUT_S
+    status = await runtime.status(ref)
+    while status != want and time.monotonic() < deadline:
+        await asyncio.sleep(5)
+        status = await runtime.status(ref)
+    return status
+
+
+async def test_stop_keeps_the_tenant_and_start_brings_it_back(
+    tenant: Provisioned, docker_runtime: DockerRuntime, docker_client: docker.DockerClient,
+    worker_settings: WorkerSettings,
+) -> None:  # fmt: skip
+    """Hibernation (ADM-5): `stop` stops the tenant's containers and removes nothing (its
+    volumes, network and both databases stay); `start` brings the same Paperless back."""
+    spec = tenant.spec
+    before = tenant_resources(docker_client, spec.ref)
+    await docker_runtime.stop(spec.ref)
+    await docker_runtime.stop(spec.ref)  # idempotent
+    assert await docker_runtime.status(spec.ref) == "stopped"
+    flt: dict[str, str | list[str] | bool] = {"label": f"sijil.tenant={spec.ref}"}
+    assert docker_client.containers.list(filters=flt) == []  # none running
+    assert tenant_resources(docker_client, spec.ref) == before
+    await _connect_as(worker_settings, spec.db_name, spec.db_password, spec.db_name)
+    await _connect_as(
+        worker_settings, spec.index_db_name, spec.index_db_password, spec.index_db_name
+    )
+
+    await docker_runtime.start(spec.ref)
+    await docker_runtime.start(spec.ref)  # idempotent
+    assert await _wait_status(docker_runtime, spec.ref, "running") == "running"
+    assert tenant_resources(docker_client, spec.ref) == before
+    async with PaperlessClient(
+        tenant.handle.url, basic=(ADMIN_USERNAME, spec.admin_password)
+    ) as admin:
+        await admin.wait_ready(READY_TIMEOUT_S)
+        assert await admin.api_version() >= 1
+
+
 async def _connect_as(settings: WorkerSettings, user: str, password: str, database: str) -> None:
     url = make_url(settings.provisioner_database_url)
     conn = await asyncpg.connect(
