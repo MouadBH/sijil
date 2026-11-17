@@ -12,6 +12,7 @@ from sijil_core.db.models import (
     Invoice,
     InvoiceState,
     Organisation,
+    Plan,
     Subscription,
     SubscriptionStatus,
     Workspace,
@@ -79,3 +80,31 @@ async def test_an_overdue_org_is_paid_up_once(
         await db.scalars(select(AuditEvent.action).where(AuditEvent.workspace_id == workspace.id))
     )
     assert actions.count("billing.invoice_paid") == 1
+
+
+async def test_a_plan_already_chosen_is_kept(
+    db: AsyncSession, org: Organisation, workspace: Workspace
+) -> None:
+    """Someone moved the SAMPLE org to `pro`: seed pays its invoices and never downgrades it."""
+    await _with_ice(db, org)
+    now = datetime.now(UTC)
+    trial_end = now - timedelta(days=45)
+    db.add(billing.new_trial(org.id, trial_end - timedelta(days=billing.TRIAL_DAYS)))
+    await db.commit()
+    await billing.advance(db, org.id, trial_end, seller=sample_seller())
+    pro = await db.get(Plan, "pro")
+    assert pro is not None
+    await billing.change_plan(db, org.id, pro, now, seller=sample_seller())
+    await db.commit()
+
+    paid = await keep_paid_up(db, org.id, now, seller=sample_seller())
+
+    assert len(paid) == 2  # the annual invoice and the upgrade
+    sub = await db.scalar(
+        select(Subscription)
+        .where(Subscription.org_id == org.id)
+        .execution_options(populate_existing=True)
+    )
+    assert sub is not None
+    assert (sub.plan_code, sub.pending_plan_code) == ("pro", None)
+    assert sub.status is SubscriptionStatus.active

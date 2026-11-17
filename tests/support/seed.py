@@ -139,14 +139,18 @@ async def keep_paid_up(
     db: AsyncSession, org_id: UUID, now: datetime, *, seller: SellerSettings
 ) -> list[str]:
     """Chooses SEED_PLAN (`billing.change_plan`, as the Owner's `PUT /orgs/{id}/subscription`)
-    and records every unpaid invoice as paid by a SAMPLE transfer, as staff `mark-paid` does,
+    unless another plan or a change is already chosen, and records every unpaid invoice as paid by a SAMPLE transfer, as staff `mark-paid` does,
     then stores the status (`billing.advance`): active, nothing owed. The org must have an ICE.
     Commits. Idempotent: returns the numbers it marked paid (none on a second run)."""
+    # A plan someone already chose (another plan, or a change pending) is kept: seed never
+    # schedules a downgrade.
+    sub = await billing.subscription_of(db, org_id)
     plan = await db.get(Plan, SEED_PLAN)
     if plan is None:
         raise LookupError(f"plan {SEED_PLAN} not found")
-    change = await billing.change_plan(db, org_id, plan, now, seller=seller)
-    if change.changed:
+    chosen = sub.plan_code != SEED_PLAN or sub.pending_plan_code is not None
+    change = None if chosen else await billing.change_plan(db, org_id, plan, now, seller=seller)
+    if change is not None and change.changed:
         await invoicing.audit_org(
             db, org_id, "billing.plan_chosen",
             {"from": change.previous, "to": plan.code, "effective": change.effective}, now,
