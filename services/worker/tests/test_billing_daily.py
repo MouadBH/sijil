@@ -18,6 +18,7 @@ from sijil_core.db.models import (
     InvoiceState,
     Membership,
     Organisation,
+    OrgStatus,
     OrgType,
     Plan,
     Role,
@@ -492,3 +493,47 @@ async def test_a_mid_plan_above_a_cheaper_issued_renewal_is_billed_and_applies_a
     year_2 = YEAR_END.replace(year=YEAR_END.year + 1)
     await billing_daily(sessions, settings=SELLER, now=year_2 - timedelta(days=29))
     assert (await _invoices(db, org))[-1].plan_code == "pro"
+
+
+async def test_no_invoice_while_the_account_is_closing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    org: Organisation,
+    user: User,
+    workspace: Workspace,
+) -> None:
+    """Ruling R4: during a closure's grace period (org `closing`) neither the trial-end invoice
+    nor a renewal is issued; a cancel (org `active` again) lets the next run issue it."""
+    await _subscribed(db, org, user, ICE)
+    org.status = OrgStatus.closing
+    await db.commit()
+    await _twice(sessions, TRIAL_END + timedelta(hours=2))
+    assert await _invoices(db, org) == []
+    assert (await _sub(db, org)).status is SubscriptionStatus.active
+    assert await _events(db, workspace) == []
+    # A renewal is not issued either.
+    org.status = OrgStatus.active
+    await db.commit()
+    await _twice(sessions, TRIAL_END + timedelta(hours=3))
+    assert len(await _invoices(db, org)) == 1
+    org.status = OrgStatus.closing
+    await db.commit()
+    renewal_window = (await _sub(db, org)).period_end - timedelta(days=10)
+    await _twice(sessions, renewal_window)
+    assert len(await _invoices(db, org)) == 1
+
+
+async def test_a_closed_subscription_refuses_writes_but_not_exports(
+    db: AsyncSession, org: Organisation, user: User
+) -> None:
+    """Ruling R5: a hibernated account's subscription is `closed`: its writes answer
+    `billing.read_only`; its Owner's exports stay open; no AI, no new user."""
+    await _subscribed(db, org, user, ICE)
+    sub = await _sub(db, org)
+    sub.status = SubscriptionStatus.closed
+    await db.commit()
+    standing = await billing.standing(db, org.id, START)
+    assert (standing.writes_allowed, standing.billing_code) == (False, "billing.read_only")
+    assert (standing.export_allowed, standing.ai_allowed, standing.new_users_allowed) == (
+        True, False, False
+    )  # fmt: skip

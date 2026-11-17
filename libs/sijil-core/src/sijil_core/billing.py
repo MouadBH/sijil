@@ -27,7 +27,9 @@ Billing is per organisation, in the control-plane database of its region.
   ICE), the renewal RENEWAL_NOTICE before `period_end` (on `pending_plan_code` when there is
   one), rolls the billing year on at `period_end` (the plan the new year is invoiced on then
   applies: its renewal's, or an upgrade's issued after it), marks
-  unpaid invoices past due `overdue`, and stores the phase. Each transition is audited once:
+  unpaid invoices past due `overdue`, and stores the phase. While the org is closing or closed
+  (ADM-5, ruling R4) no invoice is issued: neither the first annual one nor a renewal. Each
+  transition is audited once:
   `billing.invoice_issued`, `billing.overdue` (`{number}` for an invoice, `{reason}` for the
   missing ICE) and `billing.read_only`.
 - **Standing** (`standing`): what the organisation may do. Over quota (any of users,
@@ -35,7 +37,9 @@ Billing is per organisation, in the control-plane database of its region.
   may be added; at the user limit only new users stop. `overdue` also stops exports
   (`billing.overdue`), and `read_only` every state-changing workspace route but capture
   (`billing.read_only`); a document that skips AI for either is flagged `billing_overdue`.
-  Capture and reads are never gated here or anywhere (§5.7a).
+  Capture and reads are never gated here or anywhere (§5.7a). A `closed` subscription (a
+  hibernated account, ADM-5, ruling R5) refuses every write (`billing.read_only`), AI and new
+  users, and keeps the Owner's exports open.
 - **Warnings** (`check`): the first time a quota reaches 80% or 100% in a billing year,
   `quota.warning_80` / `quota.warning_100` `{kind}` is audited on every workspace of the org.
   A `quota_warning` row, unique per (org, kind, threshold, period start), makes it once
@@ -64,6 +68,7 @@ from sijil_core.db.models import (
     InvoiceState,
     Membership,
     Organisation,
+    OrgStatus,
     Plan,
     QuotaWarning,
     Subscription,
@@ -313,6 +318,15 @@ def exceeded(m: Meter) -> list[str]:
 
 
 def standing_of(m: Meter) -> Standing:
+    if m.status is SubscriptionStatus.closed:
+        return Standing(
+            ai_allowed=False,
+            new_users_allowed=False,
+            export_allowed=True,
+            writes_allowed=False,
+            reason_code=None,
+            billing_code=READ_ONLY_CODE,
+        )
     if m.status in (SubscriptionStatus.overdue, SubscriptionStatus.read_only):
         read_only = m.status is SubscriptionStatus.read_only
         return Standing(
@@ -475,7 +489,9 @@ async def advance(
     org, sub = await locked_subscription(db, org_id)
     if sub.status is SubscriptionStatus.closed:
         return Phase(SubscriptionStatus.closed)
-    if org.ice is not None and sub.period_end <= sub.trial_ends_at <= now:
+    # Ruling R4: an account being closed is never invoiced again.
+    invoicing_open = org.status is OrgStatus.active
+    if invoicing_open and org.ice is not None and sub.period_end <= sub.trial_ends_at <= now:
         start, end = sub.trial_ends_at, add_year(sub.trial_ends_at)
         if await _annual_for(db, org.id, start) is None:
             plan = await _plan(db, sub.plan_code)
@@ -485,7 +501,8 @@ async def advance(
         sub.period_start, sub.period_end = start, end
     while sub.period_end > sub.trial_ends_at:  # the first billing year has started
         renewal = await _annual_for(db, org.id, sub.period_end)
-        if renewal is None and org.ice is not None and now >= sub.period_end - RENEWAL_NOTICE:
+        due = now >= sub.period_end - RENEWAL_NOTICE
+        if renewal is None and invoicing_open and org.ice is not None and due:
             plan = await _plan(db, sub.pending_plan_code or sub.plan_code)
             period = (sub.period_end, add_year(sub.period_end))
             renewal = await invoicing.issue(
