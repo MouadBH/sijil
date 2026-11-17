@@ -403,6 +403,60 @@ async def test_takeover_refused_once_the_export_has_expired_and_needs_a_new_one(
     assert r.status_code == 201, r.text
 
 
+async def test_a_takeover_does_not_outlive_its_cancelled_closure(
+    make_actor: MakeActor, db: AsyncSession, clock: Any, cp_app: FastAPI,
+    memory_store: MemoryObjectStore, export_store: MemoryExportStore,
+) -> None:  # fmt: skip
+    """Take-over, cancel, request again: the new closure carries no statement, so after its
+    grace period a workspace holding a document under retention hibernates; nothing is
+    destroyed early."""
+    owner, org_id, workspace = await _org(make_actor, db)
+    await _document(db, memory_store, workspace, owner.user_id)
+    first = (await owner.client.post(_url(org_id))).json()
+    await db.execute(
+        text(
+            "UPDATE export_job SET state = 'ready', object_key = 'k', sha256 = repeat('a', 64),"
+            " size_bytes = 1, document_count = 1, ready_at = now() WHERE id = :id"
+        ),
+        {"id": UUID(first["export_job_id"])},
+    )
+    await db.commit()
+    r = await owner.client.post(
+        _url(org_id, "/takeover"),
+        files={"file": ("declaration.pdf", PDF, "application/pdf")},
+        data={"signer_name": "Samira SAMPLE", "signer_capacity": "Gérante"},
+    )
+    assert r.status_code == 201, r.text
+    assert (await owner.client.delete(_url(org_id))).json()["state"] == "cancelled"
+    second = (await owner.client.post(_url(org_id))).json()
+    assert second["id"] != first["id"]
+    assert second["takeover"] is None
+    assert (await owner.client.get(_url(org_id))).json()["takeover"] is None
+
+    runtime = RecordingRuntime()
+
+    async def send_removal(ledger_id: UUID, workspace_id: UUID) -> None:
+        raise AssertionError("nothing is past retention")
+
+    await db.execute(
+        text(
+            "UPDATE closure SET requested_at = requested_at - interval '31 days',"
+            " grace_ends_at = grace_ends_at - interval '31 days' WHERE id = :id"
+        ),
+        {"id": UUID(second["id"])},
+    )
+    await db.commit()
+    await closure_daily(
+        async_sessionmaker(db.bind, expire_on_commit=False), runtime=runtime, locks=NoLocks(),
+        settings=SETTINGS, send_removal=send_removal, now=datetime.now(UTC),
+    )  # fmt: skip
+    assert runtime.calls == [("stop", tenant_ref(workspace.id))]
+    ws = await db.get(Workspace, workspace.id, populate_existing=True)
+    assert ws is not None and ws.state is WorkspaceState.hibernated
+    row = await db.get(Closure, UUID(second["id"]), populate_existing=True)
+    assert row is not None and row.state is ClosureState.hibernated
+
+
 # Hibernation --------------------------------------------------------------------------------
 
 
