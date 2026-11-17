@@ -31,7 +31,9 @@ region's Ed25519 signing seed, reaches no tenant network and has no Docker socke
    and the corrected field names, then the canonical
    `integrity-report.json` and its signature (sijil_core.export_report);
 6. puts the ZIP at `<workspace_id>/<job_id>.zip` in the exports bucket, sets the job `ready`
-   with the ZIP's hash and size, and audits `export.ready` `{period, document_count}`.
+   with the ZIP's hash and size, records the documents it holds (`export_document`, one row
+   each, write-once: what a take-over is judged on, sijil_core.closure) and audits
+   `export.ready` `{period, document_count}`.
 
 `expire_exports` (daily) deletes exports ready for more than 7 days, sets them `expired` and
 audits `export.expired` `{period}` for each.
@@ -57,7 +59,7 @@ from pathlib import Path
 from typing import Final, Protocol
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import insert, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from sijil_core import audit
@@ -67,6 +69,7 @@ from sijil_core.db.models import (
     AuditEvent,
     DocumentLedger,
     DocumentState,
+    ExportDocument,
     ExportJob,
     ExportState,
     Organisation,
@@ -436,6 +439,12 @@ async def _build(
         locked.size_bytes = size
         locked.document_count = len(docs)
         locked.ready_at = now
+        # The export's own document set (final review I1): what a take-over is judged on.
+        if docs:
+            await session.execute(
+                insert(ExportDocument),
+                [{"export_job_id": job_id, "ledger_id": d.ledger.id} for d in docs],
+            )
         await _audit(session, locked, "export.ready", now, document_count=len(docs))
         await session.commit()
     return True

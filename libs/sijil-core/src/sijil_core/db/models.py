@@ -549,6 +549,17 @@ class ExportJob(Base):
     ready_at: Mapped[datetime | None] = _tstz()
 
 
+class ExportDocument(Base):
+    """A document a ready export holds (0019, final review I1): written with the job's `ready`,
+    write-once (the app role has SELECT and INSERT only). A take-over destroys a workspace only
+    when its newest built full export holds every live document (`sijil_core.closure`)."""
+
+    __tablename__ = "export_document"
+
+    export_job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("export_job.id"), primary_key=True)
+    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("document_ledger.id"), primary_key=True)
+
+
 class Plan(Base):
     """A plan of the catalogue (0015, seeded; edited only by migration). Users and storage are
     current totals; documents and AI pages are counted per billing year."""

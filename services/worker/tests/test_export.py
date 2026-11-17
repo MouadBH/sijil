@@ -32,6 +32,7 @@ from sijil_core.db.models import (
     ActorType,
     AuditEvent,
     DocumentState,
+    ExportDocument,
     ExportJob,
     ExportState,
     User,
@@ -687,3 +688,18 @@ async def test_full_export_includes_every_period(
     }  # fmt: skip
     ready = (await _events(db, workspace))[-1]
     assert (ready.action, ready.data) == ("export.ready", {"period": "all", "document_count": 3})
+    # The export's own document set is recorded with it (final review I1), write-once.
+    held = set(
+        await db.scalars(
+            select(ExportDocument.ledger_id).where(ExportDocument.export_job_id == job.id)
+        )
+    )
+    assert held == {old.id, last_year.id, undated.id}
+    job_id = job.id  # a rollback expires the ORM row
+    for sql in (
+        "UPDATE export_document SET ledger_id = ledger_id WHERE export_job_id = :id",
+        "DELETE FROM export_document WHERE export_job_id = :id",
+    ):
+        with pytest.raises(DBAPIError, match="permission denied"):
+            await db.execute(text(sql), {"id": job_id})
+        await db.rollback()
