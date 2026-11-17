@@ -52,6 +52,7 @@ from sijil_core.index import FieldsRow, IndexEngines, read_fields, write_extract
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
 from sijil_core.storage import S3ObjectStore, StorageSettings
 from sijil_core.tenancy import tenant_ref
+from sijil_cp.auth.passwords import hash_password
 from sijil_worker.ask import ANSWER_NO_MATCH, answer_question
 from sijil_worker.closure import closure_daily
 from sijil_worker.extract import _route
@@ -307,11 +308,21 @@ async def test_closure_hibernates_a_workspace_with_retained_documents(
         workspace_id = uuid.UUID(r.json()["workspace"]["id"])
         created_workspaces.append(workspace_id)
         base = f"/v1/workspaces/{workspace_id}"
+        # The Admin is created in the database (the signup rate limit is per IP and hourly),
+        # added by the Owner over the API, and signs in like anyone.
         admin_email = f"m6-close-admin-{run}@sijil.local"
-        await Owner(admin_http, PASSWORD).sign_up(admin_email, "SAMPLE M6 Admin")
+        async with sessions() as db:
+            db.add(
+                User(email=admin_email, name="SAMPLE M6 Admin",
+                     password_hash=hash_password(PASSWORD))
+            )  # fmt: skip
+            await db.commit()
         await owner.step_up()
         r = await post(http, f"/v1/orgs/{org_id}/members", {"email": admin_email, "role": "admin"})
         assert r.status_code == 201, r.text
+        (await admin_http.get("/v1/auth/csrf")).raise_for_status()
+        r = await post(admin_http, "/v1/auth/login", {"email": admin_email, "password": PASSWORD})
+        assert r.status_code == 200, r.text
         started = time.monotonic()
         while (state := (await poll_get(http, base)).json()["state"]) != WorkspaceState.active:
             assert state != WorkspaceState.error
