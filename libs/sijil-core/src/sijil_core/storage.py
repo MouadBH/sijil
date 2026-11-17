@@ -61,8 +61,12 @@ class ObjectRef:
 class ObjectStore(Protocol):
     async def ensure_bucket(self) -> None: ...
 
-    async def put_original(self, key: str, path: Path, retain_until: date) -> ObjectRef:
-        """Store the file in GOVERNANCE mode until `retain_until`."""
+    async def put_original(
+        self, key: str, path: Path, retain_until: date, *, compliance: bool = False
+    ) -> ObjectRef:
+        """Store the file in GOVERNANCE mode until `retain_until`; with `compliance`, in
+        COMPLIANCE mode (write-once evidence such as a take-over statement: no key deletes or
+        shortens it before its date)."""
         ...
 
     def open(self, ref: ObjectRef) -> AsyncIterator[bytes]: ...
@@ -184,10 +188,12 @@ class S3ObjectStore(ObjectStore):
         if versioning != "Enabled":
             raise RuntimeError(f"bucket {self.bucket} does not have versioning enabled")
 
-    async def put_original(self, key: str, path: Path, retain_until: date) -> ObjectRef:
-        return await asyncio.to_thread(self._put, key, path, retain_until)
+    async def put_original(
+        self, key: str, path: Path, retain_until: date, *, compliance: bool = False
+    ) -> ObjectRef:
+        return await asyncio.to_thread(self._put, key, path, retain_until, compliance)
 
-    def _put(self, key: str, path: Path, retain_until: date) -> ObjectRef:
+    def _put(self, key: str, path: Path, retain_until: date, compliance: bool) -> ObjectRef:
         # The store verifies the bytes it received against this digest, so corruption in
         # transit is rejected instead of being locked for the retention period.
         checksum = _sha256_b64(path)
@@ -198,7 +204,7 @@ class S3ObjectStore(ObjectStore):
                 Body=body,
                 ChecksumAlgorithm="SHA256",
                 ChecksumSHA256=checksum,
-                ObjectLockMode="GOVERNANCE",
+                ObjectLockMode="COMPLIANCE" if compliance else "GOVERNANCE",
                 ObjectLockRetainUntilDate=_end_of_day(retain_until),
             )
         return ObjectRef(key=key, version_id=out["VersionId"])

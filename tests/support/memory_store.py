@@ -45,10 +45,13 @@ class MemoryObjectStore(ObjectStore):
     async def ensure_bucket(self) -> None:
         return None
 
-    async def put_original(self, key: str, path: Path, retain_until: date) -> ObjectRef:
+    async def put_original(
+        self, key: str, path: Path, retain_until: date, *, compliance: bool = False
+    ) -> ObjectRef:
         data = path.read_bytes()  # noqa: ASYNC240 - test double, small files
         ref = ObjectRef(key=key, version_id=f"v{next(self._versions)}")
-        self.objects[ref] = StoredObject(data=data, mode="GOVERNANCE", retain_until=retain_until)
+        mode = "COMPLIANCE" if compliance else "GOVERNANCE"
+        self.objects[ref] = StoredObject(data=data, mode=mode, retain_until=retain_until)
         self.puts.append(Put(key, ref.version_id, retain_until, len(data)))
         return ref
 

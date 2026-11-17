@@ -353,10 +353,11 @@ async def test_takeover_requires_ready_full_export(
     assert (row.closure_id, row.org_id, row.signed_by) == (
         UUID(closure["id"]), org_id, owner.user_id,
     )  # fmt: skip
-    # Write-once in the object store, under its own lock, for at least ten years.
+    # Write-once in the object store, under its own COMPLIANCE lock (legal evidence: no key can
+    # shorten or delete it before its date), for at least ten years.
     stored = memory_store.objects[ObjectRef(row.object_key, row.object_version_id)]
     assert stored.data == PDF
-    assert stored.mode == "GOVERNANCE"
+    assert stored.mode == "COMPLIANCE"
     assert stored.retain_until >= date(clock.now.year + 10, 1, 1)
     assert row.object_key.startswith(f"takeover/{org_id}/")
     assert await _actions(db, workspace.id, "closure.takeover_signed") == [

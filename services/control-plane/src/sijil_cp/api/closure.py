@@ -20,7 +20,7 @@ billing gate (ruling R4): an account can always be closed.
   requested since the closure and `ready` (downloadable); a missing or expired one, a file
   that is not a PDF, an empty or over-long name or capacity, or a second statement is 422
   `takeover.invalid`. The PDF is put write-once in the originals bucket under its own
-  GOVERNANCE lock (`takeover/<org_id>/<id>.pdf`, kept TAKEOVER_RETENTION_YEARS or until the
+  COMPLIANCE lock (`takeover/<org_id>/<id>.pdf`, kept TAKEOVER_RETENTION_YEARS or until the
   org's latest retention, whichever is later), its SHA-256 in the write-once
   `takeover_statement` row, audited `closure.takeover_signed` `{statement_id, sha256}`. After
   the grace period the closure job then destroys every tenant even with documents under
@@ -365,7 +365,10 @@ async def sign_takeover(
         sha256, size = await _spool(file, path)
         if sniff(path) is not FileKind.pdf:
             raise ApiError(closing.TAKEOVER_INVALID, 422)
-        ref = await store.put_original(f"takeover/{org_id}/{statement_id}.pdf", path, retain_until)
+        # COMPLIANCE: legal evidence, which no key may delete or shorten before its date.
+        ref = await store.put_original(
+            f"takeover/{org_id}/{statement_id}.pdf", path, retain_until, compliance=True
+        )
     statement = TakeoverStatement(
         id=statement_id,
         closure_id=row.id,
