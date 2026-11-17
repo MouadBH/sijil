@@ -74,12 +74,11 @@ async def closing_at_exit(
     try:
         yield created
     except BaseException:
-        try:
+        with contextlib.suppress(Exception):
             await mark(created)
-        finally:
-            if runtime is not None:
-                with contextlib.suppress(Exception):
-                    await stop_tenants(created, runtime)
+        if runtime is not None:
+            with contextlib.suppress(Exception):
+                await stop_tenants(created, runtime)
         raise
     try:
         await mark(created)

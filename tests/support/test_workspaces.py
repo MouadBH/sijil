@@ -55,3 +55,17 @@ async def test_without_a_runtime_only_marks_closing() -> None:
     async with closing_at_exit(mark=rec.mark) as created:
         created.append(uuid4())
     assert [c[0] for c in rec.calls] == ["closing"]
+
+
+async def test_a_failed_body_wins_over_a_failed_mark() -> None:
+    rec = _Recorder()
+
+    async def failing_mark(ids: Iterable[UUID]) -> None:
+        raise RuntimeError("database gone")
+
+    a = uuid4()
+    with pytest.raises(ValueError, match="the test failed"):
+        async with closing_at_exit(rec, mark=failing_mark) as created:
+            created.append(a)
+            raise ValueError("the test failed")
+    assert rec.calls == [("stop", tenant_ref(a))]
