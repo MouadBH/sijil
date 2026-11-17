@@ -27,6 +27,8 @@ ALREADY_REQUESTED: Final = "closure.already_requested"
 NOT_REQUESTED: Final = "closure.not_requested"
 GRACE_OVER: Final = "closure.grace_over"
 TAKEOVER_INVALID: Final = "takeover.invalid"
+# A plan chosen while a closure is open (grace, hibernated or destroyed): 409 (ruling I2).
+IN_PROGRESS: Final = "closure.in_progress"
 
 
 def grace_ends(requested_at: datetime) -> datetime:

@@ -62,6 +62,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import invoicing
+from sijil_core.closure import open_closure
 from sijil_core.db.models import (
     DocumentLedger,
     Invoice,
@@ -551,6 +552,10 @@ async def advance(
     return current
 
 
+class ClosureInProgress(Exception):  # noqa: N818 - named for the machine code it maps to
+    """The org has an open closure: no plan may be chosen (`closure.in_progress`)."""
+
+
 @dataclass(frozen=True)
 class PlanChange:
     previous: str  # the plan in force before
@@ -564,7 +569,16 @@ async def change_plan(
     db: AsyncSession, org_id: UUID, plan: Plan, now: datetime, *, seller: SellerSettings
 ) -> PlanChange:
     """The Owner's choice of plan (`PUT /orgs/{id}/subscription`), after `advance`, in the
-    caller's transaction (the caller audits and commits)."""
+    caller's transaction (the caller audits and commits).
+
+    Raises `ClosureInProgress`, having changed nothing, while the org has an open closure
+    (grace, hibernated or destroyed; ruling I2): an account being closed is never invoiced
+    (R4), and its stored period may no longer hold `now`. Checked under the org row lock,
+    which a closure request takes too, so the two never interleave; a cancelled closure
+    restores the choice."""
+    await locked_subscription(db, org_id)
+    if await open_closure(db, org_id) is not None:
+        raise ClosureInProgress
     current_phase = await advance(db, org_id, now, seller=seller)
     org, sub = await locked_subscription(db, org_id)
     previous = sub.plan_code

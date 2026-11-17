@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core.db.models import (
     AuditEvent,
+    Invoice,
     Membership,
     Organisation,
     Role,
@@ -389,3 +390,62 @@ async def test_an_expired_trial_counts_as_ended_before_the_daily_job(
     assert [e["effective"] for e in events] == ["now"]
     kinds = [i["kind"] for i in (await alice.client.get(f"/v1/orgs/{org_id}/invoices")).json()]
     assert sorted(kinds) == ["annual", "upgrade"]
+
+
+# No plan choice while the account is closing or closed (final review I2) ---------------------
+
+
+async def _closing_with_ice(make_actor: MakeActor, db: AsyncSession) -> tuple[Any, str]:
+    """An active essentiel org with an ICE, in its first billing day, its closure requested."""
+    alice, org_id = await stepped_up_owner(make_actor)
+    assert (await alice.client.patch(f"/v1/orgs/{org_id}", json={"ice": ICE})).status_code == 200
+    await _active_since(db, org_id, alice.clock.now - timedelta(hours=1))
+    r = await alice.client.post(f"/v1/orgs/{org_id}/closure")
+    assert (r.status_code, r.json()["state"]) == (201, "grace"), r.text
+    return alice, org_id
+
+
+async def _refused_without_a_trace(alice: Any, db: AsyncSession, org_id: str) -> None:
+    """409 `closure.in_progress` for a dearer plan and for the current one: no invoice, no
+    pending plan, nothing audited."""
+    for plan in ("pro", "essentiel"):
+        r = await alice.client.put(f"/v1/orgs/{org_id}/subscription", json={"plan_code": plan})
+        assert (r.status_code, error(r)) == (409, "closure.in_progress"), r.text
+    db.expire_all()
+    assert await db.scalar(select(Invoice.id).where(Invoice.org_id == UUID(org_id))) is None
+    sub = await db.scalar(select(Subscription).where(Subscription.org_id == UUID(org_id)))
+    assert sub is not None
+    assert (sub.plan_code, sub.pending_plan_code) == ("essentiel", None)
+    chosen = select(AuditEvent.id).where(AuditEvent.action == "billing.plan_chosen")
+    assert await db.scalar(chosen) is None
+
+
+async def test_choose_plan_refused_during_the_grace_period(
+    make_actor: MakeActor, db: AsyncSession
+) -> None:
+    alice, org_id = await _closing_with_ice(make_actor, db)
+    await _refused_without_a_trace(alice, db, org_id)
+
+
+async def test_choose_plan_refused_once_hibernated(make_actor: MakeActor, db: AsyncSession) -> None:
+    alice, org_id = await _closing_with_ice(make_actor, db)
+    org = {"org": UUID(org_id)}
+    await db.execute(
+        text("UPDATE closure SET state = 'hibernated', hibernated_at = now() WHERE org_id = :org"),
+        org,
+    )
+    await db.execute(text("UPDATE subscription SET status = 'closed' WHERE org_id = :org"), org)
+    await db.commit()
+    await _refused_without_a_trace(alice, db, org_id)
+
+
+async def test_a_cancelled_closure_restores_plan_choice(
+    make_actor: MakeActor, db: AsyncSession
+) -> None:
+    alice, org_id = await _closing_with_ice(make_actor, db)
+    r = await alice.client.delete(f"/v1/orgs/{org_id}/closure")
+    assert (r.status_code, r.json()["state"]) == (200, "cancelled"), r.text
+    r = await alice.client.put(f"/v1/orgs/{org_id}/subscription", json={"plan_code": "pro"})
+    assert (r.status_code, r.json()["plan_code"]) == (200, "pro"), r.text
+    invoices = (await alice.client.get(f"/v1/orgs/{org_id}/invoices")).json()
+    assert [(i["kind"], i["plan_code"]) for i in invoices] == [("upgrade", "pro")]

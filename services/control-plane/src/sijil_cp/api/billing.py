@@ -21,6 +21,9 @@
     `renewal`, or `following_renewal` when the next year is already invoiced (it then applies
     at the renewal after that one). The current plan clears a pending change.
   - A change is audited `billing.plan_chosen` `{from, to, effective}`.
+  - While the org has an open closure (in its grace period, hibernated or destroyed) it is 409
+    `closure.in_progress`, with no invoice and no pending plan (ruling I2); cancelling the
+    closure restores the choice.
 - `GET /orgs/{id}/invoices`, `GET /orgs/{id}/invoices/{inv}` and `GET …/{inv}/pdf` (the PDF
   stored at issue, never rendered again): Owners and Admins; another org's invoice, or none,
   is 404 `invoice.not_found`. Amounts are strings.
@@ -38,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
 from sijil_core import billing
+from sijil_core import closure as closing
 from sijil_core.db.models import (
     Invoice,
     InvoiceKind,
@@ -217,7 +221,11 @@ async def choose_plan(
     if org.ice is None:
         raise ApiError("org.ice_required", 422)
     ensure_step_up(session, user, now)
-    change = await billing.change_plan(db, org_id, plan, now, seller=request.app.state.settings)
+    try:
+        change = await billing.change_plan(db, org_id, plan, now, seller=request.app.state.settings)
+    except billing.ClosureInProgress:
+        await db.rollback()
+        raise ApiError(closing.IN_PROGRESS, 409) from None
     _, sub = await billing.locked_subscription(db, org_id)
     previous, changed, effective = change.previous, change.changed, change.effective
     if changed:
