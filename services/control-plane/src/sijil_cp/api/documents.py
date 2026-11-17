@@ -227,6 +227,8 @@ async def upload_document(
         raise ApiError(ingest.Unsupported.code, 415) from None
     except ingest.Empty:
         raise ApiError(ingest.Empty.code, 422) from None
+    except ingest.WorkspaceNotAccepting:
+        raise ApiError(ingest.WorkspaceNotAccepting.code, 409) from None
     except (_MissingFile, MultipartParseError):
         raise _invalid() from None
     if isinstance(result, ingest.Duplicate):

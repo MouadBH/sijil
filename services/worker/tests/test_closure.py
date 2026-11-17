@@ -7,8 +7,10 @@ retention dates are set around the real today. The store is the in-memory double
 semantics, the real date too); the runtime records what it is asked. SAMPLE data only.
 """
 
+import asyncio
 import hashlib
 import uuid
+from collections.abc import AsyncIterator
 from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -18,8 +20,11 @@ from celery.schedules import crontab
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sijil_core import ingest
 from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
+    TERMINAL_STATES,
+    ActorType,
     AuditEvent,
     Closure,
     ClosureState,
@@ -370,6 +375,103 @@ async def test_a_cancelled_or_other_region_closure_is_left_alone(
     assert (runtime.calls, removals.sent) == ([], [])
 
 
+async def _capture(
+    sessions: async_sessionmaker[AsyncSession], store: MemoryObjectStore, ws: Workspace
+) -> ingest.Accepted | ingest.Duplicate:
+    """An inbound SAMPLE document, as the inbound mail path archives one."""
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"%PDF-1.7 SAMPLE late " + uuid.uuid4().bytes
+
+    async def enqueue(_ledger_id: UUID, _workspace_id: UUID) -> None:
+        return None
+
+    return await ingest.accept_file(
+        sessions=sessions, store=store, enqueue=enqueue, workspace=ws, region="ma-cas",
+        chunks=chunks(), source=DocumentSource.email, audit_action="email.received",
+        actor_type=ActorType.email, actor_id=None, ip=None, now=utcnow(),
+    )  # fmt: skip
+
+
+async def _live(db: AsyncSession, ws_id: UUID) -> list[UUID]:
+    rows = await db.scalars(
+        select(DocumentLedger.id).where(
+            DocumentLedger.workspace_id == ws_id, DocumentLedger.state.not_in(TERMINAL_STATES)
+        )
+    )
+    found = list(rows)
+    await db.rollback()
+    return found
+
+
+async def test_a_capture_racing_the_destruction_never_lands_in_a_closed_workspace(
+    db: AsyncSession, sessions: Any, org: Organisation, user: User, workspace: Workspace,
+    memory_store: MemoryObjectStore,
+) -> None:  # fmt: skip
+    """Review fix 1: the workspace stops capture, under its row lock, before the documents
+    under retention are counted. A document arriving after the count (here while the tenant is
+    being destroyed) is refused; it never becomes a live document, hidden from its Owner, in
+    a destroyed workspace with no take-over."""
+    ws_id = workspace.id
+    await _document(db, memory_store, workspace, user, PAST)
+    await _closure(db, org, user)
+    outcomes: list[str] = []
+
+    class Racing(RecordingRuntime):
+        async def destroy(self, ref: str) -> None:
+            try:
+                await _capture(sessions, memory_store, workspace)
+                outcomes.append("accepted")
+            except ingest.WorkspaceNotAccepting:
+                outcomes.append("refused")
+            await super().destroy(ref)
+
+    await _run(sessions, memory_store, Racing(), Removals())
+
+    assert outcomes == ["refused"]
+    assert (await _row(db, Workspace, ws_id)).state is WorkspaceState.closed
+    assert await _live(db, ws_id) == []
+
+
+async def test_a_document_captured_before_the_count_leads_to_hibernation(
+    db: AsyncSession, sessions: Any, org: Organisation, user: User, workspace: Workspace,
+    memory_store: MemoryObjectStore,
+) -> None:  # fmt: skip
+    """A document that arrived after the grace period ended but before the job froze the
+    workspace is counted: the workspace hibernates, it is never destroyed."""
+    ws_id = workspace.id
+    await _document(db, memory_store, workspace, user, PAST)
+    await _closure(db, org, user)
+    late = await _capture(sessions, memory_store, workspace)
+    assert isinstance(late, ingest.Accepted)
+    runtime = RecordingRuntime()
+    run = await _run(sessions, memory_store, runtime, Removals())
+    assert (run.hibernated, run.destroyed) == (1, 0)
+    assert runtime.calls == [("stop", tenant_ref(ws_id))]
+    assert (await _row(db, Workspace, ws_id)).state is WorkspaceState.hibernated
+    assert await _live(db, ws_id) == [late.document_id]
+
+
+async def test_accept_file_waits_for_a_freeze_and_then_refuses(
+    db: AsyncSession, sessions: Any, workspace: Workspace, memory_store: MemoryObjectStore
+) -> None:
+    """Capture serialises with the closure's freeze on the workspace row: an archive that
+    reaches its ledger insert while the freeze holds the row waits for it, then refuses."""
+    ws_id = workspace.id
+    async with sessions() as freezer:
+        frozen = await freezer.get(Workspace, ws_id, with_for_update=True)
+        assert frozen is not None
+        frozen.state = WorkspaceState.hibernated
+        await freezer.flush()
+        racing = asyncio.create_task(_capture(sessions, memory_store, workspace))
+        await asyncio.sleep(0.5)
+        assert not racing.done()  # blocked on the row lock
+        await freezer.commit()
+    with pytest.raises(ingest.WorkspaceNotAccepting):
+        await racing
+    assert await _live(db, ws_id) == []
+
+
 async def test_one_failing_closure_leaves_the_others_to_run(
     db: AsyncSession, sessions: Any, org: Organisation, user: User, workspace: Workspace,
     memory_store: MemoryObjectStore, caplog: pytest.LogCaptureFixture,
@@ -382,7 +484,8 @@ async def test_one_failing_closure_leaves_the_others_to_run(
     runtime = Broken()
     run = await _run(sessions, memory_store, runtime, Removals())
     assert run.destroyed == 0
-    assert (await _row(db, Workspace, workspace.id)).state is WorkspaceState.active
+    # Frozen before the count (capture stopped), not destroyed.
+    assert (await _row(db, Workspace, workspace.id)).state is WorkspaceState.hibernated
     assert "failed; the next run resumes it" in caplog.text
     # The next run resumes it.
     run = await _run(sessions, memory_store, RecordingRuntime(), Removals())

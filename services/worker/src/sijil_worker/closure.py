@@ -5,6 +5,12 @@ Daily (beat, 02:15 in the region's time zone, after `sijil.mark_eligible`), on t
 grace period is over, region-local: `sijil_core.closure.grace_over`; `hibernated`; and
 `destroyed` ones whose take-over left documents under retention), workspace by workspace:
 
+0. **Freeze.** Under the workspace row lock, a workspace not yet hibernated or closed becomes
+   `hibernated` first, so capture stops before anything is counted: upload, inbound mail and
+   ingest accept only `provisioning` or `active`, and `sijil_core.ingest.accept_file`
+   re-checks the state under the same row (FOR SHARE) when it writes the ledger row. A
+   document either landed before the freeze, and is counted below, or is refused.
+
 1. **Retention end.** Each live document (not `removed`, `deleting` or `deleted`) whose
    `retention_until` is before today (region-local) goes to `deleting`, approved by the closure
    request itself: `deletion_approved_by` is the Owner who asked for the closure, audited
@@ -44,6 +50,7 @@ from sijil_core.closure import OPEN_STATES, grace_over
 from sijil_core.db.models import (
     TERMINAL_STATES,
     ActorType,
+    AuditEvent,
     Closure,
     ClosureState,
     DocumentLedger,
@@ -65,6 +72,7 @@ from sijil_core.tenancy import tenant_ref
 log = logging.getLogger(__name__)
 
 COMPLIANCE: Final = "COMPLIANCE"
+_FROZEN: Final = (WorkspaceState.hibernated, WorkspaceState.closed)
 
 
 class ClosureRuntime(Protocol):
@@ -196,6 +204,20 @@ async def _close_subscription(session: AsyncSession, org_id: UUID) -> None:
     sub.status_reason = None
 
 
+async def _freeze(sessions: async_sessionmaker[AsyncSession], workspace_id: UUID) -> None:
+    """Stops capture before anything is counted: under the workspace row lock, a workspace not
+    yet hibernated or closed becomes `hibernated` (upload, inbound mail and ingest accept only
+    `provisioning` or `active`; `sijil_core.ingest.accept_file` re-checks under this row), so
+    no document can land after the count."""
+    async with sessions() as session:
+        workspace = await session.get(
+            Workspace, workspace_id, with_for_update=True, populate_existing=True
+        )
+        if workspace is not None and workspace.state not in _FROZEN:
+            workspace.state = WorkspaceState.hibernated
+        await session.commit()
+
+
 async def _hibernate(
     sessions: async_sessionmaker[AsyncSession],
     runtime: ClosureRuntime,
@@ -203,17 +225,23 @@ async def _hibernate(
     workspace_id: UUID,
     retained: int,
     now: datetime,
-) -> None:
+) -> bool:
+    """The tenant stopped, the subscription closed, audited once. True when this run did it."""
     await runtime.stop(tenant_ref(workspace_id))
     async with sessions() as session:
         # The org and its subscription first (as billing does), then the workspace.
         await _close_subscription(session, closure.org_id)
         workspace = await session.get(Workspace, workspace_id, with_for_update=True)
-        if workspace is None or workspace.state is WorkspaceState.hibernated:
+        done = await session.scalar(
+            select(AuditEvent.id).where(
+                AuditEvent.workspace_id == workspace_id,
+                AuditEvent.action == "closure.hibernated",
+                AuditEvent.target_id == str(closure.id),
+            )
+        )
+        if workspace is None or workspace.state is not WorkspaceState.hibernated or done:
             await session.commit()
-            return
-        workspace.state = WorkspaceState.hibernated
-        await session.flush()
+            return False
         await audit.append(
             session,
             workspace_id=workspace_id,
@@ -226,6 +254,7 @@ async def _hibernate(
             now=now,
         )
         await session.commit()
+    return True
 
 
 async def _settle(
@@ -272,6 +301,9 @@ async def _run(
             ).all()
         )
     for workspace_id, state in workspaces:
+        if state is not WorkspaceState.closed:
+            await _freeze(sessions, workspace_id)
+        # Counted only once capture is stopped (`_freeze`): the count holds until the end.
         approved, retained = await _approve_expired(
             sessions, closure, workspace_id, locks, today, now
         )
@@ -279,9 +311,10 @@ async def _run(
         if state is not WorkspaceState.closed and (closure.takeover or retained == 0):
             await _destroy(sessions, runtime, closure, workspace_id, retained, now)
             run.destroyed += 1
-        elif state not in (WorkspaceState.closed, WorkspaceState.hibernated):
-            await _hibernate(sessions, runtime, closure, workspace_id, retained, now)
-            run.hibernated += 1
+        elif state is not WorkspaceState.closed:
+            run.hibernated += await _hibernate(
+                sessions, runtime, closure, workspace_id, retained, now
+            )
         for ledger_id in approved:
             try:
                 await send_removal(ledger_id, workspace_id)
