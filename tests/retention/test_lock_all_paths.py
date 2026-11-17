@@ -17,12 +17,24 @@ a document, for every role, on an unsealed and on a sealed document.
 | 11 API closure request, cancel, take-over (M6) | each (org) | unchanged | unchanged |
 | 11 `sijil.closure_daily`: hibernation, take-over destruction | none | unchanged | unchanged |
 | 11 Owner's take-over succeeds, grace passes, tenant destroyed | Owner | locked, kept | kept |
+| 12 API remove, approve, fields with the org read-only (unpaid) | each | refused | refused |
+| 12 hibernated workspace: reads, remove, approve, fields | each | Owner reads only | same |
+| 12 API staff `mark-paid` (a read-only org's invoice) | staff, each | unchanged | unchanged |
+| 12 API full export (`all`) and its build by the export worker | each | read, unchanged | same |
 
 Path 11 (M6, ADM-5) is account closure: its routes are the Owner's (others 403) and touch no
 document; after the grace period the closure job stops or destroys the tenant and leaves a
 document still under retention (its ledger row, index rows and original with its lock) exactly
 as it was, sending no removal. A document is approved for deletion by a closure only once its
 retention has passed, through the same ledger guard (services/worker/tests/test_closure.py).
+
+Path 12 (M6, ADM-3/4/5) is billing and hibernation. Non-payment never opens a path: with the org
+read-only every removal, approval and field edit is refused (the role first, then the document,
+then 402 `billing.read_only`). A hibernated workspace keeps its Owner's reads (list, document,
+original, search) and refuses their writes the same way; every other role gets 404. Staff
+`mark-paid` (others 404 `staff.forbidden`) lifts the restriction and touches no document. A full
+export, built in-process by the export worker, reads the original and leaves it, its lock and
+its rows exactly as they were (Members and Read-only 403).
 
 Paths 8 and 9 (M5) are the annotations and the reads: on a sealed document a tag is allowed
 (Owner, Admin, Member) and a search, a saved view or a question is every role's; none of them
@@ -824,3 +836,239 @@ async def test_closure_takeover_success_path(
         await memory_store.remove_original(row.ref, governance=False)
     assert await _snapshot(db, index_conn, memory_store, row) == before
     assert after[0]["workspace_id"] == str(ws_id)
+
+
+# Path 12 (M6): billing read-only, the hibernated workspace, staff mark-paid, full export -------
+
+
+async def _read_only(db: AsyncSession, org_id: uuid.UUID, now: datetime) -> None:
+    from sijil_core.db.models import SubscriptionStatus
+    from tests.support.billing_states import make_late
+
+    await make_late(db, org_id, now, SubscriptionStatus.read_only)
+
+
+def _gated_expected(path: str, role: Role) -> tuple[int, str]:
+    """Under the billing gate (read-only, or hibernated for its Owner): the role first, then the
+    document (an approval finds none eligible), then 402 `billing.read_only`; never a change."""
+    if path == "remove":
+        return (402, "billing.read_only") if role is Role.owner else (403, "forbidden")
+    if path == "approve":
+        return (409, "retention.not_eligible") if role is Role.owner else (403, "forbidden")
+    if path == "fields":
+        return (403, "forbidden") if role is Role.readonly else (402, "billing.read_only")
+    raise AssertionError(path)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("path", ["remove", "approve", "fields"])
+async def test_billing_read_only_path(
+    path: str, role: Role, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """An org read-only for non-payment (ADM-4): no removal, approval or field edit gets
+    through for any role, and the refusal changes nothing. Billing never opens a path."""
+    ws_id, org_id = ws.id, ws.org_id  # a rollback expires the ORM row
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    actor = await _member(make_actor, db, ws, role)
+    await _read_only(db, org_id, actor.clock.now)
+    before = await _snapshot(db, index_conn, memory_store, row)
+    locks_before = list(enqueuer.locks)  # the seal's own
+    events_before = await _events(db, ws_id)
+
+    r = await _call(actor, ws_id, row, path)
+
+    status, code = _gated_expected(path, role)
+    assert (r.status_code, r.json()["error"]["code"]) == (status, code), r.text
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert enqueuer.removals == [] and enqueuer.locks == locks_before
+    new_events = (await _events(db, ws_id))[len(events_before) :]
+    assert [a for a, _d, _t in new_events if a != REFUSED] == []
+
+
+async def _hibernate(
+    db: AsyncSession, ws: Workspace, owner_id: uuid.UUID, store: MemoryObjectStore
+) -> None:
+    """A closure whose grace period is over, and the daily job: the workspace hibernates."""
+    from sijil_core.db.models import Closure, ClosureState
+    from sijil_worker.closure import closure_daily
+
+    ws_id, org_id = ws.id, ws.org_id
+    requested = datetime.now(UTC) - timedelta(days=31)
+    db.add(
+        Closure(
+            org_id=org_id, requested_at=requested, requested_by=owner_id,
+            grace_ends_at=requested + timedelta(days=30), state=ClosureState.grace,
+        )
+    )  # fmt: skip
+    await db.commit()
+    removals: list[uuid.UUID] = []
+
+    async def send_removal(ledger_id: uuid.UUID, workspace_id: uuid.UUID) -> None:
+        removals.append(ledger_id)
+
+    await closure_daily(
+        async_sessionmaker(db.bind, expire_on_commit=False), runtime=_Runtime(),
+        locks=store, settings=SETTINGS, send_removal=send_removal,
+        now=datetime.now(UTC),
+    )  # fmt: skip
+    assert removals == []
+    state = await db.scalar(select(Workspace.state).where(Workspace.id == ws_id))
+    await db.rollback()
+    assert state is not None and state.value == "hibernated"
+
+
+async def _reads(actor: Actor, ws_id: uuid.UUID, row: Doc) -> list[int]:
+    base = f"/v1/workspaces/{ws_id}"
+    client: httpx.AsyncClient = actor.client
+    return [
+        (await client.get(f"{base}/documents")).status_code,
+        (await client.get(f"{base}/documents/{row.id}")).status_code,
+        (await client.get(f"{base}/documents/{row.id}/file")).status_code,
+        (await client.post(f"{base}/search", json={"filters": {}})).status_code,
+    ]
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("path", ["reads", "remove", "approve", "fields"])
+async def test_hibernated_path(
+    path: str, role: Role, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """A hibernated workspace (ADM-5): its Owner still lists, opens, downloads and searches a
+    document under retention, and every write of theirs meets `billing.read_only`; everyone
+    else gets 404. Nothing changes the document."""
+    ws_id = ws.id  # a rollback expires the ORM row
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    actor = await _member(make_actor, db, ws, role)
+    owner = actor if role is Role.owner else await _member(make_actor, db, ws, Role.owner)
+    await _hibernate(db, ws, owner.user_id, memory_store)
+    await actor.step_up()
+    before = await _snapshot(db, index_conn, memory_store, row)
+    locks_before = list(enqueuer.locks)  # the seal's own
+
+    if path == "reads":
+        statuses = await _reads(actor, ws_id, row)
+        assert statuses == [200 if role is Role.owner else 404] * 4
+    else:
+        r = await _call(actor, ws_id, row, path)
+        expected = _gated_expected(path, role) if role is Role.owner else (404, "not_found")
+        assert (r.status_code, r.json()["error"]["code"]) == expected, r.text
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert enqueuer.removals == [] and enqueuer.locks == locks_before
+
+
+async def _staff(make_actor: MakeActor, db: AsyncSession) -> Actor:
+    """A platform staff member (set as `sijil-cp staff grant` does), TOTP and a fresh step-up."""
+    actor = await make_actor(f"staff-{uuid.uuid4().hex[:6]}@example.com")
+    await db.execute(
+        text("UPDATE user_account SET is_staff = true WHERE id = :id"), {"id": actor.user_id}
+    )
+    await db.commit()
+    await actor.enable_totp()
+    await actor.step_up()
+    return actor
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("who", ["staff", *[r.value for r in ROLES]])
+async def test_staff_mark_paid_path(
+    who: str, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, index_conn: AsyncConnection, enqueuer: Any,
+) -> None:  # fmt: skip
+    """Staff record the transfer of a read-only org's invoice (ADM-4): the org is active again
+    and nothing of a document changes; every org role gets 404 `staff.forbidden`."""
+    from sijil_core.db.models import Invoice
+    from sijil_core.retention import region_local_date
+
+    ws_id, org_id = ws.id, ws.org_id  # a rollback expires the ORM row
+    row = await _document(state, make_actor, db, ws, memory_store, index_conn)
+    if who == "staff":
+        actor = await _staff(make_actor, db)
+    else:
+        actor = await _member(make_actor, db, ws, Role(who))
+    await _read_only(db, org_id, actor.clock.now)
+    invoice_id = await db.scalar(select(Invoice.id).where(Invoice.org_id == org_id))
+    await db.rollback()
+    before = await _snapshot(db, index_conn, memory_store, row)
+    locks_before = list(enqueuer.locks)  # the seal's own
+    events_before = await _events(db, ws_id)
+
+    paid_on = region_local_date(actor.clock.now, "ma-cas").isoformat()
+    r = await actor.client.post(
+        f"/v1/staff/invoices/{invoice_id}/mark-paid",
+        json={"payment_reference": "VIR-2026-000123", "paid_on": paid_on},  # SAMPLE
+    )
+
+    if who == "staff":
+        assert r.status_code == 200, r.text
+        assert r.json()["subscription"]["status"] == "active"
+    else:
+        assert (r.status_code, r.json()["error"]["code"]) == (404, "staff.forbidden")
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert enqueuer.removals == [] and enqueuer.locks == locks_before
+    new_events = (await _events(db, ws_id))[len(events_before) :]
+    assert all(target != str(row.id) for _action, _data, target in new_events)
+
+
+@pytest.mark.db
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("role", ROLES)
+async def test_full_export_path(
+    role: Role, state: str, make_actor: MakeActor, db: AsyncSession, ws: Workspace,
+    memory_store: MemoryObjectStore, export_store: Any, index_conn: AsyncConnection,
+    index_db_url: str, enqueuer: Any,
+) -> None:  # fmt: skip
+    """A full export (`period` `all`, ADM-5) requested and built by the export worker: the
+    document under retention is read, never changed, its lock never touched; Members and
+    Read-only get 403."""
+    from sijil_core.db.models import User
+    from tests.support.exports import add_exportable, invoice_values, run_export
+
+    ws_id = ws.id  # a rollback expires the ORM row
+    actor = await _member(make_actor, db, ws, role)
+    user = await db.get(User, actor.user_id)
+    assert user is not None
+    sealed = state == "sealed"
+    added = await add_exportable(
+        db, memory_store, index_conn, ws, user,
+        state=DocumentState.sealed if sealed else DocumentState.filed,
+        arrived=datetime.now(UTC) - timedelta(hours=2), values=invoice_values(),
+    )  # fmt: skip
+    row = Doc(added.id, ObjectRef(added.object_key, added.object_version_id))
+    sessions = async_sessionmaker(db.bind, expire_on_commit=False)
+    if sealed:
+        assert await lock_sealed(
+            row.id, sessions=sessions, store=memory_store, settings=SETTINGS,
+            now=datetime.now(UTC),
+        )  # fmt: skip
+        assert memory_store.objects[row.ref].mode == "COMPLIANCE"
+    await actor.step_up()
+    before = await _snapshot(db, index_conn, memory_store, row)
+    locks_before = list(enqueuer.locks)  # the seal's own
+
+    r = await actor.client.post(f"/v1/workspaces/{ws_id}/exports", json={"period": "all"})
+
+    if role in (Role.member, Role.readonly):
+        assert (r.status_code, r.json()["error"]["code"]) == (403, "forbidden")
+        assert enqueuer.exports == []
+    else:
+        assert r.status_code == 202, r.text
+        job = uuid.UUID(r.json()["id"])
+        assert enqueuer.exports == [job]
+        assert await run_export(
+            job, sessions=sessions, index_db_url=index_db_url, store=memory_store,
+            exports=export_store, now=datetime.now(UTC),
+        )  # fmt: skip
+        count = await db.scalar(
+            text("SELECT document_count FROM export_job WHERE id = :id"), {"id": job}
+        )
+        await db.rollback()
+        assert count == 1
+    assert await _snapshot(db, index_conn, memory_store, row) == before
+    assert enqueuer.removals == [] and enqueuer.locks == locks_before
