@@ -1,8 +1,9 @@
 """Signed period exports (plan 4.6, ARC-5, design §5.6).
 
-`POST …/exports` `{period}` (`YYYY` or `YYYY-MM`) needs `Action.documents_export` and a TOTP
-step-up on this session within 10 minutes. A malformed period, a future one or one ending
-before the workspace was created (region-local dates) is 422 `export.period_invalid`. It
+`POST …/exports` `{period}` (`YYYY` or `YYYY-MM`, or `all` for a full export of every
+non-terminal document, ADM-5) needs `Action.documents_export` and a TOTP step-up on this session
+within 10 minutes. A malformed period, a future one or one ending before the workspace was
+created (region-local dates) is 422 `export.period_invalid`. It
 creates the job (`queued`), audits `export.requested` `{period}`, commits, then sends
 `sijil.build_export` to the export worker, the only holder of the region's signing seed; 202
 `{id, state}`.
@@ -31,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import audit
 from sijil_core.db.models import ActorType, ExportJob, ExportState, User, UserSession, Workspace
-from sijil_core.export_report import key_id, period_bounds
+from sijil_core.export_report import FULL_PERIOD, key_id, period_bounds
 from sijil_core.region import assert_region
 from sijil_core.retention import region_local_date
 from sijil_core.storage import ExportStore
@@ -44,7 +45,7 @@ from sijil_cp.deps import (
 )
 from sijil_cp.enqueue import Enqueuer, get_enqueuer
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, require_workspace
+from sijil_cp.permissions import Action, WorkspaceContext, require_workspace, require_writable
 from sijil_cp.settings import CpSettings
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,10 @@ Now = Annotated[datetime, Depends(get_now)]
 CurrentUser = Annotated[User, Depends(current_user)]
 # Declared in this order on every route: the role first (403 `forbidden`), then the step-up.
 Exporting = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_export))]
+# A new export: the billing gate too (`billing.overdue` or `billing.read_only` 402).
+NewExport = Annotated[
+    WorkspaceContext, Depends(require_writable(Action.documents_export, "export"))
+]
 SteppedUp = Annotated[UserSession, Depends(require_recent_totp(STEP_UP_MINUTES))]
 Queue = Annotated[Enqueuer, Depends(get_enqueuer)]
 
@@ -103,6 +108,8 @@ def _ip(request: Request) -> str | None:
 
 def _checked_period(raw: str | None, workspace: Workspace, region: str, now: datetime) -> str:
     period = raw or ""
+    if period == FULL_PERIOD:
+        return period
     try:
         start, end = period_bounds(period)
     except ValueError:
@@ -131,7 +138,7 @@ def _out(job: ExportJob) -> ExportOut:
 async def request_export(
     body: ExportIn,
     request: Request,
-    ctx: Exporting,
+    ctx: NewExport,
     _step_up: SteppedUp,
     user: CurrentUser,
     db: Db,

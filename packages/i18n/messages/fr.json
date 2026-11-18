@@ -34,5 +34,57 @@
         "excluded": "{count, plural, one {# document en attente de vérification n'a pas été compté.} other {# documents en attente de vérification n'ont pas été comptés.}}"
       }
     }
+  },
+  "invoice": {
+    "title": "Facture",
+    "number": "N°",
+    "issued_on": "Date d'émission",
+    "due_on": "Date d'échéance",
+    "seller": "Vendeur",
+    "buyer": "Client",
+    "ice": "ICE",
+    "if": "IF",
+    "rc": "RC",
+    "tp": "TP",
+    "description": "Désignation",
+    "period": "Période",
+    "period_range": "du {start} au {end}",
+    "kind": {
+      "annual": "Abonnement annuel Sijil, offre {plan}",
+      "upgrade": "Passage à l'offre {plan} au prorata de la période restante"
+    },
+    "plan": {
+      "essentiel": "Essentiel",
+      "pro": "Pro",
+      "entreprise": "Entreprise"
+    },
+    "amount_ht": "Total HT",
+    "vat": "TVA {rate} %",
+    "amount_ttc": "Total TTC",
+    "currency": "MAD",
+    "in_words": "Arrêtée la présente facture à la somme de : {words}.",
+    "payment": "Règlement par virement bancaire",
+    "bank": "Banque",
+    "rib": "RIB",
+    "reference": "Référence à indiquer sur le virement",
+    "words": {
+      "join": "{dirhams} et {centimes}",
+      "dirham": {
+        "zero": "{n} dirham",
+        "one": "{n} dirham",
+        "two": "{n} dirhams",
+        "few": "{n} dirhams",
+        "many": "{n} de dirhams",
+        "other": "{n} dirhams"
+      },
+      "centime": {
+        "zero": "{n} centime",
+        "one": "{n} centime",
+        "two": "{n} centimes",
+        "few": "{n} centimes",
+        "many": "{n} de centimes",
+        "other": "{n} centimes"
+      }
+    }
   }
 }

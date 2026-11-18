@@ -58,8 +58,20 @@ x-objectstore-root-env: &objectstore-root-env
   SIJIL_OBJECTSTORE_EXPORT_ACCESS_KEY: ${SIJIL_OBJECTSTORE_EXPORT_ACCESS_KEY:?}
   SIJIL_OBJECTSTORE_EXPORT_SECRET_KEY: ${SIJIL_OBJECTSTORE_EXPORT_SECRET_KEY:?}
 
+# The invoices' seller (ADM-4): required, no default anywhere in code (ruling R2). The control
+# plane issues upgrade invoices, the main worker the annual ones (`sijil.billing_daily`).
+x-seller-env: &seller-env
+  SIJIL_SELLER_NAME: ${SIJIL_SELLER_NAME:?}
+  SIJIL_SELLER_ADDRESS: ${SIJIL_SELLER_ADDRESS:?}
+  SIJIL_SELLER_ICE: ${SIJIL_SELLER_ICE:?}
+  SIJIL_SELLER_IF: ${SIJIL_SELLER_IF:?}
+  SIJIL_SELLER_RC: ${SIJIL_SELLER_RC:?}
+  SIJIL_SELLER_TP: ${SIJIL_SELLER_TP:?}
+  SIJIL_SELLER_RIB: ${SIJIL_SELLER_RIB:?}
+  SIJIL_SELLER_BANK: ${SIJIL_SELLER_BANK:?}
+
 x-worker-env: &worker-env
-  <<: [*sijil-env, *objectstore-env]
+  <<: [*sijil-env, *objectstore-env, *seller-env]
   SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
   SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
   SIJIL_PROVISIONER_DATABASE_URL: postgresql+asyncpg://sijil_provisioner:${SIJIL_PROVISIONER_DB_PASSWORD:?}@postgres:5432/postgres
@@ -314,7 +326,7 @@ services:
       dockerfile: services/control-plane/Dockerfile
     restart: unless-stopped
     environment:
-      <<: [*sijil-env, *objectstore-env]
+      <<: [*sijil-env, *objectstore-env, *seller-env]
       SIJIL_DATABASE_URL: postgresql+asyncpg://sijil_cp_app:${SIJIL_CP_APP_DB_PASSWORD:?}@postgres:5432/sijil_cp
       SIJIL_MASTER_KEY: ${SIJIL_MASTER_KEY:?}
       # The region's export key, public half: published, and used to verify exports.

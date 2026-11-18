@@ -10,8 +10,9 @@ Only in this worker's region, and only for a document that a reviewer has seen (
    values (`index.effective_fields`: a correction note wins) and learns them
    (`suppliers.learn`: nothing without an ICE), in one index transaction; the source is
    `correction` when a note corrects the supplier, else `seal` once sealed, else `review`.
-   Never the workspace's own ICE (`suppliers.own_ices`, final review I2): it is no supplier,
-   so it gets no record and no correspondent.
+   Never the workspace's own ICE (`suppliers.own_ices`: the organisation's ICE when stored,
+   else the frequency guard of final review I2): it is no supplier, so it gets no record and
+   no correspondent.
    Once a reviewer confirmed the document (sealed it, or PATCHed its supplier), the names the
    model read on it with the same ICE (`extraction_run`) join the record's aliases, sanitised
    as hints are: so a supplier printed in another spelling (Arabic, abbreviated) is recognised
@@ -82,7 +83,7 @@ async def learn_from_document(
     async with sessions() as session:
         found = (
             await session.execute(
-                select(DocumentLedger, Workspace, Organisation.region)
+                select(DocumentLedger, Workspace, Organisation.region, Organisation.ice)
                 .join(Workspace, Workspace.id == DocumentLedger.workspace_id)
                 .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(DocumentLedger.id == ledger_id)
@@ -91,7 +92,7 @@ async def learn_from_document(
         ).first()
         if found is None:
             raise LookupError("document not found")
-        ledger, workspace, region = found
+        ledger, workspace, region, org_ice = found
         if workspace_id is not None and workspace.id != workspace_id:
             raise LookupError("document not found")
         # Before anything leaves the databases: this worker only serves its own region.
@@ -118,7 +119,7 @@ async def learn_from_document(
             else:
                 source, actor = "review", row.updated_by
             ice = effective.get("supplier_ice", (None, False))[0]
-            if ice is not None and ice in await suppliers.own_ices(conn, [ice]):
+            if ice is not None and ice in await suppliers.own_ices(conn, [ice], org_ice=org_ice):
                 log.info("learning of document %s skipped: the workspace's own ICE", ledger_id)
                 return False
             confirmed = ledger.sealed_at is not None or any(

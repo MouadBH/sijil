@@ -79,6 +79,31 @@ async def test_app_credential_puts_and_reads_but_never_destroys(
     await root.remove_original(ref, governance=True)
 
 
+async def test_app_credential_puts_a_takeover_statement_under_compliance(
+    app: S3ObjectStore, root: S3ObjectStore, tmp_path: Path
+) -> None:
+    """A take-over statement (ADM-5) is legal evidence: the control plane puts it with a
+    COMPLIANCE lock, which no key, not even the root key with the bypass, deletes or shortens
+    before its date. (The test object stays until tomorrow, like every locked leftover.)"""
+    path = tmp_path / "statement.pdf"
+    path.write_bytes(b"%PDF-1.7 SAMPLE statement " + uuid.uuid4().bytes)
+    key = f"it-takeover/{uuid.uuid4().hex}.pdf"
+    retain = date.today() + timedelta(days=1)
+
+    ref = await app.put_original(key, path, retain, compliance=True)
+
+    assert await root.retention(ref) == ("COMPLIANCE", retain)
+    target = {"Bucket": root.bucket, "Key": ref.key, "VersionId": ref.version_id}
+    _denied(lambda: root.client.delete_object(**target, BypassGovernanceRetention=True))
+    sooner = {"Mode": "COMPLIANCE", "RetainUntilDate": datetime.now(UTC) + timedelta(hours=1)}
+    _denied(
+        lambda: root.client.put_object_retention(
+            **target, Retention=sooner, BypassGovernanceRetention=True
+        )
+    )
+    assert await root.head(ref) == path.stat().st_size
+
+
 @pytest.mark.parametrize("service", ["control-plane", "worker", "smtp", "beat"])
 def test_running_services_hold_the_app_key_not_the_root_key(
     docker_client: docker.DockerClient, worker_settings: WorkerSettings, service: str

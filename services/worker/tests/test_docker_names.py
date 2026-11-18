@@ -66,6 +66,63 @@ def test_names_carry_no_org_name() -> None:
         runtime.paperless_name("societe-marocaine-de-distribution-et-de-commerce-sarl-ab12cd")
 
 
+def _container(role: str, running: bool) -> MagicMock:
+    container = MagicMock()
+    container.labels = {"sijil.role": role}
+    container.status = "running" if running else "exited"
+    return container
+
+
+async def test_stop_stops_only_the_tenant_containers_and_keeps_everything_else() -> None:
+    """Hibernation (ADM-5): the tenant's containers stop; nothing is removed, so its volumes,
+    network and databases stay for `start`."""
+    runtime, client = _runtime("sijil")
+    ref = tenant_ref(uuid.uuid4())
+    redis, paperless = _container("redis", True), _container("paperless", True)
+    client.containers.list.return_value = [paperless, redis]
+    await runtime.stop(ref)
+    client.containers.list.assert_called_once_with(
+        all=True, filters={"label": f"sijil.tenant={ref}"}
+    )
+    paperless.stop.assert_called_once()
+    redis.stop.assert_called_once()
+    for container in (redis, paperless):
+        container.remove.assert_not_called()
+    client.networks.assert_not_called()
+    client.volumes.assert_not_called()
+
+
+async def test_start_starts_redis_before_paperless_and_skips_running_ones() -> None:
+    runtime, client = _runtime("sijil")
+    ref = tenant_ref(uuid.uuid4())
+    order: list[str] = []
+    redis, paperless = _container("redis", False), _container("paperless", False)
+    redis.start.side_effect = lambda: order.append("redis")
+    paperless.start.side_effect = lambda: order.append("paperless")
+    client.containers.list.return_value = [paperless, redis]
+    await runtime.start(ref)
+    assert order == ["redis", "paperless"]
+    running = _container("paperless", True)
+    client.containers.list.return_value = [running]
+    await runtime.start(ref)
+    running.start.assert_not_called()
+
+
+async def test_start_of_an_absent_tenant_is_refused() -> None:
+    runtime, client = _runtime("sijil")
+    client.containers.list.return_value = []
+    with pytest.raises(LookupError):
+        await runtime.start(tenant_ref(uuid.uuid4()))
+
+
+async def test_stop_and_start_refuse_a_bad_ref_before_any_call() -> None:
+    runtime, client = _runtime("sijil")
+    for call in (runtime.stop, runtime.start):
+        with pytest.raises(ValueError, match="invalid tenant ref"):
+            await call("not-a-ref")
+    assert client.mock_calls == []
+
+
 async def test_overlong_hostname_refused_before_creating_anything() -> None:
     runtime, client = _runtime("p" * 40)
     with pytest.raises(ValueError, match="hostname"):

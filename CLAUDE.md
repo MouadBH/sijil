@@ -34,7 +34,7 @@ Sijil is a hosted compliance archive for Moroccan SMEs, built beside an **unmodi
 | `apps/site` | Next.js 15 marketing site, static export |
 | `packages/i18n` | Message catalogues + `locales`, `dirFor()` |
 | `services/control-plane` | `sijil_cp`: FastAPI, SQLAlchemy 2 (async), Alembic |
-| `services/worker` | `sijil_worker`: Celery (queues `default`, `provisioning`, `ingest`, `extraction`, `embedding`, `ask`, `seal`, `removal`, `export`). Compose runs it as `worker` (`default`, `provisioning`, `ingest`; Docker socket; purges removed documents in Paperless and the index; search upkeep and supplier learning), `worker-extraction` (`extraction,embedding`, concurrency 1, the models), `worker-ask` (`ask`, concurrency 1, Ask; `core` and `ai` networks only), `worker-seal` (`seal`, the only holder of the sealing key), `worker-removal` (`removal`, concurrency 1, the only holder of the removal key: the only service that deletes an original), `worker-export` (`export`, the only holder of the export key and the region's signing seed), `smtp` and `beat`. The seal, removal and export workers are on the `core` network only |
+| `services/worker` | `sijil_worker`: Celery (queues `default`, `provisioning`, `ingest`, `extraction`, `embedding`, `ask`, `seal`, `removal`, `export`). Compose runs it as `worker` (`default`, `provisioning`, `ingest`; Docker socket; purges removed documents in Paperless and the index; search upkeep and supplier learning; the daily billing and closure jobs), `worker-extraction` (`extraction,embedding`, concurrency 1, the models), `worker-ask` (`ask`, concurrency 1, Ask; `core` and `ai` networks only), `worker-seal` (`seal`, the only holder of the sealing key), `worker-removal` (`removal`, concurrency 1, the only holder of the removal key: the only service that deletes an original), `worker-export` (`export`, the only holder of the export key and the region's signing seed), `smtp` and `beat` (its daily jobs, in the region's time zone, include `sijil.billing_daily` at 01:00: invoices, renewals, overdue and read-only; and `sijil.closure_daily` at 02:15: closures past their grace period, hibernated or destroyed). The seal, removal and export workers are on the `core` network only |
 | `libs/sijil-core` | `sijil_core`: anything both Python services use (settings, region, crypto, Paperless client) |
 | `infra/compose` | Local stack; tenants live on the internal `tenants` network with no published ports |
 | `fixtures/` | **Sample data only**, fictitious companies and ICE numbers |
@@ -49,9 +49,11 @@ make up         # boot the compose stack (copies .env.example on first run)
 make smoke      # assert every service is healthy and tenants are not exposed
 make models     # pull the models (qwen3:4b: extraction and Ask; bge-m3: embeddings) into the ollama volume, once
 make seed       # 12 SAMPLE invoices (6 via the API, 6 by email) into the SAMPLE workspace; idempotent,
-                # prints the workspace id, then waits until all are routed and prints filed/review counts
+                # prints the workspace id, then waits until all are routed and prints filed/review counts.
+                # Also gives the SAMPLE org a SAMPLE ICE and pays its invoices, so its AI never stops;
+                # run it again after a renewal
 make eval WS=…  # per-field extraction accuracy (fr, ar, all) on the SAMPLE set in workspace WS; read-only
-make itest      # integration tests in the compose `tests` runner, except `slow` (includes the M1/M2/M4/M5 acceptance
+make itest      # integration tests in the compose `tests` runner, except `slow` (includes the M1/M2/M4/M5/M6 acceptance
                 # and the lock suite's Paperless and object-store paths)
 make acceptance # the `slow` integration tests: the M3 acceptance (18 documents through the model, up to 45 min),
                 # Ask and embeddings on the real models, the 100k-row search perf test
@@ -62,10 +64,12 @@ make down ARGS=-v
 - The retention-lock suite: `uv run pytest tests/retention -v` (needs `SIJIL_TEST_DATABASE_URL`); its `test_lock_all_paths.py` is the role × path matrix.
 - An export ZIP: `sijil-cp export verify <zip> [--against-ledger]` prints `ok` or one problem code per line.
 - A workspace's search index rebuilt (text, fields, embeddings): `sijil-cp search backfill <workspace id>` sends `sijil.search_backfill` to the worker.
+- Platform staff (the hidden `/v1/staff` API: mark a transfer paid): `sijil-cp staff grant <email>` and `sijil-cp staff revoke <email>`, audited on the platform's own chain. Staff also need TOTP.
+- Invoices need the seller's identity: `SIJIL_SELLER_NAME`, `_ADDRESS`, `_ICE`, `_IF`, `_RC`, `_TP`, `_RIB`, `_BANK`, required with no default by the control plane and the worker. `infra/compose/.env.example` carries SAMPLE values, and `make up` adds missing keys to an older `.env`.
 - The slow Ask test alone (real models, its own workspace; never the SAMPLE one): `docker compose -f infra/compose/docker-compose.yml --env-file infra/compose/.env --profile test run --rm --build tests uv run --frozen pytest tests/integration/test_ask_model.py -m "integration and slow" -s -v`.
 - Single JS test: `pnpm --filter web exec vitest run path`.
 - Mark a model-bound integration test `@pytest.mark.slow` so `make itest` stays usable day to day.
-- An integration test that creates a workspace appends its id to the `created_workspaces` fixture (or uses the t1 `harness`), which marks it `closing` at teardown: only `active` workspaces extract.
+- An integration test that creates a workspace appends its id to the `created_workspaces` fixture (or uses the t1 `harness`). At teardown the fixture marks it `closing` (only `active` workspaces extract) and stops its tenant's containers through `TenantRuntime.stop` (containers, volumes and databases stay, as for a hibernated workspace), so a run never leaves Paperless running. A test that runs `closure_daily` gets the real Docker runtime from the `docker_runtime` fixture and destroys its own tenants; the job serves the whole region, so read a workspace's outcome from its own state, not from the run's counts.
 
 ## Working
 

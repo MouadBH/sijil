@@ -41,14 +41,14 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import Select, func, select, tuple_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, AsyncTransaction
 
@@ -67,11 +67,18 @@ from sijil_core.index import FieldsChanged, FieldsRow, IndexEngines, RetentionLo
 from sijil_core.pending import EMBED_PREFIX, LOCK_PREFIX, PENDING_TTL_S, pending_key
 from sijil_core.retention import REGION_TZ, fiscal_retain_until, policy_years, retention_basis
 from sijil_core.search_index import SearchLedgerFacts, refresh_search_doc
-from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone
+from sijil_cp.api.documents import TOMBSTONES, TombstoneOut, tombstone, visible_rows
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, require_workspace
+from sijil_cp.permissions import (
+    Action,
+    WorkspaceContext,
+    ensure_visible,
+    hidden_ids,
+    require_workspace,
+    require_writable,
+)
 
 log = logging.getLogger(__name__)
 
@@ -83,6 +90,10 @@ Now = Annotated[datetime, Depends(get_now)]
 Reading = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_read))]
 Reviewing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_review))]
 Sealing = Annotated[WorkspaceContext, Depends(require_workspace(Action.documents_seal))]
+# State-changing routes: the same roles, then the billing gate (`require_writable`, ADM-4).
+Editing = Annotated[WorkspaceContext, Depends(require_writable(Action.documents_review))]
+SealWriting = Annotated[WorkspaceContext, Depends(require_writable(Action.documents_seal))]
+ReadWriting = Annotated[WorkspaceContext, Depends(require_writable(Action.documents_read))]
 
 LOCKED: Final = "retention.locked"
 SEAL_UNFINISHED: Final = "seal.incomplete"
@@ -274,15 +285,19 @@ async def review_queue(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> ReviewPage:
     workspace = ctx.workspace
-    query = select(DocumentLedger).where(
-        DocumentLedger.workspace_id == workspace.id,
-        DocumentLedger.state == DocumentState.needs_review,
-    )
-    if cursor is not None:
-        at, last_id = _decode_cursor(cursor)
-        query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (at, last_id))
-    query = query.order_by(DocumentLedger.ingested_at, DocumentLedger.id).limit(limit + 1)
-    rows = list((await db.scalars(query)).all())
+    start = _decode_cursor(cursor) if cursor is not None else None
+
+    def page(after: DocumentLedger | None) -> Select[DocumentLedger]:
+        query = select(DocumentLedger).where(
+            DocumentLedger.workspace_id == workspace.id,
+            DocumentLedger.state == DocumentState.needs_review,
+        )
+        key = (after.ingested_at, after.id) if after is not None else start
+        if key is not None:
+            query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > key)
+        return query.order_by(DocumentLedger.ingested_at, DocumentLedger.id)
+
+    rows = await visible_rows(request, ctx, db, page, limit + 1)
     more = len(rows) > limit
     rows = rows[:limit]
     async with (await _engines(request).engine(workspace)).connect() as conn:
@@ -322,6 +337,7 @@ async def get_fields(
     )
     if ledger is None:
         raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, ledger)
     dead = ledger.state in TOMBSTONES
     row: FieldsRow | None = None
     notes: list[index_db.Correction] = []
@@ -368,13 +384,14 @@ async def edit_fields(
     doc_id: UUID,
     body: FieldsPatch,
     request: Request,
-    ctx: Reviewing,
+    ctx: Editing,
     user: CurrentUser,
     db: Db,
     now: Now,
 ) -> FieldsOut:
     workspace = ctx.workspace
     ledger = await _locked_ledger(db, workspace, doc_id)
+    await ensure_visible(request, ctx, ledger)
     _refuse_unless_reviewable(ledger)
     values = _parsed(body.fields)
     names = sorted(values)
@@ -631,10 +648,11 @@ async def _sealer(
 
 @router.post("/workspaces/{workspace_id}/documents/{doc_id}/seal", response_model=FieldsOut)
 async def seal_document(
-    doc_id: UUID, request: Request, ctx: Sealing, user: CurrentUser, db: Db, now: Now
+    doc_id: UUID, request: Request, ctx: SealWriting, user: CurrentUser, db: Db, now: Now
 ) -> FieldsOut:
     sealer = await _sealer(request, db, ctx.workspace, user, now)
     ledger = await _locked_ledger(db, ctx.workspace, doc_id)
+    await ensure_visible(request, ctx, ledger)
     out = await _seal_locked(db, sealer, ledger)
     await _after_commit(request, ledger.id, sealer.workspace_id)
     return out
@@ -664,9 +682,36 @@ def _failure_code(exc: Exception) -> str:
     return SEAL_FAILED
 
 
+async def _visible_batch(
+    request: Request, ctx: WorkspaceContext, db: AsyncSession, where: list[Any], limit: int
+) -> list[tuple[UUID, datetime]]:
+    """Up to `limit` (id, arrival) of the rows matching `where` that the caller's grant shows,
+    oldest first, reading further batches past the hidden ones."""
+    found: list[tuple[UUID, datetime]] = []
+    after: list[Any] = []
+    while len(found) < limit:
+        batch = (
+            await db.execute(
+                select(DocumentLedger.id, DocumentLedger.ingested_at, DocumentLedger.uploaded_by)
+                .where(*where, *after)
+                .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
+                .limit(limit)
+            )
+        ).all()
+        hidden = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in batch])
+        found += [(r.id, r.ingested_at) for r in batch if r.id not in hidden]
+        if len(batch) < limit:
+            break
+        last = batch[-1]
+        after = [
+            tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (last.ingested_at, last.id)
+        ]
+    return found[:limit]
+
+
 @router.post("/workspaces/{workspace_id}/seal-batch", response_model=SealBatchOut)
 async def seal_batch(
-    body: SealBatchIn, request: Request, ctx: Sealing, user: CurrentUser, db: Db, now: Now
+    body: SealBatchIn, request: Request, ctx: SealWriting, user: CurrentUser, db: Db, now: Now
 ) -> SealBatchOut:
     """Seals the month's `filed` documents (region-local arrival), oldest first, at most
     SEAL_BATCH_LIMIT per call, each in its own transaction through the single seal's code.
@@ -689,16 +734,9 @@ async def seal_batch(
     if body.cursor is not None:
         at, last_id = _decode_batch_cursor(body.cursor)
         in_month.append(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (at, last_id))
-    rows = list(
-        (
-            await db.execute(
-                select(DocumentLedger.id, DocumentLedger.ingested_at)
-                .where(*in_month)
-                .order_by(DocumentLedger.ingested_at, DocumentLedger.id)
-                .limit(SEAL_BATCH_LIMIT)
-            )
-        ).all()
-    )
+    # A document the caller's grant hides is neither sealed, reported, counted, nor ever the
+    # cursor (which names its row): only the visible rows are read on.
+    rows = await _visible_batch(request, ctx, db, in_month, SEAL_BATCH_LIMIT)
     await db.commit()
     sealed = 0
     skipped: list[Skipped] = []
@@ -720,7 +758,16 @@ async def seal_batch(
     if rows:
         last_id, last_at = rows[-1]
         after = tuple_(DocumentLedger.ingested_at, DocumentLedger.id) > (last_at, last_id)
-        remaining = int(await db.scalar(select(func.count()).where(*in_month, after)) or 0)
+        if ctx.document_types is None:
+            remaining = int(await db.scalar(select(func.count()).where(*in_month, after)) or 0)
+        else:
+            rest = (
+                await db.execute(
+                    select(DocumentLedger.id, DocumentLedger.uploaded_by).where(*in_month, after)
+                )
+            ).all()
+            unseen = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in rest])
+            remaining = len(rest) - len(unseen)
         if remaining:
             next_cursor = _batch_cursor(last_at, last_id)
     return SealBatchOut(

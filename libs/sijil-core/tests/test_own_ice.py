@@ -100,3 +100,13 @@ async def test_the_count_uses_the_trigram_index(conn: AsyncConnection) -> None:
     )
     await conn.execute(text("RESET enable_seqscan"))
     assert "search_doc_content_trgm" in plan, plan
+
+
+async def test_the_org_ice_comes_first(conn: AsyncConnection) -> None:
+    """With the organisation's ICE stored, it alone is the own ICE, from the first document;
+    the frequency guard is only the fallback for an org without one."""
+    assert await suppliers.own_ices(conn, [OWN, OTHER], org_ice=OWN) == {OWN}
+    await _documents(conn, 6, 6)  # OTHER and OWN on every document
+    assert await suppliers.own_ices(conn, [OWN, OTHER], org_ice=OWN) == {OWN}
+    assert await suppliers.own_ices(conn, [OTHER], org_ice=OWN) == frozenset()
+    assert await suppliers.own_ices(conn, [OWN, OTHER]) == {OWN, OTHER}

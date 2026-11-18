@@ -40,4 +40,13 @@ class TenantRuntime(Protocol):
 
     async def status(self, ref: str) -> TenantStatus: ...
 
+    async def stop(self, ref: str) -> None:
+        """Stops the tenant's containers and keeps everything else (volumes, network,
+        databases) for `start`: a hibernated workspace (ADM-5)."""
+        ...
+
+    async def start(self, ref: str) -> None:
+        """Starts a stopped tenant's containers again. LookupError when it has none."""
+        ...
+
     async def destroy(self, ref: str) -> None: ...

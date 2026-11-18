@@ -1,5 +1,6 @@
 import uuid
 from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Final
 
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -20,7 +22,7 @@ from sqlalchemy import (
     false,
     text,
 )
-from sqlalchemy.dialects.postgresql import CITEXT, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from sijil_core.db.base import Base, utcnow
@@ -44,6 +46,8 @@ class WorkspaceState(StrEnum):
     hibernated = "hibernated"
     closing = "closing"
     error = "error"
+    # 0018 (ADM-5): destroyed after an account closure; the ledger rows stay as tombstones.
+    closed = "closed"
 
 
 class Role(StrEnum):
@@ -119,6 +123,13 @@ class ExportState(StrEnum):
     expired = "expired"
 
 
+class ClosureState(StrEnum):
+    grace = "grace"
+    hibernated = "hibernated"
+    destroyed = "destroyed"
+    cancelled = "cancelled"
+
+
 class IngestState(StrEnum):
     queued = "queued"
     sending = "sending"
@@ -132,10 +143,33 @@ class DocumentSource(StrEnum):
     email = "email"
 
 
+class SubscriptionStatus(StrEnum):
+    # 0015 (ADM-3, ADM-4): every status is defined now so the column migrates once; Task 3
+    # gives `overdue` and `read_only` their behaviour (ruling R1).
+    trial = "trial"
+    active = "active"
+    overdue = "overdue"
+    read_only = "read_only"
+    closed = "closed"
+
+
+class InvoiceKind(StrEnum):
+    annual = "annual"
+    upgrade = "upgrade"
+
+
+class InvoiceState(StrEnum):
+    issued = "issued"
+    overdue = "overdue"
+    paid = "paid"
+
+
 class ActorType(StrEnum):
     user = "user"
     system = "system"
     email = "email"
+    # 0017: a platform operator at the `sijil-cp` command line (e.g. `staff grant`); no user id.
+    platform = "platform"
 
 
 def _enum(cls: type[StrEnum]) -> Enum:
@@ -163,6 +197,7 @@ def _tstz() -> Mapped[datetime | None]:
 
 class Organisation(Base):
     __tablename__ = "organisation"
+    __table_args__ = (CheckConstraint("ice ~ '^[0-9]{15}$'", name="ice_format"),)
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     created_at: Mapped[datetime] = _created_at()
@@ -173,6 +208,9 @@ class Organisation(Base):
     region: Mapped[str] = mapped_column(String)
     status: Mapped[OrgStatus] = mapped_column(_enum(OrgStatus), default=OrgStatus.active)
     require_totp: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # 0015 (ADM-3): the organisation's ICE, 15 digits; required to choose a plan, and the first
+    # own-ICE guard of extraction and learning (`sijil_core.suppliers.own_ices`).
+    ice: Mapped[str | None] = mapped_column(String(15))
 
 
 class Workspace(Base):
@@ -230,6 +268,8 @@ class User(Base):
     totp_secret: Mapped[bytes | None] = mapped_column(LargeBinary)
     totp_pending: Mapped[bytes | None] = mapped_column(LargeBinary)
     totp_last_step: Mapped[int | None] = mapped_column(Integer)
+    # 0017 (ADM-4): platform staff (the `/v1/staff` API), set only by `sijil-cp staff grant`.
+    is_staff: Mapped[bool] = mapped_column(default=False, server_default=false())
 
     @validates("email")
     def _normalise_email(self, _key: str, value: str) -> str:
@@ -244,6 +284,12 @@ class Membership(Base):
         ),
         UniqueConstraint("user_id", "org_id", name="uq_membership_user_org"),
         UniqueConstraint("user_id", "workspace_id", name="uq_membership_user_workspace"),
+        # A grant restricts a Member or a Read-only user only, and names at least one type.
+        CheckConstraint(
+            "document_types IS NULL OR (role IN ('member', 'readonly')"
+            " AND cardinality(document_types) >= 1)",
+            name="document_types_restricted",
+        ),
     )
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -252,6 +298,8 @@ class Membership(Base):
     org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organisation.id"), index=True)
     workspace_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("workspace.id"), index=True)
     role: Mapped[Role] = mapped_column(_enum(Role))
+    # 0014 (ADM-1): the document types a Member or Read-only user may see; NULL means all.
+    document_types: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
 
 
 class UserSession(Base):
@@ -428,6 +476,28 @@ class AuditEvent(Base):
     hash: Mapped[str] = mapped_column(String(64), unique=True)
 
 
+class PlatformAuditEvent(Base):
+    """The platform's own audit chain (0017), for events that belong to no organisation (a
+    staff grant): one chain, hashed and append-only like `AuditEvent`
+    (`sijil_core.audit.append_platform`). The app role has no UPDATE/DELETE grant."""
+
+    __tablename__ = "platform_audit_event"
+    __table_args__ = (UniqueConstraint("seq", name="uq_platform_audit_event_seq"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    seq: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    actor_type: Mapped[ActorType] = mapped_column(_enum(ActorType))
+    actor_id: Mapped[str | None] = mapped_column(String)
+    action: Mapped[str] = mapped_column(String)
+    target_type: Mapped[str | None] = mapped_column(String)
+    target_id: Mapped[str | None] = mapped_column(String)
+    ip: Mapped[str | None] = mapped_column(String)
+    data: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str] = mapped_column(String(64), unique=True)
+
+
 class IntegrityAlert(Base):
     __tablename__ = "integrity_alert"
 
@@ -444,13 +514,16 @@ class IntegrityAlert(Base):
 
 
 class ExportJob(Base):
-    """A period export (ARC-5): built by the export worker into the exports bucket at
-    `object_key` (`<workspace_id>/<job_id>.zip`). The app role has SELECT, INSERT and UPDATE
-    only (0012). Holds no content: the period, the ZIP's hash and size, a count."""
+    """A period export (ARC-5), or a full one (`period` `all`, 0018): built by the export
+    worker into the exports bucket at `object_key` (`<workspace_id>/<job_id>.zip`). The app
+    role has SELECT, INSERT and UPDATE only (0012). Holds no content: the period, the ZIP's
+    hash and size, a count."""
 
     __tablename__ = "export_job"
     __table_args__ = (
-        CheckConstraint(r"period ~ '^[0-9]{4}(-(0[1-9]|1[0-2]))?$'", name="period_format"),
+        CheckConstraint(
+            r"period = 'all' OR period ~ '^[0-9]{4}(-(0[1-9]|1[0-2]))?$'", name="period_format"
+        ),
         CheckConstraint(
             "state IN ('queued', 'building', 'ready', 'failed', 'expired')", name="state_known"
         ),
@@ -474,3 +547,229 @@ class ExportJob(Base):
     error_code: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = _created_at()
     ready_at: Mapped[datetime | None] = _tstz()
+
+
+class ExportDocument(Base):
+    """A document a ready export holds (0019, final review I1): written with the job's `ready`,
+    write-once (the app role has SELECT and INSERT only). A take-over destroys a workspace only
+    when its newest built full export holds every live document (`sijil_core.closure`)."""
+
+    __tablename__ = "export_document"
+
+    export_job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("export_job.id"), primary_key=True)
+    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("document_ledger.id"), primary_key=True)
+
+
+class Plan(Base):
+    """A plan of the catalogue (0015, seeded; edited only by migration). Users and storage are
+    current totals; documents and AI pages are counted per billing year."""
+
+    __tablename__ = "plan"
+    __table_args__ = (
+        CheckConstraint("price_ht >= 0", name="price_non_negative"),
+        CheckConstraint(
+            "max_users > 0 AND max_documents_year > 0 AND max_storage_bytes > 0"
+            " AND max_ai_pages_year > 0",
+            name="quotas_positive",
+        ),
+    )
+
+    code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # MAD, excluding VAT.
+    price_ht: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    max_users: Mapped[int] = mapped_column(Integer)
+    max_documents_year: Mapped[int] = mapped_column(Integer)
+    max_storage_bytes: Mapped[int] = mapped_column(BigInteger)
+    max_ai_pages_year: Mapped[int] = mapped_column(Integer)
+    active: Mapped[bool] = mapped_column(default=True)
+
+
+class Subscription(Base):
+    """One per organisation (0015). The billing year is `[period_start, period_end)`; during
+    the trial it is the trial itself, and the first year starts at `trial_ends_at`."""
+
+    __tablename__ = "subscription"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('trial', 'active', 'overdue', 'read_only', 'closed')", name="status_known"
+        ),
+        CheckConstraint("period_end > period_start", name="period_ordered"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    created_at: Mapped[datetime] = _created_at()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"), unique=True)
+    plan_code: Mapped[str] = mapped_column(ForeignKey("plan.code"))
+    status: Mapped[SubscriptionStatus] = mapped_column(
+        _enum(SubscriptionStatus), default=SubscriptionStatus.trial
+    )
+    trial_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # A downgrade waits for the renewal, which applies it (`sijil_core.billing.advance`).
+    pending_plan_code: Mapped[str | None] = mapped_column(ForeignKey("plan.code"))
+    # 0016: why the status is what it is, when the status alone does not say
+    # (`org.ice_required`: the trial ended with no ICE to invoice).
+    status_reason: Mapped[str | None] = mapped_column(String(64))
+
+
+class UsageRecord(Base):
+    """Metered usage (0015): the AI pages of one document, written once by the extraction
+    worker when it calls the model. The app role may not UPDATE or DELETE it."""
+
+    __tablename__ = "usage_record"
+    __table_args__ = (
+        UniqueConstraint("ledger_id", "kind", name="uq_usage_record_ledger_kind"),
+        CheckConstraint("kind IN ('ai_pages')", name="kind_known"),
+        CheckConstraint("quantity > 0", name="quantity_positive"),
+        Index("ix_usage_record_org_at", "org_id", "at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspace.id"))
+    ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("document_ledger.id"))
+    kind: Mapped[str] = mapped_column(String(32))
+    quantity: Mapped[int] = mapped_column(Integer)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class QuotaWarning(Base):
+    """A quota warning already given (0015): once per org, quota, threshold and billing year
+    (`period_start`), whoever notices it first; the unique key makes concurrent ones one."""
+
+    __tablename__ = "quota_warning"
+    __table_args__ = (
+        UniqueConstraint(
+            "org_id", "kind", "threshold", "period_start", name="uq_quota_warning_once"
+        ),
+        CheckConstraint("threshold IN (80, 100)", name="threshold_known"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    kind: Mapped[str] = mapped_column(String(32))
+    threshold: Mapped[int] = mapped_column(Integer)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class InvoiceCounter(Base):
+    """The last invoice number given in a calendar year of issue (0016): locked FOR UPDATE in
+    the issuing transaction, so numbers are gapless and a rollback gives its number back."""
+
+    __tablename__ = "invoice_counter"
+    __table_args__ = (CheckConstraint("last >= 0", name="last_non_negative"),)
+
+    year: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last: Mapped[int] = mapped_column(Integer)
+
+
+class Invoice(Base):
+    """An invoice in MAD (0016, ADM-4): `SIJ-{YYYY}-{NNNNNN}`. Everything but its payment
+    (`state`, `paid_at`, `payment_reference`) is frozen at issue, the buyer and seller as
+    snapshots and the PDF with its SHA-256; a trigger refuses any other change, and the app role
+    may not DELETE it."""
+
+    __tablename__ = "invoice"
+    __table_args__ = (
+        CheckConstraint("kind IN ('annual', 'upgrade')", name="kind_known"),
+        CheckConstraint("state IN ('issued', 'overdue', 'paid')", name="state_known"),
+        CheckConstraint("currency = 'MAD'", name="currency_mad"),
+        CheckConstraint("amount_ttc = amount_ht + amount_vat", name="ttc_is_ht_plus_vat"),
+        CheckConstraint("amount_ht >= 0 AND amount_vat >= 0", name="amounts_non_negative"),
+        CheckConstraint("number ~ '^SIJ-[0-9]{4}-[0-9]{6}$'", name="number_format"),
+        CheckConstraint("period_end > period_start", name="period_ordered"),
+        CheckConstraint("(state = 'paid') = (paid_at IS NOT NULL)", name="paid_at_iff_paid"),
+        UniqueConstraint("number", name="uq_invoice_number"),
+        Index("ix_invoice_org_issued", "org_id", "issued_at"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    number: Mapped[str] = mapped_column(String(16))
+    year: Mapped[int] = mapped_column(Integer)
+    kind: Mapped[InvoiceKind] = mapped_column(_enum(InvoiceKind))
+    plan_code: Mapped[str] = mapped_column(ForeignKey("plan.code"))
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    amount_ht: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    vat_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2))
+    amount_vat: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    amount_ttc: Mapped[Decimal] = mapped_column(Numeric(14, 2))
+    currency: Mapped[str] = mapped_column(String(3))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = _tstz()
+    payment_reference: Mapped[str | None] = mapped_column(String(128))
+    state: Mapped[InvoiceState] = mapped_column(_enum(InvoiceState), default=InvoiceState.issued)
+    buyer: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    seller: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    locale: Mapped[Locale] = mapped_column(_enum(Locale))
+    pdf: Mapped[bytes] = mapped_column(LargeBinary)
+    pdf_sha256: Mapped[str] = mapped_column(String(64))
+
+
+class Closure(Base):
+    """An organisation's closure request (0018, ADM-5): `grace` for GRACE_DAYS, then
+    `hibernated` (documents still under retention) or `destroyed`; `cancelled` by the Owner
+    during the grace period. At most one per org is open (any state but `cancelled`). The app
+    role may not DELETE it. `export_job_id` is the full export queued with the request for the
+    org's first workspace (one is queued for each)."""
+
+    __tablename__ = "closure"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('grace', 'hibernated', 'destroyed', 'cancelled')", name="state_known"
+        ),
+        CheckConstraint("grace_ends_at > requested_at", name="grace_ordered"),
+        CheckConstraint(
+            "(state = 'cancelled') = (cancelled_at IS NOT NULL)"
+            " AND (cancelled_at IS NULL) = (cancelled_by IS NULL)",
+            name="cancel_consistent",
+        ),
+        Index(
+            "uq_closure_org_open",
+            "org_id",
+            unique=True,
+            postgresql_where=text("state <> 'cancelled'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_account.id"))
+    grace_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    export_job_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("export_job.id"))
+    state: Mapped[ClosureState] = mapped_column(_enum(ClosureState), default=ClosureState.grace)
+    cancelled_at: Mapped[datetime | None] = _tstz()
+    cancelled_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("user_account.id"))
+    hibernated_at: Mapped[datetime | None] = _tstz()
+    destroyed_at: Mapped[datetime | None] = _tstz()
+
+
+class TakeoverStatement(Base):
+    """The Owner's signed take-over statement (0018, design §7 item 11): the PDF is in the
+    object store, write-once under its own lock, at `object_key`/`object_version_id`; this row
+    holds its SHA-256 and is write-once too (the app role has SELECT and INSERT only). One per
+    closure."""
+
+    __tablename__ = "takeover_statement"
+    __table_args__ = (
+        UniqueConstraint("closure_id"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="sha256_hex"),
+        CheckConstraint("size_bytes > 0", name="size_positive"),
+    )
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    closure_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("closure.id"))
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organisation.id"))
+    signed_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_account.id"))
+    signer_name: Mapped[str] = mapped_column(String(200))
+    signer_capacity: Mapped[str] = mapped_column(String(200))
+    object_key: Mapped[str] = mapped_column(String)
+    object_version_id: Mapped[str] = mapped_column(String)
+    sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = _created_at()

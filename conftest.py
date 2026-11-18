@@ -39,6 +39,8 @@ APP_ROLE = "sijil_test_app"
 OWNER_PASSWORD = "test-owner"  # noqa: S105
 APP_PASSWORD = "test-app"  # noqa: S105
 SKIP_REASON = "set SIJIL_TEST_DATABASE_URL"
+# Seeded by the migrations (the plan catalogue, 0015): kept between tests.
+SEEDED_TABLES = frozenset({"plan"})
 
 
 @dataclass(frozen=True)
@@ -162,7 +164,9 @@ async def db(migrated_db: TestDb) -> AsyncIterator[AsyncSession]:
     async with make_sessionmaker(engine)() as session:
         yield session
         await session.rollback()
-    tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
+    tables = ", ".join(
+        f'"{t.name}"' for t in Base.metadata.sorted_tables if t.name not in SEEDED_TABLES
+    )
     async with owner.connect() as conn:
         await conn.execute(text(f"TRUNCATE {tables} CASCADE"))
     await owner.dispose()

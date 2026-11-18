@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Final
 from uuid import UUID, uuid4
 
 from sqlalchemy import select, text
@@ -38,6 +38,7 @@ from sijil_core.db.models import (
     DocumentState,
     IngestState,
     Workspace,
+    WorkspaceState,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES, sniff
 from sijil_core.retention import (
@@ -83,6 +84,18 @@ class Unsupported(IngestError):
 
 class Empty(IngestError):
     code = "upload.empty"
+
+
+class WorkspaceNotAccepting(IngestError):
+    """The workspace stopped capture (a closed account, ADM-5) before the row was written.
+    Checked under the workspace row (FOR SHARE) in the insert's transaction, so it serialises
+    with the closure job's freeze: a row is either counted by it or never written."""
+
+    code = "workspace.not_ready"
+
+
+# Capture is open in these workspace states only.
+CAPTURING: Final = frozenset({WorkspaceState.provisioning, WorkspaceState.active})
 
 
 @dataclass(frozen=True)
@@ -234,6 +247,11 @@ async def accept_file(
         await asyncio.to_thread(spooled.path.unlink, missing_ok=True)
 
     async with sessions() as db:
+        state = await db.scalar(
+            select(Workspace.state).where(Workspace.id == workspace_id).with_for_update(read=True)
+        )
+        if state not in CAPTURING:
+            raise WorkspaceNotAccepting
         document_id: UUID | None = await db.scalar(
             insert(DocumentLedger)
             .values(

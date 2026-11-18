@@ -1,6 +1,8 @@
 """`sijil-cp` console entry: `serve` runs the API, `bootstrap-storage` prepares the object store,
-`audit verify` recomputes a workspace's audit chain, `export verify` checks an export ZIP and
-`search backfill` has the worker rebuild a workspace's search index."""
+`audit verify` recomputes a workspace's audit chain (`--workspace <id>`) or the platform's
+(`--platform`), `export verify` checks an export ZIP,
+`search backfill` has the worker rebuild a workspace's search index and `staff grant|revoke`
+sets who is platform staff."""
 
 import argparse
 import asyncio
@@ -28,6 +30,7 @@ from sijil_cp.storage_admin import (
 )
 
 if TYPE_CHECKING:
+    from sijil_core.audit import VerifyResult
     from sijil_cp.enqueue import Enqueuer
     from sijil_cp.settings import CpSettings
 
@@ -110,8 +113,39 @@ def audit_verify(workspace_id: UUID, settings: "CpSettings | None" = None) -> in
     if result is None:
         print("unknown workspace", file=sys.stderr)  # noqa: T201
         return 2
+    return _print_verdict(result)
+
+
+def _print_verdict(result: "VerifyResult") -> int:
     print(f"ok {result.count}" if result.ok else f"broken at seq {result.first_bad_seq}")  # noqa: T201
     return 0 if result.ok else 1
+
+
+def audit_verify_platform(settings: "CpSettings | None" = None) -> int:
+    """Recompute the platform's audit chain (events of no organisation, e.g. staff grants).
+
+    Same output and exit codes as `audit_verify`: 0 intact, 1 broken, 2 when the database could
+    not be reached.
+    """
+    from sijil_core import audit
+    from sijil_cp.db import make_engine, make_sessionmaker
+    from sijil_cp.settings import CpSettings
+
+    async def _run() -> audit.VerifyResult:
+        engine = make_engine(settings or CpSettings())
+        try:
+            async with make_sessionmaker(engine)() as db:
+                return await audit.verify_platform(db)
+        finally:
+            await engine.dispose()
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        # The type only: messages can carry the connection string.
+        print(f"database error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    return _print_verdict(result)
 
 
 def search_backfill(
@@ -166,6 +200,72 @@ def search_backfill(
         return 2
     print(f"queued {workspace_id}")  # noqa: T201
     return 0
+
+
+def _set_staff(email: str, staff: bool, settings: "CpSettings | None") -> int:
+    """Writes `user_account.is_staff`, and nothing else, audited `staff.granted` or
+    `staff.revoked` `{}` (the user's id as target, never the email) on the platform's chain by
+    the `platform` actor. Prints `granted|revoked|unchanged <user id>`. Exit code 0, or 2 for
+    an unknown email or a database that cannot be reached."""
+    from sqlalchemy import select
+
+    from sijil_core import audit
+    from sijil_core.db.base import utcnow
+    from sijil_core.db.models import ActorType, User
+    from sijil_cp.db import make_engine, make_sessionmaker
+    from sijil_cp.settings import CpSettings
+
+    normalised = email.strip().lower()
+
+    async def _run() -> tuple[UUID, bool] | None:
+        engine = make_engine(settings or CpSettings())
+        try:
+            async with make_sessionmaker(engine)() as db:
+                user = await db.scalar(
+                    select(User).where(User.email == normalised).with_for_update()
+                )
+                if user is None:
+                    return None
+                if user.is_staff is staff:
+                    return user.id, False
+                user.is_staff = staff
+                await audit.append_platform(
+                    db,
+                    action="staff.granted" if staff else "staff.revoked",
+                    actor_type=ActorType.platform,
+                    actor_id=None,
+                    target_type="user",
+                    target_id=str(user.id),
+                    now=utcnow(),
+                )
+                await db.commit()
+                return user.id, True
+        finally:
+            await engine.dispose()
+
+    try:
+        result = asyncio.run(_run())
+    except Exception as exc:
+        # The type only: messages can carry the connection string.
+        print(f"database error: {type(exc).__name__}", file=sys.stderr)  # noqa: T201
+        return 2
+    if result is None:
+        print("unknown user", file=sys.stderr)  # noqa: T201
+        return 2
+    user_id, changed = result
+    verb = ("granted" if staff else "revoked") if changed else "unchanged"
+    print(f"{verb} {user_id}")  # noqa: T201
+    return 0
+
+
+def staff_grant(email: str, settings: "CpSettings | None" = None) -> int:
+    """`sijil-cp staff grant <email>`: the user becomes platform staff (see `_set_staff`)."""
+    return _set_staff(email, True, settings)
+
+
+def staff_revoke(email: str, settings: "CpSettings | None" = None) -> int:
+    """`sijil-cp staff revoke <email>`: the user is platform staff no more."""
+    return _set_staff(email, False, settings)
 
 
 async def _ledger_problems(report: dict[str, Any], database_url: str) -> list[str]:
@@ -258,8 +358,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     sub.add_parser("bootstrap-storage", help="create the object-locked original bucket")
     audit_parser = sub.add_parser("audit", help="audit log tools")
     audit_sub = audit_parser.add_subparsers(dest="audit_command", required=True)
-    verify = audit_sub.add_parser("verify", help="verify a workspace's audit hash chain")
-    verify.add_argument("--workspace", type=UUID, required=True)
+    verify = audit_sub.add_parser(
+        "verify", help="verify a workspace's audit hash chain, or the platform's"
+    )
+    chain = verify.add_mutually_exclusive_group(required=True)
+    chain.add_argument("--workspace", type=UUID)
+    chain.add_argument("--platform", action="store_true", help="the platform's own chain")
     export_parser = sub.add_parser("export", help="period export tools")
     export_sub = export_parser.add_subparsers(dest="export_command", required=True)
     check = export_sub.add_parser("verify", help="verify an export ZIP and its signed report")
@@ -272,13 +376,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     search_sub = search_parser.add_subparsers(dest="search_command", required=True)
     backfill = search_sub.add_parser("backfill", help="rebuild a workspace's search index")
     backfill.add_argument("workspace", type=UUID)
+    staff_parser = sub.add_parser("staff", help="platform staff (the /v1/staff API)")
+    staff_sub = staff_parser.add_subparsers(dest="staff_command", required=True)
+    staff_sub.add_parser("grant", help="make a user platform staff").add_argument("email")
+    staff_sub.add_parser("revoke", help="revoke a user's staff access").add_argument("email")
     args = parser.parse_args(argv)
     if args.command == "serve":
         serve()
+    elif args.command == "staff":
+        command = staff_grant if args.staff_command == "grant" else staff_revoke
+        sys.exit(command(args.email))
     elif args.command == "search":
         sys.exit(search_backfill(args.workspace))
     elif args.command == "audit":
-        sys.exit(audit_verify(args.workspace))
+        sys.exit(audit_verify_platform() if args.platform else audit_verify(args.workspace))
     elif args.command == "export":
         sys.exit(
             export_verify(

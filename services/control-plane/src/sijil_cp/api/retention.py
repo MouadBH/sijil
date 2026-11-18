@@ -62,7 +62,15 @@ from sijil_cp.deps import (
     require_totp_compliance,
 )
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, authorize, require_workspace
+from sijil_cp.permissions import (
+    Action,
+    WorkspaceContext,
+    authorize,
+    ensure_billing,
+    gated_in_handler,
+    require_workspace,
+    require_writable,
+)
 from sijil_cp.removals import (
     INVALID_BODY,
     STEP_UP_MINUTES,
@@ -138,7 +146,7 @@ async def put_policy(
     document_type: str,
     body: PolicyIn,
     request: Request,
-    ctx: Annotated[WorkspaceContext, Depends(require_workspace(Action.retention_manage))],
+    ctx: Annotated[WorkspaceContext, Depends(require_writable(Action.retention_manage))],
     _step_up: Annotated[object, Depends(require_recent_totp(10))],
     user: Annotated[User, Depends(require_totp_compliance)],
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -328,6 +336,7 @@ async def _locked_eligible(
         }
     },
 )
+@gated_in_handler
 async def approve_deletion(
     workspace_id: UUID,
     request: Request,
@@ -350,6 +359,9 @@ async def approve_deletion(
         ids = sorted(set(parse_body(ApproveIn, await request.body()).ids))
         today = region_local_date(now, settings.region)
         rows = await _locked_eligible(db, workspace, ids, today)
+        # Read-only (non-payment) refuses it, audited like any refusal (ADM-4), once the
+        # documents are found (ruling R3: a missing one answers as such, never the 402).
+        await ensure_billing(db, workspace.org_id, now)
     except RequestValidationError:
         await audit_refusal(db, request, ws_id, user_id, [None], INVALID_BODY, now)
         raise

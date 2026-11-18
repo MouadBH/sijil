@@ -261,9 +261,11 @@ class BarrierStore(MemoryObjectStore):
         super().__init__()
         self.barrier = asyncio.Barrier(parties)
 
-    async def put_original(self, key: str, path: Path, retain_until: date) -> ObjectRef:
+    async def put_original(
+        self, key: str, path: Path, retain_until: date, *, compliance: bool = False
+    ) -> ObjectRef:
         await asyncio.wait_for(self.barrier.wait(), timeout=10)
-        return await super().put_original(key, path, retain_until)
+        return await super().put_original(key, path, retain_until, compliance=compliance)
 
 
 async def test_concurrent_identical_uploads_create_one_row(
@@ -485,8 +487,11 @@ async def test_upload_into_unusable_workspace_is_refused(
     workspace.state = state
     await db.commit()
     r = await _upload(uploader, workspace, PDF)
-    assert r.status_code == 409
-    assert r.json() == {"error": {"code": "workspace.not_ready"}}
+    # A hibernated workspace (ADM-5) answers its Owners only: to a Member it does not exist.
+    # Its Owner's upload is refused `workspace.not_ready` (test_closure_api.py).
+    hibernated = state is WorkspaceState.hibernated
+    code = "not_found" if hibernated else "workspace.not_ready"
+    assert (r.status_code, r.json()) == (404 if hibernated else 409, {"error": {"code": code}})
     assert memory_store.puts == []
     assert await _ledger(db, workspace) == []
     assert enqueuer.ingests == []

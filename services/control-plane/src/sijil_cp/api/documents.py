@@ -1,5 +1,12 @@
 """Documents (CAP-2 web upload). The body is streamed straight into the shared ingest path.
 
+The list and a document's metadata come from the ledger, with titles from the workspace's
+Paperless when it is active; a workspace that is not (a hibernated one, ADM-5) is never sent a
+request: its titles are absent and `engine` is `unavailable`. `GET …/documents/{id}/file`
+streams the original from our object store, never from Paperless, in every workspace state,
+audited `document.downloaded`; a document the caller's grant hides, or whose original is gone
+(removed or deleted), answers 404 `document.not_found`.
+
 The multipart body is parsed incrementally from `request.stream()`: FastAPI's `UploadFile`
 would spool the whole part before the handler runs, so an oversized upload could only be
 refused after it had been fully received. The client's filename and Content-Type are read past
@@ -10,23 +17,25 @@ import asyncio
 import base64
 import binascii
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Final, Literal
 from uuid import UUID
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from python_multipart.exceptions import MultipartParseError
 from python_multipart.multipart import MultipartParser, parse_options_header
-from sqlalchemy import select, tuple_
+from sqlalchemy import Select, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sijil_core import audit, ingest
 from sijil_core.crypto import Envelope, open_envelope
 from sijil_core.db.models import (
+    TERMINAL_STATES,
     ActorType,
     CredentialKind,
     DocumentLedger,
@@ -41,10 +50,17 @@ from sijil_core.db.models import (
     WorkspaceState,
 )
 from sijil_core.paperless import PaperlessClient, PaperlessDoc, PaperlessError
+from sijil_core.storage import ObjectRef, ObjectStore
 from sijil_cp.deps import get_db, get_now, require_totp_compliance
 from sijil_cp.enqueue import get_enqueuer
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, WorkspaceContext, require_workspace
+from sijil_cp.permissions import (
+    Action,
+    WorkspaceContext,
+    ensure_visible,
+    hidden_ids,
+    require_workspace,
+)
 
 if TYPE_CHECKING:
     from python_multipart.multipart import MultipartCallbacks
@@ -156,6 +172,18 @@ async def _file_part(request: Request, boundary: bytes) -> AsyncIterator[bytes]:
         yield b"".join(data)
 
 
+async def _visible_by_id(request: Request, ctx: WorkspaceContext, doc_id: UUID) -> bool:
+    """Whether the caller's grant shows the document (its own short session: the request's
+    was handed back before the upload)."""
+    if ctx.document_types is None:
+        return True
+    async with request.app.state.sessionmaker() as db:
+        uploaded_by = await db.scalar(
+            select(DocumentLedger.uploaded_by).where(DocumentLedger.id == doc_id)
+        )
+    return not await hidden_ids(request, ctx, [(doc_id, uploaded_by)])
+
+
 @router.post("/workspaces/{workspace_id}/documents", status_code=202, response_model=UploadOut)
 async def upload_document(
     request: Request, ctx: Uploading, user: CurrentUser, db: Db, now: Now
@@ -199,13 +227,16 @@ async def upload_document(
         raise ApiError(ingest.Unsupported.code, 415) from None
     except ingest.Empty:
         raise ApiError(ingest.Empty.code, 422) from None
+    except ingest.WorkspaceNotAccepting:
+        raise ApiError(ingest.WorkspaceNotAccepting.code, 409) from None
     except (_MissingFile, MultipartParseError):
         raise _invalid() from None
     if isinstance(result, ingest.Duplicate):
-        return JSONResponse(
-            {"error": {"code": "document.duplicate"}, "document_id": str(result.document_id)},
-            status_code=409,
-        )
+        # The existing document is named only when the caller's grant shows it.
+        body: dict[str, object] = {"error": {"code": "document.duplicate"}}
+        if await _visible_by_id(request, ctx, result.document_id):
+            body["document_id"] = str(result.document_id)
+        return JSONResponse(body, status_code=409)
     return UploadOut(
         document_id=result.document_id,
         state=DocumentState.received,
@@ -222,6 +253,8 @@ PAPERLESS_TIMEOUT_S = 3.0
 PAPERLESS_DEADLINE_S = 6.0
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
+# Rows read per round when a grant hides some (`visible_rows`).
+VISIBLE_BATCH = 200
 # Gone from every list; the document itself answers with its tombstone.
 TOMBSTONES = (DocumentState.removed, DocumentState.deleted)
 
@@ -291,6 +324,8 @@ async def _titles(
     """
     if not ids:
         return {}
+    if workspace.state is not WorkspaceState.active:
+        return None  # a hibernated (or not yet active) workspace's Paperless is never called
     try:
         if not workspace.paperless_url:
             return None
@@ -340,6 +375,31 @@ def _ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
+async def visible_rows(
+    request: Request,
+    ctx: WorkspaceContext,
+    db: AsyncSession,
+    page: Callable[[DocumentLedger | None], Select[DocumentLedger]],
+    want: int,
+) -> list[DocumentLedger]:
+    """Up to `want` rows the caller's grant shows, in the order of `page(after)`: the ordered
+    query of the rows after `after` (None: from the start). Hidden rows are skipped, reading
+    further batches until `want` are found or the rows run out."""
+    if ctx.document_types is None:
+        return list((await db.scalars(page(None).limit(want))).all())
+    batch = max(want, VISIBLE_BATCH)
+    found: list[DocumentLedger] = []
+    last: DocumentLedger | None = None
+    while len(found) < want:
+        rows = list((await db.scalars(page(last).limit(batch))).all())
+        hidden = await hidden_ids(request, ctx, [(r.id, r.uploaded_by) for r in rows])
+        found += [r for r in rows if r.id not in hidden]
+        if len(rows) < batch:
+            break
+        last = rows[-1]
+    return found[:want]
+
+
 @router.get("/workspaces/{workspace_id}/documents", response_model=DocumentPage)
 async def list_documents(
     request: Request,
@@ -351,16 +411,18 @@ async def list_documents(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> DocumentPage:
     workspace = ctx.workspace
-    query = select(DocumentLedger).where(
-        DocumentLedger.workspace_id == workspace.id, DocumentLedger.state.not_in(TOMBSTONES)
-    )
-    if cursor is not None:
-        at, last_id = _decode_cursor(cursor)
-        query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) < (at, last_id))
-    query = query.order_by(DocumentLedger.ingested_at.desc(), DocumentLedger.id.desc()).limit(
-        limit + 1
-    )
-    rows = list((await db.scalars(query)).all())
+    start = _decode_cursor(cursor) if cursor is not None else None
+
+    def page(after: DocumentLedger | None) -> Select[DocumentLedger]:
+        query = select(DocumentLedger).where(
+            DocumentLedger.workspace_id == workspace.id, DocumentLedger.state.not_in(TOMBSTONES)
+        )
+        key = (after.ingested_at, after.id) if after is not None else start
+        if key is not None:
+            query = query.where(tuple_(DocumentLedger.ingested_at, DocumentLedger.id) < key)
+        return query.order_by(DocumentLedger.ingested_at.desc(), DocumentLedger.id.desc())
+
+    rows = await visible_rows(request, ctx, db, page, limit + 1)
     more = len(rows) > limit
     rows = rows[:limit]
     ids = [r.paperless_doc_id for r in rows if r.paperless_doc_id is not None]
@@ -412,6 +474,7 @@ async def get_document(
     )
     if row is None:
         raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, row)
     dead = row.state in TOMBSTONES
     # A tombstone has nothing left in Paperless to ask about.
     ids = [row.paperless_doc_id] if row.paperless_doc_id is not None and not dead else []
@@ -429,3 +492,72 @@ async def get_document(
     )
     await db.commit()
     return tombstone(row, ctx.role) if dead else _out(row, docs)
+
+
+# The media type of each `content_kind` (sijil_core.filetypes.FileKind).
+MEDIA_TYPES: Final = {
+    "pdf": "application/pdf",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "tiff": "image/tiff",
+    "heic": "image/heic",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "xml": "application/xml",
+    "eml": "message/rfc822",
+}
+_EXTENSIONS: Final = {"jpeg": "jpg", "tiff": "tif"}
+
+
+async def _chunks(first: bytes, rest: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    yield first
+    async for chunk in rest:
+        yield chunk
+
+
+@router.get("/workspaces/{workspace_id}/documents/{doc_id}/file")
+async def download_original(
+    doc_id: UUID, request: Request, ctx: Reading, user: CurrentUser, db: Db, now: Now
+) -> StreamingResponse:
+    """The original, from our object store (see the module docstring)."""
+    workspace = ctx.workspace
+    row = await db.scalar(
+        select(DocumentLedger).where(
+            DocumentLedger.id == doc_id, DocumentLedger.workspace_id == workspace.id
+        )
+    )
+    if row is None:
+        raise ApiError("document.not_found", 404)
+    await ensure_visible(request, ctx, row)
+    if row.state in TERMINAL_STATES or row.original_removed_at is not None:
+        raise ApiError("document.not_found", 404)
+    store: ObjectStore = request.app.state.store
+    rest = store.open(ObjectRef(row.object_key, row.object_version_id))
+    try:
+        # The first chunk before the 200: a missing object answers an error, not a cut stream.
+        first = await anext(rest)
+    except (FileNotFoundError, ClientError, BotoCoreError, StopAsyncIteration) as exc:
+        log.error("original of document %s unreadable: %s", row.id, type(exc).__name__)
+        raise ApiError("document.unavailable", 503) from None
+    await audit.append(
+        db,
+        workspace_id=workspace.id,
+        action="document.downloaded",
+        actor_type=ActorType.user,
+        actor_id=str(user.id),
+        target_type="document",
+        target_id=str(row.id),
+        ip=_ip(request),
+        now=now,
+    )
+    await db.commit()
+    kind = row.content_kind
+    headers = {
+        "Content-Disposition": f'attachment; filename="{row.id}.{_EXTENSIONS.get(kind, kind)}"',
+        "Content-Length": str(row.size_bytes),
+    }
+    return StreamingResponse(
+        _chunks(first, rest),
+        media_type=MEDIA_TYPES.get(kind, "application/octet-stream"),
+        headers=headers,
+    )

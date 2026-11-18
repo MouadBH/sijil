@@ -117,6 +117,15 @@ class PaperlessDoc:
         return is_copy_of(self.checksum, self.original_file_name, sha256, filename)
 
 
+@dataclass(frozen=True)
+class DocumentText:
+    """A document's text as Paperless extracted it ("" when none), and the page count it
+    reports (None when it reports no positive integer)."""
+
+    content: str
+    page_count: int | None
+
+
 def is_copy_of(checksum: object, original_file_name: object, sha256: str, filename: str) -> bool:
     """Whether a Paperless list row is a copy of the original with this SHA-256, uploaded by
     ingest as `filename`: its `checksum` when the payload carries one, else its file name.
@@ -457,10 +466,9 @@ class PaperlessClient:
             "POST", "/api/trash/", json={"documents": list(doc_ids), "action": "empty"}
         )
 
-    async def document_content(self, doc_id: int) -> str:
-        """The document's text as Paperless extracted it (OCR or text layer), or ""."""
+    async def _document_fields(self, doc_id: int, fields: str) -> dict[str, Any]:
         response = await self._request(
-            "GET", f"/api/documents/{doc_id}/", params={"fields": "id,content"}
+            "GET", f"/api/documents/{doc_id}/", params={"fields": fields}
         )
         try:
             body = response.json()
@@ -468,8 +476,23 @@ class PaperlessClient:
             raise PaperlessBadResponse("GET /api/documents/{id}/: not JSON") from None
         if not isinstance(body, dict):
             raise PaperlessBadResponse("GET /api/documents/{id}/: unexpected body")
-        content = body.get("content")
+        return dict(body)
+
+    async def document_content(self, doc_id: int) -> str:
+        """The document's text as Paperless extracted it (OCR or text layer), or ""."""
+        content = (await self._document_fields(doc_id, "id,content")).get("content")
         return content if isinstance(content, str) else ""
+
+    async def document_text(self, doc_id: int) -> DocumentText:
+        """The text (as `document_content`) and the page count, in one request (ADM-3: the AI
+        pages a document costs)."""
+        body = await self._document_fields(doc_id, "id,content,page_count")
+        content, pages = body.get("content"), body.get("page_count")
+        usable = isinstance(pages, int) and not isinstance(pages, bool) and pages > 0
+        return DocumentText(
+            content=content if isinstance(content, str) else "",
+            page_count=pages if usable else None,
+        )
 
     async def document_suggestions(self, doc_id: int) -> dict[str, list[int]]:
         """Paperless's matching suggestions (`document_types`, `tags`, ...): id lists only."""

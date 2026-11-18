@@ -58,7 +58,7 @@ from sijil_cp.deps import (
     require_totp_compliance,
 )
 from sijil_cp.errors import ApiError
-from sijil_cp.permissions import Action, authorize
+from sijil_cp.permissions import Action, authorize, ensure_billing, gated_in_handler
 from sijil_cp.removals import (
     INVALID_BODY,
     STEP_UP_MINUTES,
@@ -154,6 +154,7 @@ async def _refuse_if_half_sealed(
         }
     },
 )
+@gated_in_handler
 async def remove_document(
     workspace_id: UUID,
     doc_id: UUID,
@@ -175,6 +176,9 @@ async def remove_document(
         await _step_up(session, user, now)
         reason = _reason(parse_body(RemovalIn, await request.body()))
         ledger = await _locked_ledger(db, workspace, doc_id)
+        # Read-only (non-payment) refuses it, audited like any refusal (ADM-4), once the
+        # documents are found (ruling R3: a missing one answers as such, never the 402).
+        await ensure_billing(db, workspace.org_id, now)
         _refuse_unless_removable(ledger)
         await _refuse_if_half_sealed(request, workspace, ledger)
     except RequestValidationError:

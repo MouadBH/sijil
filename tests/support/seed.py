@@ -5,6 +5,12 @@ service name). Idempotent: it signs in as the fixed SAMPLE user (signing up only
 so the signup rate limit and the three-organisation cap are never touched again), reuses the
 SAMPLE organisation, and skips what is already archived. Prints the workspace id.
 
+It also keeps the SAMPLE organisation paid up, so its AI never stops (an org with no ICE is
+overdue 30 days after its trial, and AI stops then): the org gets a SAMPLE ICE through the API
+(`PATCH /orgs/{id}`) when it has none, and `keep_paid_up` chooses its plan and records every
+unpaid invoice as paid through `sijil_core.billing` directly (dev tooling, not a client of the
+staff API: the payment is audited as a system event). Run `make seed` again after a renewal.
+
     python -m tests.support.seed [--wait-routed SECONDS]
 
 With `--wait-routed`, it then waits (printing progress) until no seeded document is still
@@ -21,23 +27,32 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from email.message import EmailMessage
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
+from sijil_core import billing, invoicing
 from sijil_core.db.engine import make_engine, make_sessionmaker
 from sijil_core.db.models import (
     DocumentLedger,
     DocumentState,
     IngestState,
+    Invoice,
+    InvoiceState,
     Membership,
     Organisation,
+    Plan,
     Workspace,
     WorkspaceState,
 )
+from sijil_core.settings import SellerSettings
 from tests.support.polling import poll_get
 
 CP_URL = os.environ.get("SIJIL_IT_CP_URL", "http://control-plane:8000")
@@ -47,6 +62,8 @@ FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "invoices"
 SAMPLE_EMAIL = "sample-owner@sijil.local"
 SAMPLE_PASSWORD = "sample-Passw0rd-not-a-secret"  # noqa: S105 - SAMPLE data only
 SAMPLE_ORG = "SAMPLE Société Atlas SARL"
+SAMPLE_ORG_ICE = "002999888000011"  # SAMPLE: the org's own (fictitious) ICE, no supplier's
+SEED_PLAN = "essentiel"
 PROVISION_BUDGET_S = 240
 CONSUME_BUDGET_S = 180
 VIA_API = 6  # sample-01..06 by upload, sample-07..12 by email
@@ -118,6 +135,72 @@ def _send(address: str, path: Path) -> None:
         client.send_message(message, from_addr="fournisseur@sample.example")
 
 
+async def keep_paid_up(
+    db: AsyncSession, org_id: UUID, now: datetime, *, seller: SellerSettings
+) -> list[str]:
+    """Chooses SEED_PLAN (`billing.change_plan`, as the Owner's `PUT /orgs/{id}/subscription`)
+    unless another plan or a change is already chosen, and records every unpaid invoice as
+    paid by a SAMPLE transfer, as staff `mark-paid` does, then stores the status
+    (`billing.advance`): active, nothing owed. The org must have an ICE.
+    Commits. Idempotent: returns the numbers it marked paid (none on a second run)."""
+    # A plan someone already chose (another plan, or a change pending) is kept: seed never
+    # schedules a downgrade.
+    sub = await billing.subscription_of(db, org_id)
+    plan = await db.get(Plan, SEED_PLAN)
+    if plan is None:
+        raise LookupError(f"plan {SEED_PLAN} not found")
+    chosen = sub.plan_code != SEED_PLAN or sub.pending_plan_code is not None
+    change = None if chosen else await billing.change_plan(db, org_id, plan, now, seller=seller)
+    if change is not None and change.changed:
+        await invoicing.audit_org(
+            db, org_id, "billing.plan_chosen",
+            {"from": change.previous, "to": plan.code, "effective": change.effective}, now,
+        )  # fmt: skip
+    unpaid = await db.scalars(
+        select(Invoice)
+        .where(Invoice.org_id == org_id, Invoice.state.in_(billing.UNPAID))
+        .options(defer(Invoice.pdf))
+        .order_by(Invoice.due_at, Invoice.number)
+        .with_for_update()
+    )
+    paid: list[str] = []
+    for invoice in list(unpaid):
+        invoice.state = InvoiceState.paid
+        invoice.paid_at = now
+        invoice.payment_reference = f"SAMPLE-SEED-{invoice.number}"
+        await db.flush()
+        await invoicing.audit_org(
+            db, org_id, "billing.invoice_paid",
+            {"number": invoice.number, "amount_ttc": f"{invoice.amount_ttc:.2f}"}, now,
+            target_type="invoice", target_id=str(invoice.id),
+        )  # fmt: skip
+        paid.append(invoice.number)
+    await billing.advance(db, org_id, now, seller=seller)
+    await db.commit()
+    return paid
+
+
+async def _paid_up(http: httpx.AsyncClient, sessions: Any, workspace_id: UUID) -> None:
+    """The SAMPLE ICE (through the API, when the org has none), then `keep_paid_up`."""
+    async with sessions() as db:
+        org = await db.scalar(
+            select(Organisation)
+            .join(Workspace, Workspace.org_id == Organisation.id)
+            .where(Workspace.id == workspace_id)
+        )
+        assert org is not None
+        org_id, ice = org.id, org.ice
+    if ice is None:
+        r = await http.patch(
+            f"/v1/orgs/{org_id}", json={"ice": SAMPLE_ORG_ICE}, headers=_csrf(http)
+        )
+        r.raise_for_status()
+    async with sessions() as db:
+        paid = await keep_paid_up(db, org_id, datetime.now(UTC), seller=SellerSettings())
+    if paid:
+        print(f"marked paid (SAMPLE): {', '.join(paid)}", flush=True)  # noqa: T201
+
+
 async def seed(
     *,
     email: str = SAMPLE_EMAIL,
@@ -164,6 +247,7 @@ async def seed(
                 workspace_id = found
             if on_workspace is not None:
                 on_workspace(workspace_id)
+            await _paid_up(http, sessions, workspace_id)
 
             deadline = time.monotonic() + PROVISION_BUDGET_S
             while True:

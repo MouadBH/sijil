@@ -41,9 +41,14 @@ sends it again when it stops on a removed row after an upload. `purge_document`:
 8. audits `document.purged` `{paperless}`: whether Paperless held a copy this run removed
    (plus `consume_unresolved: true` when a dead consume task was given up on).
 
-Every step is idempotent, so a retry or a second message repeats it harmlessly. A workspace that
-is not active (paused, hibernated, closing) raises WorkspaceNotActive, retried later; Paperless
-down raises PaperlessUnavailable likewise. Nothing here touches the object store.
+Every step is idempotent, so a retry or a second message repeats it harmlessly. A closed account
+(ADM-5) never reaches Paperless: a hibernated workspace's tenant is stopped, so only its index
+rows are purged (its Paperless copy goes with the tenant when it is destroyed), and a destroyed
+(`closed`) one's Paperless and index went with its tenant, so the purge is only recorded;
+`document.purged` then carries `{paperless: false, tenant: "stopped" | "destroyed"}`. Any other
+workspace that is not active (provisioning, closing, in error) raises WorkspaceNotActive,
+retried later; Paperless down raises PaperlessUnavailable likewise. Nothing here touches the
+object store.
 `requeue_unpurged` re-sends the purge for rows that never recorded `document.purged`.
 """
 
@@ -96,6 +101,7 @@ REQUEUE_BATCH: Final = 50
 # lease, its poll timeout plus margin.
 CONSUME_WINDOW: Final = CLAIM_LEASE
 _PURGEABLE = (DocumentState.removed, DocumentState.deleted)
+_SWEPT = (WorkspaceState.active, WorkspaceState.hibernated, WorkspaceState.closed)
 _TASK_DONE = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
 CONSUME_BOUND: Final = timedelta(hours=24)
 RECHECK_MIN: Final = timedelta(minutes=1)
@@ -126,6 +132,20 @@ class TooManyMatches(Exception):  # noqa: N818
         self.count = count
 
 
+# A closed account's tenant (ADM-5): what is left of it to purge.
+_CLOSED_TENANT: Final = {WorkspaceState.hibernated: "stopped", WorkspaceState.closed: "destroyed"}
+
+
+@dataclass(frozen=True)
+class _Closed:
+    """A purge in a hibernated or destroyed workspace: no Paperless call."""
+
+    ledger_id: UUID
+    workspace: Workspace
+    sealed: bool
+    tenant: str  # `stopped` (index rows to purge) or `destroyed` (nothing left)
+
+
 @dataclass(frozen=True)
 class _Target:
     ledger_id: UUID
@@ -153,7 +173,7 @@ async def _target(
     settings: CoreSettings,
     ledger_id: UUID,
     workspace_id: UUID,
-) -> _Target | None:
+) -> _Target | _Closed | None:
     async with sessions() as session:
         found = (
             await session.execute(
@@ -177,8 +197,13 @@ async def _target(
                 ledger_id, ledger.state.value, ledger.original_removed_at,
             )  # fmt: skip
             return None
+        tenant = _CLOSED_TENANT.get(workspace.state)
+        if tenant is not None:
+            return _Closed(
+                ledger_id, workspace, sealed=ledger.state is DocumentState.deleted, tenant=tenant
+            )
         if workspace.state is not WorkspaceState.active or not workspace.paperless_url:
-            raise WorkspaceNotActive  # transient: paused, hibernated or closing, retried later
+            raise WorkspaceNotActive  # transient: provisioning, closing or in error
         kind = CredentialKind.admin_password
         credential = await session.scalar(
             select(TenantCredential).where(
@@ -362,10 +387,17 @@ async def purge_document(
     target = await _target(sessions, keys, settings, ledger_id, workspace_id)
     if target is None:
         return False
-    data = await _purge_paperless(target, paperless, now)
-    # After Paperless: a failure there leaves everything for the retry to find again.
-    async with (await index.engine(target.workspace)).begin() as conn:
-        await index_db.purge_document(conn, ledger_id, sealed=target.sealed)
+    data: dict[str, bool | str]
+    if isinstance(target, _Closed):
+        data = {"paperless": False, "tenant": target.tenant}
+        if target.tenant == "stopped":
+            async with (await index.engine(target.workspace)).begin() as conn:
+                await index_db.purge_document(conn, ledger_id, sealed=target.sealed)
+    else:
+        data = dict(await _purge_paperless(target, paperless, now))
+        # After Paperless: a failure there leaves everything for the retry to find again.
+        async with (await index.engine(target.workspace)).begin() as conn:
+            await index_db.purge_document(conn, ledger_id, sealed=target.sealed)
     async with sessions() as session:
         await audit.append(
             session,
@@ -392,7 +424,8 @@ async def requeue_unpurged(
 ) -> int:
     """Re-send `purge_document` for this region's `removed` and `deleted` rows whose original
     is removed but that never recorded `document.purged` (a lost message, Paperless down for
-    longer than the retries), in active workspaces only (any other would only retry), oldest
+    longer than the retries), in active, hibernated or destroyed workspaces only (any other
+    would only retry), oldest
     removal first, at most `limit`, skipping those in flight (`purge:pending:<id>`). A failed
     send is logged and the sweep goes on. Returns how many were sent."""
     purged = exists().where(
@@ -409,7 +442,7 @@ async def requeue_unpurged(
                 .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(
                     Organisation.region == region,
-                    Workspace.state == WorkspaceState.active,
+                    Workspace.state.in_(_SWEPT),
                     DocumentLedger.state.in_(_PURGEABLE),
                     DocumentLedger.original_removed_at.is_not(None),
                     ~purged,

@@ -2,9 +2,10 @@
 
 A question is document content (it names suppliers, amounts), so it lives beside the documents,
 never in the shared control-plane database. Its life: `queued` (the control plane,
-`create_ask`), `answering` (the Ask worker claimed it, `claim_ask`), then `answered`
-(`store_answer`) or `failed` (`fail_ask`). Questions are deleted 90 days after they were asked
-(`expire_asks`, daily); the table has no lock trigger, since it is not document data.
+`create_ask`, with the asker's document-type grant, v9), `answering` (the Ask worker claimed
+it, `claim_ask`), then `answered` (`store_answer`) or `failed` (`fail_ask`). Questions are
+deleted 90 days after they were asked (`expire_asks`, daily); the table has no lock trigger,
+since it is not document data.
 
 An answer quotes documents: those it cites (`citations`, at most 20, shown) and those its
 figures counted (`counted`, every one). It is stored only while each of them has a live search
@@ -60,6 +61,8 @@ class AskRecord:
     created_by: UUID
     created_at: datetime
     answered_at: datetime | None
+    # The asker's document-type grant when they asked (ADM-1); None: every type.
+    document_types: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -73,7 +76,7 @@ class CitedDocument:
 
 _COLUMNS: Final = (
     "id, question, locale, state, intent, answer_text, answer_code, figures, citations, "
-    "counted, excluded, error_code, created_by, created_at, answered_at"
+    "counted, excluded, error_code, created_by, created_at, answered_at, document_types"
 )
 
 
@@ -98,20 +101,26 @@ def _record(row: Any) -> AskRecord:
         created_by=row.created_by,
         created_at=row.created_at,
         answered_at=row.answered_at,
+        document_types=None if row.document_types is None else list(row.document_types),
     )
 
 
 async def create_ask(
     conn: AsyncConnection, ask_id: UUID, *, question: str, locale: str, created_by: UUID,
-    now: datetime,
+    now: datetime, document_types: list[str] | None = None,
 ) -> None:  # fmt: skip
+    """Queues the question. `document_types` is the asker's grant (None: every type): the Ask
+    worker answers from those types only."""
     await conn.execute(
         text(
-            "INSERT INTO ask_query (id, question, locale, created_by, created_at) "
-            "VALUES (:id, :question, :locale, :by, :now)"
+            "INSERT INTO ask_query (id, question, locale, created_by, created_at, document_types) "
+            "VALUES (:id, :question, :locale, :by, :now, CAST(:types AS text[]))"
         ),
-        {"id": ask_id, "question": question, "locale": locale, "by": created_by, "now": now},
-    )
+        {
+            "id": ask_id, "question": question, "locale": locale, "by": created_by, "now": now,
+            "types": None if document_types is None else sorted(set(document_types)),
+        },
+    )  # fmt: skip
 
 
 async def read_ask(conn: AsyncConnection, ask_id: UUID) -> AskRecord | None:

@@ -75,6 +75,7 @@ async def add_document(
     ingested_at: datetime = ARRIVAL,
     retention_until: date = PROVISIONAL,
     flags: tuple[str, ...] = (),
+    uploaded_by: uuid.UUID | None = None,
 ) -> DocumentLedger:
     """A ledger row, its GOVERNANCE-locked original and (unless `values` is None) its fields."""
     sha = hashlib.sha256(uuid.uuid4().bytes).hexdigest()
@@ -85,6 +86,7 @@ async def add_document(
         size_bytes=10,
         content_kind="pdf",
         source=DocumentSource.upload,
+        uploaded_by=uploaded_by,
         object_key=f"t/{sha}",
         object_version_id="v1",
         state=state,

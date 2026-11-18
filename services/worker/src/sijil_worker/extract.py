@@ -6,14 +6,22 @@ consumed` (or `unsupported`, which is only routed: see below), only in an `activ
 (any other state, e.g. hibernated or closing, is a no-op), and only in this worker's region. It:
 1. reads the text Paperless extracted (never the PDF's own text layer, ruling P4), normalises
    it and keeps the first 12,000 characters; empty text is flagged `no_text`;
+1a. asks the org's billing standing (`sijil_core.billing`, ADM-3) before any model call. When
+   AI is not allowed (over quota, or an invoice unpaid past due), the model is not called and
+   no usage is recorded: the row is empty, flagged with the standing's reason
+   (`quota_exceeded` or `billing_overdue`), audited
+   `document.extraction_skipped` `{code}`, and goes to review. Otherwise the document's AI
+   pages (the page count Paperless reports, at least 1) are recorded once, before the model
+   runs, and any quota warning they reach is audited; a document whose pages are already
+   recorded (a retry) goes on whatever the standing says now;
 2. asks Ollama twice (run A: PROMPT_A, seed 1; run B: PROMPT_B, seed 2) for the fields, as a
    JSON object constrained by `extraction_schema()`. Each 15-digit token of the text that is
    the ICE of a workspace supplier record (`sijil_core.suppliers`, REC-5) adds a line
    `Known company in this workspace: <name> (ICE <ice>)` to both prompts (`hint_lines`: at
    most MAX_HINTS, each name stripped of control characters and cut at HINT_NAME_CHARS, since
    a reviewer or a document wrote it). A company, not a supplier: the ICE may be the client's.
-   Never the workspace's own ICE (`suppliers.own_ices`, final review I2): the client of
-   every purchase invoice;
+   Never the workspace's own ICE (`suppliers.own_ices`: the organisation's ICE when stored,
+   else the frequency guard of final review I2): the client of every purchase invoice;
 3. parses each run's values into canonical strings (`sijil_core.fields`), keeping run A's
    value, or run B's where run A has none. A kept ICE with a supplier record takes the
    record's name (source `supplier_record`); unless a run's own name matches the record's
@@ -67,7 +75,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import and_, select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
-from sijil_core import audit, suppliers
+from sijil_core import audit, billing, suppliers
 from sijil_core import index as index_db
 from sijil_core.confidence import (
     OWN_ICE,
@@ -125,7 +133,13 @@ EXTRACTION_FAILED: Final = "extraction_failed"
 BAD_OUTPUT: Final = "extraction.ai_bad_output"
 POSSIBLE_DUPLICATE: Final = "possible_duplicate"
 RETENTION_EXTEND_FAILED: Final = "retention.extend_failed"
-_RESULT_ACTIONS: Final = ("document.extracted", "document.extraction_failed")
+_RESULT_ACTIONS: Final = (
+    "document.extracted",
+    "document.extraction_failed",
+    "document.extraction_skipped",
+)
+# The flags of a document that skipped AI on its org's standing: a quota, or non-payment.
+SKIPPED_FLAGS: Final = frozenset({billing.QUOTA_EXCEEDED, billing.BILLING_OVERDUE})
 SUPPLIER_RECORD: Final = "supplier_record"  # the source of a name taken from the record
 MAX_HINTS: Final = 5
 HINT_NAME_CHARS: Final = 120
@@ -274,7 +288,7 @@ def _with_hints(prompt: str, hints: Sequence[str]) -> str:
 
 
 async def _known_in_text(
-    index: IndexEngines, workspace: Workspace, content: str
+    index: IndexEngines, workspace: Workspace, content: str, org_ice: str | None
 ) -> tuple[list[Supplier], frozenset[str]]:
     """The supplier records whose ICE the text carries, in the order the text gives them, but
     the workspace's own; and which of the text's ICEs are its own (`suppliers.own_ices`)."""
@@ -282,7 +296,7 @@ async def _known_in_text(
     if not ices:
         return [], frozenset()
     async with (await index.engine(workspace)).connect() as conn:
-        own = await suppliers.own_ices(conn, ices)
+        own = await suppliers.own_ices(conn, ices, org_ice=org_ice)
         found = {s.ice: s for s in await suppliers.find(conn, ices)}
     return [found[ice] for ice in ices if ice in found and ice not in own], own
 
@@ -298,6 +312,7 @@ class _Job:
     doc_id: int | None
     paperless_url: str | None
     token: str | None
+    org_ice: str | None = None  # the organisation's ICE (ADM-3), the first own-ICE guard
 
     @property
     def unsupported(self) -> bool:
@@ -356,7 +371,7 @@ async def _load(
     async with sessions() as session:
         found = (
             await session.execute(
-                select(DocumentLedger, Workspace, Organisation.region)
+                select(DocumentLedger, Workspace, Organisation.region, Organisation.ice)
                 .join(Workspace, Workspace.id == DocumentLedger.workspace_id)
                 .join(Organisation, Organisation.id == Workspace.org_id)
                 .where(DocumentLedger.id == ledger_id)
@@ -364,7 +379,7 @@ async def _load(
         ).first()
         if found is None:
             raise LookupError("document not found")
-        ledger, workspace, region = found
+        ledger, workspace, region, org_ice = found
         if workspace_id is not None and workspace.id != workspace_id:
             raise LookupError("document not found")
         # Before anything leaves the database: this worker only serves its own region.
@@ -387,7 +402,7 @@ async def _load(
             )
             return None
         if ledger.ingest_state is IngestState.unsupported:
-            return _Job(ledger_id, workspace, region, None, None, None)
+            return _Job(ledger_id, workspace, region, None, None, None, org_ice)
         if ledger.ingest_state is not IngestState.consumed or ledger.paperless_doc_id is None:
             return None
         if not workspace.paperless_url:
@@ -405,6 +420,7 @@ async def _load(
             doc_id=ledger.paperless_doc_id,
             paperless_url=workspace.paperless_url,
             token=_service_token(credential, keys, workspace),
+            org_ice=org_ice,
         )
 
 
@@ -466,6 +482,9 @@ async def _append_event(
 
 def _event_for(row: FieldsRow) -> tuple[str, dict[str, str | int | bool | None]]:
     """The audit event a stored row stands for, rebuilt from the row alone (no values)."""
+    skipped = [f for f in row.flags if f in SKIPPED_FLAGS]
+    if skipped:
+        return "document.extraction_skipped", {"code": skipped[0]}
     if EXTRACTION_FAILED in row.flags:
         codes = [f for f in row.flags if f.startswith("extraction.")]
         return "document.extraction_failed", {"code": codes[0] if codes else "extraction.error"}
@@ -518,9 +537,49 @@ async def _ensure_audited(
         await session.commit()
 
 
+async def _ai_refused(
+    sessions: async_sessionmaker[AsyncSession], job: _Job, pages: int | None, now: datetime
+) -> str | None:
+    """The standing's reason when AI is not allowed for the document; else None, once its AI
+    pages are recorded (with any quota warning they reach). A document already recorded (a
+    retry after the model failed) is allowed: its pages are counted."""
+    async with sessions() as session:
+        if await billing.ai_pages_recorded(session, job.ledger_id):
+            return None
+        meter = await billing.check(session, job.workspace.org_id, now)
+        standing = billing.standing_of(meter)
+        if not standing.ai_allowed:
+            await session.commit()  # the warnings the meter reached
+            return standing.reason_code or billing.QUOTA_EXCEEDED
+        await billing.record_ai_pages(
+            session,
+            org_id=job.workspace.org_id,
+            workspace_id=job.workspace.id,
+            ledger_id=job.ledger_id,
+            pages=pages or 1,
+            now=now,
+        )
+        await billing.check(session, job.workspace.org_id, now)
+        await session.commit()
+    return None
+
+
+def _skipped_row(job: _Job, reason: str, now: datetime) -> FieldsRow:
+    """The empty row of a document that skipped AI on its org's standing: no values, no runs,
+    no model; to review."""
+    return FieldsRow(
+        ledger_id=job.ledger_id,
+        values=dict.fromkeys(FIELD_NAMES),
+        flags=(reason,),
+        extracted_at=now,
+        updated_at=now,
+    )
+
+
 async def _compute(
     job: _Job,
     *,
+    sessions: async_sessionmaker[AsyncSession] | None,
     index: IndexEngines,
     paperless: Callable[..., PaperlessClient],
     ollama: OllamaClient,
@@ -529,12 +588,14 @@ async def _compute(
 ) -> tuple[FieldsRow, list[tuple[RunName, _Run]], str]:
     """Reads the content and runs the model twice; returns the row, the runs to record and the
     whole normalised text (for search; the model gets its first MAX_CONTENT_CHARS).
-    Writes nothing (the index is only read, for the hints and the known supplier): see
-    `_write_once`."""
+    Writes nothing to the index (it is only read, for the hints and the known supplier): see
+    `_write_once`. With `sessions`, the billing gate runs first (`_ai_refused`, which records
+    the AI pages); None (the read-only `sijil-eval`) skips it and meters nothing."""
     if job.doc_id is None or job.paperless_url is None:
         raise ValueError("no Paperless document to extract")
     async with paperless(job.paperless_url, token=job.token) as client:
-        text_all = normalise(await client.document_content(job.doc_id))
+        document = await client.document_text(job.doc_id)
+        text_all = normalise(document.content)
         content = text_all[:MAX_CONTENT_CHARS]
         runs: list[tuple[RunName, _Run]] = []
         paperless_type: str | None = None
@@ -542,7 +603,12 @@ async def _compute(
         if content.strip():
             # Paperless first: a failure there is retried before any model time is spent.
             paperless_type = await _paperless_type(client, job.doc_id)
-            printed, own = await _known_in_text(index, job.workspace, content)
+            refused = None
+            if sessions is not None:
+                refused = await _ai_refused(sessions, job, document.page_count, now)
+            if refused is not None:
+                return _skipped_row(job, refused, now), [], text_all
+            printed, own = await _known_in_text(index, job.workspace, content, job.org_ice)
             hints = hint_lines(printed)
             prompt_a, prompt_b = _with_hints(PROMPT_A, hints), _with_hints(PROMPT_B, hints)
             runs.append(("a", await _ask(ollama, model, prompt_a, content, SEED_A)))
@@ -562,7 +628,7 @@ async def _compute(
     if ice is not None:
         async with (await index.engine(job.workspace)).connect() as conn:
             if ice not in ice_tokens(content):  # not printed as such: not asked above
-                own = own | await suppliers.own_ices(conn, [ice])
+                own = own | await suppliers.own_ices(conn, [ice], org_ice=job.org_ice)
             if ice in own:
                 flags = (*flags, OWN_ICE)
             else:
@@ -602,6 +668,7 @@ async def _compute(
 async def _extract(
     job: _Job,
     *,
+    sessions: async_sessionmaker[AsyncSession],
     index: IndexEngines,
     paperless: Callable[..., PaperlessClient],
     ollama: OllamaClient,
@@ -610,7 +677,13 @@ async def _extract(
 ) -> tuple[FieldsRow, str]:
     """Computes the row (`_compute`) and writes it; returns the stored row and the text."""
     row, runs, content = await _compute(
-        job, index=index, paperless=paperless, ollama=ollama, model=model, now=now
+        job,
+        sessions=sessions,
+        index=index,
+        paperless=paperless,
+        ollama=ollama,
+        model=model,
+        now=now,
     )
     async with (await index.engine(job.workspace)).begin() as conn:
         return await _write_once(conn, row, runs), content
@@ -806,6 +879,7 @@ async def extract_document(
         else:
             row, content = await _extract(
                 job,
+                sessions=sessions,
                 index=index,
                 paperless=paperless,
                 ollama=ollama,

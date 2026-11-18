@@ -8,6 +8,7 @@ import respx
 from sijil_core.paperless import (
     SERVICE_PERMISSIONS,
     SUPPORT_PERMISSIONS,
+    DocumentText,
     PaperlessBadResponse,
     PaperlessClient,
     PaperlessDoc,
@@ -278,6 +279,26 @@ async def test_document_content_reads_only_the_content_field() -> None:
     async with PaperlessClient(BASE, token="t") as client:
         assert await client.document_content(7) == "FACTURE N° F-1"
     assert route.calls.last.request.url.params["fields"] == "id,content"
+
+
+@respx.mock
+async def test_document_text_reads_the_content_and_the_page_count() -> None:
+    route = respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "content": "F-1", "page_count": 3})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.document_text(7) == DocumentText(content="F-1", page_count=3)
+    assert route.calls.last.request.url.params["fields"] == "id,content,page_count"
+
+
+@pytest.mark.parametrize("pages", [None, 0, -1, "2", True])
+@respx.mock
+async def test_document_text_without_a_usable_page_count(pages: object) -> None:
+    respx.get(f"{BASE}/api/documents/7/").mock(
+        return_value=httpx.Response(200, json={"id": 7, "content": None, "page_count": pages})
+    )
+    async with PaperlessClient(BASE, token="t") as client:
+        assert await client.document_text(7) == DocumentText(content="", page_count=None)
 
 
 @respx.mock

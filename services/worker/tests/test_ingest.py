@@ -33,6 +33,7 @@ from sijil_core.db.models import (
     IngestState,
     IntegrityAlert,
     Organisation,
+    SubscriptionStatus,
     TenantCredential,
     User,
     Workspace,
@@ -50,6 +51,7 @@ from sijil_worker.ingest import (
     ingest_document,
     requeue_stuck_ingest,
 )
+from tests.support.billing_states import make_late
 from tests.support.index_db import throwaway_index_db
 from tests.support.memory_store import MemoryObjectStore
 
@@ -217,6 +219,28 @@ async def test_ingest_consumed_sets_doc_id_and_audits(
     assert event.target_id == str(ledger.id)
     assert event.data == {"paperless_doc_id": 7, "sha256": PDF_SHA}
     assert (await audit.verify(db, ready.id)).ok
+
+
+@pytest.mark.parametrize("status", [SubscriptionStatus.overdue, SubscriptionStatus.read_only])
+async def test_ingest_is_never_gated_by_billing(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    memory_store: MemoryObjectStore,
+    ready: Workspace,
+    tmp_path: Path,
+    status: SubscriptionStatus,
+) -> None:
+    """Capture survives every billing state (§5.7a): the consume stage ingests an upload into
+    Paperless in an overdue or read-only org as in any other."""
+    await make_late(db, ready.org_id, utcnow(), status)
+    ledger = await make_ledger(db, memory_store, ready, tmp_path)
+    with respx.mock(assert_all_called=False) as router:
+        upload, _ = mock_flow(router)
+        await run(ledger, sessions, keys, memory_store)
+    assert upload.called
+    row = await reload(db, ledger)
+    assert (row.ingest_state, row.paperless_doc_id) == (IngestState.consumed, 7)
 
 
 async def test_filename_sent_to_paperless_is_derived(

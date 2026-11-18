@@ -32,6 +32,7 @@ from sijil_core.db.models import (
     ActorType,
     AuditEvent,
     DocumentState,
+    ExportDocument,
     ExportJob,
     ExportState,
     User,
@@ -649,3 +650,56 @@ async def test_a_document_without_a_search_row_is_exported_and_logged(
         assert await _build(job, sessions, idx, memory_store, exports)
     assert [r["document_id"] for r in _rows(_zip(exports, job, tmp_path))] == [str(row.id)]
     assert "1 document(s) not in the search index" in caplog.text
+
+
+async def test_full_export_includes_every_period(
+    db: AsyncSession, sessions: Any, workspace: Workspace, user: User,
+    memory_store: MemoryObjectStore, exports: MemoryExportStore, idx: OneIndex,
+    index_conn: AsyncConnection, tmp_path: Path,
+) -> None:  # fmt: skip
+    """Period `all` (ADM-5): every non-terminal document, whatever its date, in the same signed
+    ZIP; a removed one stays out."""
+    args = (db, memory_store, index_conn, workspace, user)
+    old = await add_exportable(
+        *args, state=DocumentState.sealed, arrived=datetime(2019, 3, 1, 9, 0, tzinfo=UTC),
+        values=_values(date="2019-02-27"),
+    )  # fmt: skip
+    last_year = await add_exportable(
+        *args, arrived=datetime(2025, 6, 1, 9, 0, tzinfo=UTC), values=_values(date="2025-05-31")
+    )
+    undated = await add_exportable(
+        *args, state=DocumentState.received, arrived=datetime(2026, 11, 4, 9, 0, tzinfo=UTC)
+    )
+    await add_exportable(
+        *args, state=DocumentState.removed, arrived=datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    )
+    job = await _job(db, workspace, user, period="all")
+
+    assert await _build(job, sessions, idx, memory_store, exports)
+
+    done = await _fresh(db, job)
+    assert (done.state, done.period, done.document_count) == (ExportState.ready, "all", 3)
+    path = _zip(exports, job, tmp_path)
+    assert verify_zip(path, public_key(SEED)).ok
+    report = read_report(path)
+    assert report is not None and report["period"] == "all"
+    assert {d["id"] for d in report["documents"]} == {
+        str(old.id), str(last_year.id), str(undated.id),
+    }  # fmt: skip
+    ready = (await _events(db, workspace))[-1]
+    assert (ready.action, ready.data) == ("export.ready", {"period": "all", "document_count": 3})
+    # The export's own document set is recorded with it (final review I1), write-once.
+    held = set(
+        await db.scalars(
+            select(ExportDocument.ledger_id).where(ExportDocument.export_job_id == job.id)
+        )
+    )
+    assert held == {old.id, last_year.id, undated.id}
+    job_id = job.id  # a rollback expires the ORM row
+    for sql in (
+        "UPDATE export_document SET ledger_id = ledger_id WHERE export_job_id = :id",
+        "DELETE FROM export_document WHERE export_job_id = :id",
+    ):
+        with pytest.raises(DBAPIError, match="permission denied"):
+            await db.execute(text(sql), {"id": job_id})
+        await db.rollback()

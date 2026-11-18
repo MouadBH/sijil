@@ -34,5 +34,57 @@
         "excluded": "{count, plural, one {# document awaiting review was left out.} other {# documents awaiting review were left out.}}"
       }
     }
+  },
+  "invoice": {
+    "title": "Invoice",
+    "number": "No.",
+    "issued_on": "Issue date",
+    "due_on": "Due date",
+    "seller": "Seller",
+    "buyer": "Customer",
+    "ice": "ICE",
+    "if": "Tax ID (IF)",
+    "rc": "Trade register (RC)",
+    "tp": "Business tax (TP)",
+    "description": "Description",
+    "period": "Period",
+    "period_range": "from {start} to {end}",
+    "kind": {
+      "annual": "Sijil annual subscription, {plan} plan",
+      "upgrade": "Upgrade to the {plan} plan, prorated for the remaining period"
+    },
+    "plan": {
+      "essentiel": "Essentiel",
+      "pro": "Pro",
+      "entreprise": "Entreprise"
+    },
+    "amount_ht": "Total excl. VAT",
+    "vat": "VAT {rate}%",
+    "amount_ttc": "Total incl. VAT",
+    "currency": "MAD",
+    "in_words": "This invoice amounts to: {words}.",
+    "payment": "Payment by bank transfer",
+    "bank": "Bank",
+    "rib": "RIB",
+    "reference": "Reference to quote on the transfer",
+    "words": {
+      "join": "{dirhams} and {centimes}",
+      "dirham": {
+        "zero": "{n} dirhams",
+        "one": "{n} dirham",
+        "two": "{n} dirhams",
+        "few": "{n} dirhams",
+        "many": "{n} dirhams",
+        "other": "{n} dirhams"
+      },
+      "centime": {
+        "zero": "{n} centimes",
+        "one": "{n} centime",
+        "two": "{n} centimes",
+        "few": "{n} centimes",
+        "many": "{n} centimes",
+        "other": "{n} centimes"
+      }
+    }
   }
 }

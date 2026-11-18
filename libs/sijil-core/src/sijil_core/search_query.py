@@ -3,7 +3,9 @@ Ask, and the saved views (`saved_view`, v4) that store a search.
 
 `build_search` turns `SearchFilters` into one SELECT. Whatever the filters, only live documents
 are returned (`received`, `needs_review`, `filed`, `sealed`): a row in `removed`, `deleting` or
-`deleted` never is, and `status` cannot ask for one.
+`deleted` never is, and `status` cannot ask for one. A caller's document-type grant (ADM-1,
+`SearchFilters.within`) is not a field: no body, saved view or intent can carry or widen it, and
+it applies on top of every filter (`grant_clause`).
 
 `q` is split on whitespace:
 - a 15-digit token (Arabic-Indic digits folded) must equal `supplier_ice`;
@@ -30,13 +32,14 @@ import base64
 import binascii
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Final, Literal, get_args
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from sqlalchemy import (
     Date,
     Float,
@@ -44,6 +47,7 @@ from sqlalchemy import (
     Select,
     Text,
     and_,
+    any_,
     bindparam,
     cast,
     column,
@@ -109,6 +113,30 @@ class SearchFilters(BaseModel):
     # Every one of them, normalised as stored (`search_index.normalise_tag`).
     tags: Annotated[list[str], Field(max_length=MAX_LIST)] = []
     status: list[LiveState] = []
+
+    # The caller's document-type grant (ADM-1), set only by `within`: never a field, so a body,
+    # a saved view or an intent can neither carry nor widen it. None: every type.
+    _allowed_types: frozenset[str] | None = PrivateAttr(default=None)
+    # Unclassified documents the caller uploaded, which a grant still shows them.
+    _own_uploads: frozenset[UUID] = PrivateAttr(default=frozenset())
+
+    @property
+    def allowed_types(self) -> frozenset[str] | None:
+        return self._allowed_types
+
+    @property
+    def own_uploads(self) -> frozenset[UUID]:
+        return self._own_uploads
+
+    def within(
+        self, allowed_types: frozenset[str] | None, own_uploads: frozenset[UUID] = frozenset()
+    ) -> "SearchFilters":
+        """A copy limited to `allowed_types` (None: every type), plus the unclassified
+        documents among `own_uploads`. Every other filter still applies on top."""
+        limited = self.model_copy()
+        limited._allowed_types = allowed_types
+        limited._own_uploads = frozenset() if allowed_types is None else own_uploads
+        return limited
 
 
 def filter_names(filters: SearchFilters) -> str:
@@ -280,6 +308,8 @@ def build_search(filters: SearchFilters, sort: str, cursor: str | None, limit: i
         )
     if filters.document_type:
         where.append(_d.document_type.in_(filters.document_type))
+    if filters.allowed_types is not None:
+        where.append(grant_clause(_d.document_type, _d.ledger_id, filters))
     if filters.supplier and filters.supplier.strip():
         supplier = search_normalise(filters.supplier).strip()
         if _ICE.fullmatch(supplier):
@@ -344,6 +374,48 @@ def build_search(filters: SearchFilters, sort: str, cursor: str | None, limit: i
         p.ledger_id, p.state, p.document_type, p.basis_date, p.supplier_name, p.number,
         p.total_ttc, p.currency, p.tags, p.corrected, snippet.label("snippet"), p.sort_key,
     ).order_by(*_order(sort, p.sort_key, p.ledger_id))  # fmt: skip
+
+
+def grant_clause(
+    document_type: ColumnElement[Any], ledger_id: ColumnElement[Any], filters: SearchFilters
+) -> ColumnElement[bool]:
+    """The rows `filters`' grant shows: a type in it, or unclassified and among its own
+    uploads. Only for a filter with a grant (`allowed_types` not None)."""
+    types = sorted(filters.allowed_types or ())
+    shown = document_type == any_(cast(literal(types, ARRAY(Text)), ARRAY(Text)))
+    if filters.own_uploads:
+        own = cast(literal(sorted(filters.own_uploads), ARRAY(PG_UUID(as_uuid=True))),
+                   ARRAY(PG_UUID(as_uuid=True)))  # fmt: skip
+        shown = or_(shown, and_(document_type.is_(None), ledger_id == any_(own)))
+    return shown
+
+
+def grant_allows(
+    document_type: str | None,
+    uploaded_by: UUID | None,
+    user_id: UUID | None,
+    allowed_types: frozenset[str] | None,
+) -> bool:
+    """Whether a grant shows one document (ADM-1): every type without a grant; else a type in
+    it, or an unclassified document (no type, or no search row yet) the user uploaded."""
+    if allowed_types is None:
+        return True
+    if document_type is None:
+        return uploaded_by is not None and uploaded_by == user_id
+    return document_type in allowed_types
+
+
+async def document_types(conn: AsyncConnection, ids: Sequence[UUID]) -> dict[UUID, str | None]:
+    """The search row's type of each document of `ids` that has one (None: unclassified)."""
+    if not ids:
+        return {}
+    result = await conn.execute(
+        select(_d.ledger_id, _d.document_type).where(
+            _d.ledger_id == any_(cast(literal(list(ids), ARRAY(PG_UUID(as_uuid=True))),
+                                      ARRAY(PG_UUID(as_uuid=True))))
+        )
+    )  # fmt: skip
+    return {r.ledger_id: r.document_type for r in result}
 
 
 def _order(sort: str, key: ColumnElement[Any], ledger: ColumnElement[Any]) -> list[Any]:

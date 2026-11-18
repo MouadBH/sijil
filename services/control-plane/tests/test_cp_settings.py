@@ -4,6 +4,7 @@ from pydantic import ValidationError
 from sijil_cp.main import create_app
 from sijil_cp.settings import CpSettings, MigrationSettings
 from tests.support.export_keys import TEST_PUBLIC_KEY_B64
+from tests.support.seller import SAMPLE_SELLER
 
 
 def test_migrations_use_their_own_url(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -36,7 +37,17 @@ _CP_ENV = {
     "objectstore_secret_key": "app-secret",
     "objectstore_bucket": "sijil-originals-ma-cas",
     "export_public_key": TEST_PUBLIC_KEY_B64,
-}
+} | SAMPLE_SELLER
+
+
+@pytest.mark.parametrize("missing", sorted(SAMPLE_SELLER))
+def test_the_control_plane_needs_the_seller(missing: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """It issues upgrade invoices: SIJIL_SELLER_* are required (ruling R2), with no default."""
+    for name in SAMPLE_SELLER:
+        monkeypatch.delenv(f"SIJIL_{name.upper()}", raising=False)
+    with pytest.raises(ValidationError):
+        CpSettings.model_validate({k: v for k, v in _CP_ENV.items() if k != missing})
+    assert CpSettings.model_validate(_CP_ENV).seller()["name"] == "SAMPLE Sijil SARL"
 
 
 def test_the_control_plane_holds_no_sealing_key(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -32,10 +32,12 @@ def test_matrix_shape() -> None:
         Action.org_update,
         Action.documents_remove,
         Action.retention_approve_deletion,
+        Action.billing_manage,
+        Action.org_close,
     }
     assert MATRIX[Role.member] == MEMBER
     assert MATRIX[Role.readonly] == READONLY
-    assert len(Action) == 15
+    assert len(Action) == 18
 
 
 @pytest.mark.parametrize("role", list(Role))
@@ -87,3 +89,17 @@ async def test_effective_role_is_higher_of_org_and_workspace(
     org_membership.role = Role.owner
     await db.commit()
     assert await permissions.effective_role(db, user.id, workspace) == Role.owner
+
+
+def test_workspace_context_requires_the_grant_and_the_user() -> None:
+    """No fail-open default (final review T1): a context built without the caller's
+    document-type grant or id would see every type."""
+    import dataclasses
+    import inspect
+
+    fields = {f.name: f for f in dataclasses.fields(permissions.WorkspaceContext)}
+    for name in ("document_types", "user_id"):
+        assert fields[name].default is dataclasses.MISSING, name
+        assert fields[name].default_factory is dataclasses.MISSING, name
+    params = inspect.signature(permissions.WorkspaceContext).parameters
+    assert all(p.default is inspect.Parameter.empty for p in params.values())

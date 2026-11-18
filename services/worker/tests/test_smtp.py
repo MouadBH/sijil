@@ -4,6 +4,7 @@ import hashlib
 import logging
 import smtplib
 import socket
+from collections.abc import Awaitable, Callable
 from email.message import EmailMessage
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,18 +16,22 @@ from aiosmtpd.controller import Controller
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sijil_core import billing
+from sijil_core.db.base import utcnow
 from sijil_core.db.models import (
     AuditEvent,
     DocumentLedger,
     DocumentSource,
     IngestState,
     Organisation,
+    SubscriptionStatus,
     Workspace,
     WorkspaceState,
 )
 from sijil_core.filetypes import MAX_UPLOAD_BYTES
 from sijil_core.settings import CoreSettings
 from sijil_worker.smtp import SijilSmtpHandler, configure_logging
+from tests.support.billing_states import make_late
 from tests.support.memory_store import MemoryObjectStore
 
 pytestmark = pytest.mark.db
@@ -376,3 +381,73 @@ def test_wire_logs_carry_no_sender_recipient_or_token(
             controller.stop()
     for secret in (SENDER, recipient, "abcdefghij"):
         assert secret not in caplog.text
+
+
+# ADM-3, §5.7a: capture is never blocked by billing ----------------------------------------
+
+GB = 1024**3
+
+
+async def _over_quota(db: AsyncSession, workspace: Workspace) -> None:
+    """The org at 150% of the trial's documents (3 000 of 2 000) and storage (7.5 of 5 GB):
+    SAMPLE ledger rows ingested now, the first one 7.5 GB."""
+    now = utcnow()
+    await db.execute(
+        text(
+            """
+            INSERT INTO document_ledger (id, workspace_id, sha256, md5, size_bytes, content_kind,
+                source, object_key, object_version_id, state, ingest_state, ingest_attempts,
+                retention_until, ingested_at)
+            SELECT gen_random_uuid(), :ws, md5(n::text || 'a') || md5(n::text || 'b'),
+                md5(n::text), CASE WHEN n = 1 THEN CAST(:big AS bigint) ELSE 10 END, 'pdf',
+                'upload', 'k/' || n, 'v1', 'filed', 'consumed', 0, DATE '2036-12-31', :at
+            FROM generate_series(1, 3000) AS n
+            """
+        ),
+        {"ws": workspace.id, "big": 15 * GB // 2, "at": now},
+    )
+    await db.commit()
+    meter = await billing.meter(db, workspace.org_id, now)
+    assert (meter.quotas["documents"].percent, meter.quotas["storage"].percent) == (150, 150)
+
+
+async def _overdue(db: AsyncSession, workspace: Workspace) -> None:
+    await make_late(db, workspace.org_id, utcnow(), SubscriptionStatus.overdue)
+
+
+async def _read_only(db: AsyncSession, workspace: Workspace) -> None:
+    await make_late(db, workspace.org_id, utcnow(), SubscriptionStatus.read_only)
+
+
+# Every billing state (the upload half is in services/control-plane/tests/test_billing_api.py).
+BILLING_STATES: dict[str, Callable[[AsyncSession, Workspace], Awaitable[None]]] = {
+    "over_quota": _over_quota,
+    "overdue": _overdue,
+    "read_only": _read_only,
+}
+
+
+@pytest.mark.parametrize("billing_state", list(BILLING_STATES))
+async def test_capture_never_blocked_over_quota(
+    handler: SijilSmtpHandler,
+    db: AsyncSession,
+    workspace: Workspace,
+    enqueued: Enqueued,
+    billing_state: str,
+) -> None:
+    """Inbound email through the SMTP handler, in every billing state: the message is accepted
+    (250), and the email and its attachment get ledger rows, queued for ingest."""
+    await BILLING_STATES[billing_state](db, workspace)
+    content = mail((PDF, "application", "pdf", FILENAME))
+    assert await handler.handle_DATA(None, SESSION, envelope(content, address(workspace))) == OK
+    found = await db.scalars(
+        select(DocumentLedger).where(
+            DocumentLedger.workspace_id == workspace.id,
+            DocumentLedger.source == DocumentSource.email,
+        )
+    )
+    landed = {r.content_kind: r for r in found}
+    assert set(landed) == {"eml", "pdf"}
+    assert landed["pdf"].sha256 == hashlib.sha256(PDF).hexdigest()
+    assert landed["pdf"].ingest_state is IngestState.queued
+    assert sorted(enqueued.calls) == sorted((r.id, workspace.id) for r in landed.values())

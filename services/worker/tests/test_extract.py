@@ -24,7 +24,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from sijil_core import index
+from sijil_core import index, suppliers
+from sijil_core.confidence import OWN_ICE
 from sijil_core.crypto import LocalKeyService, seal
 from sijil_core.db.models import (
     AuditEvent,
@@ -35,7 +36,9 @@ from sijil_core.db.models import (
     IngestState,
     Organisation,
     OrgType,
+    SubscriptionStatus,
     TenantCredential,
+    UsageRecord,
     User,
     Workspace,
     WorkspaceState,
@@ -62,6 +65,7 @@ from sijil_worker.extract import (
 )
 from sijil_worker.settings import WorkerSettings
 from sijil_worker.taxonomy import RULES, ensure_taxonomy
+from tests.support.billing_states import make_late, make_paid_up
 from tests.support.index_db import throwaway_index_db
 
 pytestmark = pytest.mark.db
@@ -197,13 +201,14 @@ async def make_ledger(
     ingested_at: datetime | None = None,
     retention_until: date = PROVISIONAL,
     sha: str | None = None,
+    size_bytes: int = 10,
 ) -> DocumentLedger:
     sha = sha or hashlib.sha256(uuid.uuid4().bytes).hexdigest()
     row = DocumentLedger(
         workspace_id=workspace.id,
         sha256=sha,
         md5="0" * 32,
-        size_bytes=10,
+        size_bytes=size_bytes,
         content_kind="pdf",
         source=DocumentSource.upload,
         object_key=f"k/{sha}",
@@ -258,10 +263,12 @@ def mock_paperless(
     content: str = CONTENT_01,
     suggested: list[int] | None = None,
     patch_status: int = 200,
+    pages: int | None = None,
 ) -> respx.Route:
-    route = router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(
-        200, json={"id": DOC_ID, "content": content}
-    )
+    document: dict[str, Any] = {"id": DOC_ID, "content": content}
+    if pages is not None:
+        document["page_count"] = pages
+    route = router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/").respond(200, json=document)
     router.get(f"{PAPERLESS}/api/document_types/").mock(side_effect=_document_types)
     router.get(f"{PAPERLESS}/api/documents/{DOC_ID}/suggestions/").respond(
         200,
@@ -1161,6 +1168,7 @@ async def test_filing_extends_retention_and_object_lock(
     ready: Workspace,
 ) -> None:
     arrival = datetime(2026, 1, 5, 10, 0, tzinfo=UTC)
+    await make_paid_up(db, ready.org_id, arrival)  # the run's clock is past any trial's end
     ledger = await make_ledger(db, ready, ingested_at=arrival, retention_until=date(2036, 12, 31))
     raw = {**RAW_01, "date": "2027-01-02"}
 
@@ -1313,6 +1321,7 @@ async def test_date_one_day_ahead_never_adds_a_year_of_lock(
     """On 31 December (local), a document dated 1 January next year is plausible (a time zone
     apart) but its retention counts from today's year."""
     eve = datetime(2026, 12, 31, 12, 0, tzinfo=UTC)
+    await make_paid_up(db, ready.org_id, eve - timedelta(days=1))  # past any trial's end
     ledger = await make_ledger(db, ready, ingested_at=eve)
     raw = {**RAW_01, "date": "2027-01-01"}
     store = FakeStore()
@@ -1979,3 +1988,173 @@ async def test_a_search_index_failure_does_not_undo_the_routing(
     assert await search_of(engines, ready, ledger.id) is None
     assert "OSError" in caplog.text
     assert SUPPLIER_01["name"] not in caplog.text
+
+
+# ADM-3: AI pages metered, and stopped over quota ---------------------------------------------
+
+GB = 1024**3
+
+
+async def usage_of(db: AsyncSession, ledger_id: uuid.UUID) -> list[tuple[str, int]]:
+    rows = await db.execute(
+        select(UsageRecord.kind, UsageRecord.quantity)
+        .where(UsageRecord.ledger_id == ledger_id)
+        .execution_options(populate_existing=True)
+    )
+    return [(kind, quantity) for kind, quantity in rows]
+
+
+async def over_storage(db: AsyncSession, workspace: Workspace) -> None:
+    """The org beyond its storage quota (the trial's 5 GB) with one big SAMPLE original."""
+    await make_ledger(db, workspace, state=DocumentState.filed, size_bytes=6 * GB)
+
+
+async def test_ai_stops_over_quota_documents_go_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """Over a quota: no Ollama call, no usage record, an empty row flagged `quota_exceeded`,
+    and the document in review."""
+    await over_storage(db, ready)
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, pages=2)
+        await run(ledger, sessions, keys, engines, ollama)
+    assert ollama.requests == []
+    assert await usage_of(db, ledger.id) == []
+    row = await fields_of(engines, ready, ledger.id)
+    assert row.flags == ("quota_exceeded",)
+    assert row.values == dict.fromkeys(FIELD_NAMES)
+    assert row.model is None
+    assert await runs_of(engines, ready, ledger.id) == []
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
+    document_events = [
+        (e.action, e.data)
+        for e in await events(db, ready)
+        if e.target_type == "document" and e.target_id == str(ledger.id)
+    ]
+    assert document_events == [
+        ("document.extraction_skipped", {"code": "quota_exceeded"}),
+        ("document.needs_review", {"min_confidence_pct": 0, "flags": "quota_exceeded"}),
+    ]
+
+
+@pytest.mark.parametrize("status", [SubscriptionStatus.overdue, SubscriptionStatus.read_only])
+async def test_ai_stops_when_overdue_documents_go_to_review(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+    status: SubscriptionStatus,
+) -> None:
+    """An unpaid invoice past due stops AI as a quota does, with the flag `billing_overdue`."""
+    await make_late(db, ready.org_id, NOW, status)
+    ledger = await make_ledger(db, ready)
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, pages=2)
+        await run(ledger, sessions, keys, engines, ollama)
+    assert ollama.requests == []
+    assert await usage_of(db, ledger.id) == []
+    row = await fields_of(engines, ready, ledger.id)
+    assert (row.flags, row.values) == (("billing_overdue",), dict.fromkeys(FIELD_NAMES))
+    assert (await reload(db, ledger)).state is DocumentState.needs_review
+    skipped = [e.data for e in await events(db, ready) if e.action == "document.extraction_skipped"]
+    assert skipped == [{"code": "billing_overdue"}]
+
+
+async def test_usage_record_written_once_per_document_on_retry(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """The pages Paperless counts are recorded before the model runs, once: a retry after
+    Ollama failed adds nothing, and goes on even if the org has since gone over quota (the
+    document's pages are already counted)."""
+    ledger = await make_ledger(db, ready)
+    down = FakeOllama({1: RAW_01, 2: httpx.Response(503, json={"error": "busy"})})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, pages=3)
+        with pytest.raises(OllamaUnavailable):
+            await run(ledger, sessions, keys, engines, down)
+    assert await usage_of(db, ledger.id) == [("ai_pages", 3)]
+    await over_storage(db, ready)
+    ollama = FakeOllama({1: RAW_01, 2: RAW_01})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, pages=3)
+        await run(ledger, sessions, keys, engines, ollama)
+    assert len(ollama.requests) == 2
+    assert await usage_of(db, ledger.id) == [("ai_pages", 3)]
+    assert (await fields_of(engines, ready, ledger.id)).values == CANONICAL_01
+
+
+async def test_ai_pages_are_at_least_one(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router)  # no page count reported
+        await run(ledger, sessions, keys, engines, FakeOllama({1: RAW_01, 2: RAW_01}))
+    assert await usage_of(db, ledger.id) == [("ai_pages", 1)]
+
+
+async def test_no_text_calls_no_model_and_records_no_usage(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    ledger = await make_ledger(db, ready)
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, content="   ", pages=4)
+        await run(ledger, sessions, keys, engines, FakeOllama({}))
+    assert await usage_of(db, ledger.id) == []
+
+
+OWN = "002999888000011"  # SAMPLE: the organisation's own ICE (fictitious)
+
+
+async def test_org_ice_is_never_learnt_or_hinted(
+    db: AsyncSession,
+    sessions: async_sessionmaker[AsyncSession],
+    keys: LocalKeyService,
+    engines: IndexEngines,
+    ready: Workspace,
+) -> None:
+    """With the organisation's ICE stored, it is the own ICE from the first document (the
+    frequency guard needs 5): never hinted though it has a record, never named from it, and
+    flagged `supplier_own_ice`. (Never learnt: test_learning.py, the same guard.)"""
+    org = await db.get(Organisation, ready.org_id)
+    assert org is not None
+    org.ice = OWN
+    await db.commit()
+    async with (await engines.engine(ready)).begin() as conn:
+        await suppliers.learn(
+            conn, ice=OWN, name="Entreprise Exemple SARL", source="seal", actor=None, now=NOW
+        )
+    content = CONTENT_01 + f"ICE client : {OWN}\n"
+    ledger = await make_ledger(db, ready)
+    picked = RAW_01 | {"supplier_ice": OWN}
+    ollama = FakeOllama({1: picked, 2: picked})
+    with respx.mock(assert_all_called=False) as router:
+        mock_paperless(router, content=content)
+        await run(ledger, sessions, keys, engines, ollama)
+    systems = [json.loads(r.content)["messages"][0]["content"] for r in ollama.requests]
+    assert systems and all("Known company" not in s for s in systems)
+    row = await fields_of(engines, ready, ledger.id)
+    assert OWN_ICE in row.flags
+    assert row.values["supplier_name"] == SUPPLIER_01["name"]
+    assert row.source["supplier_name"] == "extraction"
+    assert (await reload(db, ledger)).state is DocumentState.needs_review

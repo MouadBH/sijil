@@ -72,8 +72,9 @@ async def harness() -> AsyncIterator[Harness]:
 
 
 @pytest.fixture
-async def created_workspaces() -> AsyncIterator[list[uuid.UUID]]:
-    """Append the id of every workspace the test creates: each is marked `closing` at
-    teardown (tests/support/workspaces.py), so it never feeds the live extraction worker."""
-    async with closing_at_exit() as created:
+async def created_workspaces(docker_runtime: DockerRuntime) -> AsyncIterator[list[uuid.UUID]]:
+    """Append the id of every workspace the test creates: at teardown each is marked `closing`
+    (so it never feeds the live extraction worker) and its tenant's containers are stopped (so
+    a run never leaves Paperless running), tests/support/workspaces.py."""
+    async with closing_at_exit(docker_runtime) as created:
         yield created
